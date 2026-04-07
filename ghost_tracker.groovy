@@ -2,14 +2,14 @@ import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
 
 definition(
-    name: "mmWave Ghost Buster",
-    namespace: "lnjustin",
-    author: "Justin Leonard",
-    description: "Detects persistent mmWave ghost targets and recommends interference zones",
-    category: "Utility",
-    iconUrl: "",
-    iconX2Url: "",
-    singleInstance: false
+        name: "mmWave Ghost Buster",
+        namespace: "lnjustin",
+        author: "Justin Leonard",
+        description: "Detects persistent mmWave ghost targets and recommends interference zones",
+        category: "Utility",
+        iconUrl: "",
+        iconX2Url: "",
+        singleInstance: false
 )
 
 preferences {
@@ -48,34 +48,34 @@ def settingsPage() {
     dynamicPage(name: "settingsPage", install: false, uninstall: false) {
         section(getInterface("header", "Devices")) {
             input "mmwaveDevices",
-                "device.InovellimmWaveDimmerBlueSeriesVZM32-SN",
-                title: "Choose mmWave switches",
-                multiple: true,
-                submitOnChange: true
+                    "device.InovellimmWaveDimmerBlueSeriesVZM32-SN",
+                    title: "Choose mmWave switches",
+                    multiple: true,
+                    submitOnChange: true
         }
 
         section(getInterface("header", "Activation")) {
             input "ghostModes",
-                "mode",
-                title: "Modes where ghost detection is active",
-                multiple: true,
-                required: true
+                    "mode",
+                    title: "Modes where ghost detection is active",
+                    multiple: true,
+                    required: true
 
             input "activationMode",
-                "enum",
-                title: "Ghost detection activation",
-                options: [
-                    "Always Active During Ghost Modes",
-                    "Conditioned On Virtual Switch"
-                ],
-                required: true,
-                submitOnChange: true
+                    "enum",
+                    title: "Ghost detection activation",
+                    options: [
+                            "Always Active During Ghost Modes",
+                            "Conditioned On Virtual Switch"
+                    ],
+                    required: true,
+                    submitOnChange: true
 
             if (activationMode == "Conditioned On Virtual Switch") {
                 input "autoDisableDays",
-                    "number",
-                    title: "Turn off activator switches after X days (0 disables auto-off)",
-                    defaultValue: 0
+                        "number",
+                        title: "Turn off activator switches after X days (0 disables auto-off)",
+                        defaultValue: 0
             }
         }
 
@@ -105,115 +105,137 @@ def settingsPage() {
 
         section(getInterface("header", "Daily Boundary")) {
             input "boundaryType",
-                "enum",
-                title: "Define day by",
-                options: ["Mode Boundary", "Time Boundary"],
-                required: true,
-                submitOnChange: true
+                    "enum",
+                    title: "Define day by",
+                    options: ["Mode Boundary", "Time Boundary"],
+                    required: true,
+                    submitOnChange: true
 
             if (boundaryType == "Mode Boundary") {
                 input "resetModeEnterExit",
-                    "enum",
-                    title: "Start a new day when",
-                    options: ["Entering", "Exiting"],
-                    required: true
+                        "enum",
+                        title: "Start a new day when",
+                        options: ["Entering", "Exiting"],
+                        required: true
 
                 input "resetMode",
-                    "mode",
-                    title: "Selected mode",
-                    required: true
+                        "mode",
+                        title: "Selected mode",
+                        required: true
             }
 
             if (boundaryType == "Time Boundary") {
                 input "dayEnd",
-                    "time",
-                    title: "Run daily analysis at",
-                    required: true
+                        "time",
+                        title: "Run daily analysis at",
+                        required: true
+            }
+        }
+
+        section(getInterface("header", "Point Filtering")) {
+            input "filterPointsByDeviceBounds",
+                    "bool",
+                    title: "Filter out points not within device X/Y/Z min/max settings",
+                    defaultValue: false,
+                    submitOnChange: true
+
+            if (filterPointsByDeviceBounds) {
+                input "captureOutOfBoundsPoints",
+                        "bool",
+                        title: "Still capture and graph out-of-bounds points (but don't use for ghost detection)",
+                        defaultValue: false,
+                        submitOnChange: true
+
+                if (captureOutOfBoundsPoints) {
+                    paragraph renderNoteCard("Filtering with Visualization", "Out-of-bounds points will be captured for graphing and reporting but excluded from ghost detection.")
+                } else {
+                    paragraph renderNoteCard("Filtering Enabled", "Points outside the device's configured X/Y/Z min/max ranges will be completely excluded.")
+                }
             }
         }
 
         section(getInterface("header", "Clustering")) {
             input "clusteringAlgorithm",
-                "enum",
-                title: "Primary clustering algorithm",
-                options: ["DBSCAN", "K-Means"],
-                defaultValue: "DBSCAN",
-                required: true
+                    "enum",
+                    title: "Primary clustering algorithm",
+                    options: ["DBSCAN", "K-Means"],
+                    defaultValue: "DBSCAN",
+                    required: true
 
             input "clusterRadius",
-                "decimal",
-                title: "Cluster radius / match threshold (meters)",
-                defaultValue: 0.5
+                    "decimal",
+                    title: "Cluster radius / match threshold (meters)",
+                    defaultValue: 0.5
 
             input "minClusterEvents",
-                "number",
-                title: "Minimum events per cluster",
-                defaultValue: 5
+                    "number",
+                    title: "Minimum events per cluster",
+                    defaultValue: 5
 
             input "maxClusters",
-                "number",
-                title: "Maximum K-Means clusters",
-                defaultValue: 5
+                    "number",
+                    title: "Maximum K-Means clusters",
+                    defaultValue: 5
         }
 
         section(getInterface("header", "Persistence")) {
             input "historyDays",
-                "number",
-                title: "Rolling stability window (days)",
-                defaultValue: 14
+                    "number",
+                    title: "Rolling stability window (days)",
+                    defaultValue: 14
 
             input "persistentGhostDays",
-                "number",
-                title: "Consecutive days to become persistent",
-                defaultValue: 2
+                    "number",
+                    title: "Consecutive days to become persistent",
+                    defaultValue: 2
 
             input "bustedGhostDays",
-                "number",
-                title: "Consecutive missing days to become busted",
-                defaultValue: 2
+                    "number",
+                    title: "Consecutive missing days to become busted",
+                    defaultValue: 2
 
             input "stableThreshold",
-                "number",
-                title: "Recommendation threshold (%)",
-                defaultValue: 70
+                    "number",
+                    title: "Recommendation threshold (%)",
+                    defaultValue: 70
         }
 
         section(getInterface("header", "Notifications")) {
             input "sendPush",
-                "bool",
-                title: "Send notifications",
-                defaultValue: false,
-                submitOnChange: true
+                    "bool",
+                    title: "Send notifications",
+                    defaultValue: false,
+                    submitOnChange: true
 
             if (sendPush) {
                 input "notifyDevices",
-                    "capability.notification",
-                    title: "Notification devices",
-                    multiple: true,
-                    required: false
+                        "capability.notification",
+                        title: "Notification devices",
+                        multiple: true,
+                        required: false
 
                 input "notifyOnActivate",
-                    "bool",
-                    title: "Notify on activation",
-                    defaultValue: true
+                        "bool",
+                        title: "Notify on activation",
+                        defaultValue: true
 
                 input "notifyOnDeactivate",
-                    "bool",
-                    title: "Notify on deactivation",
-                    defaultValue: true
+                        "bool",
+                        title: "Notify on deactivation",
+                        defaultValue: true
 
                 input "notifyDailySummary",
-                    "bool",
-                    title: "Notify on daily summary",
-                    defaultValue: true
+                        "bool",
+                        title: "Notify on daily summary",
+                        defaultValue: true
             }
         }
 
         section(getInterface("header", "Logging")) {
             input "enableDebugLogging",
-                "bool",
-                title: "Enable debug logging",
-                defaultValue: false
+                    "bool",
+                    title: "Enable debug logging",
+                    defaultValue: false
         }
     }
 }
@@ -240,10 +262,10 @@ def statsPage() {
 
         section(getInterface("header", "All Devices Summary")) {
             paragraph renderStatBlock("Network Summary", [
-                "Last processed ghosts": aggregateToday,
-                "Persistent ghosts": aggregatePersistent,
-                "Busted ghosts": aggregateBusted,
-                "Processed days": state.totalDays ?: 0
+                    "Last processed ghosts": aggregateToday,
+                    "Persistent ghosts": aggregatePersistent,
+                    "Busted ghosts": aggregateBusted,
+                    "Processed days": state.totalDays ?: 0
             ])
 
             if (state.recommendation) {
@@ -254,6 +276,7 @@ def statsPage() {
         mmwaveDevices.each { dev ->
             def devKey = deviceKey(dev.id)
             def todayPoints = getPointsForDevice(dev.id)
+            def todayOutOfBounds = getOutOfBoundsPointsForDevice(dev.id)
             def todayClusters = getTodayClusters(dev.id)
             def stableClusters = getStableClusters(dev.id)
             def liveCounts = getGhostCounts(devKey, todayClusters)
@@ -262,24 +285,34 @@ def statsPage() {
             def lastSummary = getSummaryForDevice(dev.id)
 
             section(getInterface("header", "Device: ${dev.displayName}")) {
-                paragraph renderDualStatBlocks(
-                    "Current Collection",
-                    [
+                def currentStats = [
                         "Points buffered": todayPoints.size(),
                         "Ghosts detected": liveCounts.ghostsToday,
                         "Active": isDeviceActive(dev) ? "Yes" : "No"
-                    ],
-                    "Last Processed Day",
-                    [
+                ]
+                if (todayOutOfBounds) {
+                    currentStats["Out-of-bounds points"] = todayOutOfBounds.size()
+                }
+
+                def lastDayStats = [
                         "Ghosts detected": displayCounts.ghostsToday,
                         "Persistent ghosts": displayCounts.persistentGhosts,
                         "Busted ghosts": displayCounts.bustedGhosts,
                         "Points processed": lastSummary.pointCount ?: 0,
                         "Non-cluster points": lastSummary.unclusteredPointCount ?: 0
-                    ]
+                ]
+                if (lastSummary.outOfBoundsPointCount) {
+                    lastDayStats["Out-of-bounds points"] = lastSummary.outOfBoundsPointCount
+                }
+
+                paragraph renderDualStatBlocks(
+                        "Current Collection",
+                        currentStats,
+                        "Last Processed Day",
+                        lastDayStats
                 )
 
-                paragraph renderClusterPlot(displayData.points, displayData.currentClusters, displayData.historicalClusters)
+                paragraph renderClusterPlot(displayData.points, displayData.outOfBoundsPoints, displayData.currentClusters, displayData.historicalClusters)
 
                 if (stableClusters) {
                     paragraph getInterface("subHeader", "Tracked Clusters")
@@ -298,14 +331,14 @@ def statsPage() {
 
                 if (displayData.selectableClusters) {
                     input "blockClusters_${devKey}",
-                        "enum",
-                        title: "Clusters to convert to interference zones",
-                        multiple: true,
-                        required: false,
-                        options: displayData.selectableClusters.collectEntries { cluster ->
-                            def idx = displayData.selectableClusters.indexOf(cluster)
-                            [(idx.toString()): describeClusterOption(cluster, idx)]
-                        }
+                            "enum",
+                            title: "Clusters to convert to interference zones",
+                            multiple: true,
+                            required: false,
+                            options: displayData.selectableClusters.collectEntries { cluster ->
+                                def idx = displayData.selectableClusters.indexOf(cluster)
+                                [(idx.toString()): describeClusterOption(cluster, idx)]
+                            }
                     input "applyZones_${devKey}", "button", title: "Apply Selected Interference Zones"
                 } else {
                     paragraph "No clusters are available for interference zone selection."
@@ -377,9 +410,11 @@ private initialize() {
 
 private initializeState() {
     state.dailyPoints = state.dailyPoints ?: [:]
+    state.dailyOutOfBoundsPoints = state.dailyOutOfBoundsPoints ?: [:]
     state.stabilityData = state.stabilityData ?: [:]
     state.dailySummary = state.dailySummary ?: [:]
     state.lastPointsSnapshot = state.lastPointsSnapshot ?: [:]
+    state.lastOutOfBoundsSnapshot = state.lastOutOfBoundsSnapshot ?: [:]
     state.lastClustersSnapshot = state.lastClustersSnapshot ?: [:]
     state.recommendation = state.recommendation ?: null
     state.activeDevices = state.activeDevices ?: [:]
@@ -566,18 +601,28 @@ def targetInfoHandler(evt) {
         return
     }
 
-    def points = extractPoints(payload)
-    if (!points) {
+    def result = extractPoints(payload, dev)
+    if (!result.inBounds && !result.outOfBounds) {
         debugLog("Dropped targetInfo for ${dev.displayName}: no valid targets")
         return
     }
 
     def devKey = deviceKey(dev.id)
+
+    // Store in-bounds points (used for ghost detection)
     def currentPoints = ((state.dailyPoints[devKey] ?: []) as List).collect { it }
-    currentPoints.addAll(points)
+    currentPoints.addAll(result.inBounds)
     state.dailyPoints[devKey] = currentPoints
 
-    debugLog("Stored ${points.size()} points for ${dev.displayName}; total=${currentPoints.size()}")
+    // Store out-of-bounds points (for graphing only, if enabled)
+    if (result.outOfBounds) {
+        def currentOutOfBounds = ((state.dailyOutOfBoundsPoints[devKey] ?: []) as List).collect { it }
+        currentOutOfBounds.addAll(result.outOfBounds)
+        state.dailyOutOfBoundsPoints[devKey] = currentOutOfBounds
+        debugLog("Stored ${result.inBounds.size()} in-bounds and ${result.outOfBounds.size()} out-of-bounds points for ${dev.displayName}")
+    } else {
+        debugLog("Stored ${result.inBounds.size()} points for ${dev.displayName}; total=${currentPoints.size()}")
+    }
 }
 
 private parseTargetPayload(String rawValue) {
@@ -593,7 +638,7 @@ private parseTargetPayload(String rawValue) {
     }
 }
 
-private List extractPoints(def payload) {
+private Map extractPoints(def payload, dev = null) {
     def targets = []
 
     if (payload instanceof Map) {
@@ -608,7 +653,12 @@ private List extractPoints(def payload) {
         targets = payload as List
     }
 
-    def points = []
+    def bounds = filterPointsByDeviceBounds && dev ? getDeviceBounds(dev) : null
+    def captureOOB = captureOutOfBoundsPoints && bounds
+
+    def inBoundsPoints = []
+    def outOfBoundsPoints = []
+
     targets.each { target ->
         def x = toDouble(target?.x)
         def y = toDouble(target?.y)
@@ -618,14 +668,32 @@ private List extractPoints(def payload) {
             return
         }
 
-        points << [
-            x: x / 1000.0d,
-            y: y / 1000.0d,
-            z: z / 1000.0d
+        def xMeters = x / 1000.0d
+        def yMeters = y / 1000.0d
+        def zMeters = z / 1000.0d
+
+        def point = [
+                x: xMeters,
+                y: yMeters,
+                z: zMeters
         ]
+
+        // Apply bounds filtering if enabled
+        if (bounds) {
+            if (isPointWithinBounds(xMeters, yMeters, zMeters, bounds)) {
+                inBoundsPoints << point
+            } else if (captureOOB) {
+                // Capture out-of-bounds points for visualization
+                outOfBoundsPoints << point
+            }
+            // else: completely discard out-of-bounds points
+        } else {
+            // No filtering enabled, all points are in-bounds
+            inBoundsPoints << point
+        }
     }
 
-    points
+    [inBounds: inBoundsPoints, outOfBounds: outOfBoundsPoints]
 }
 
 def endOfDay() {
@@ -637,6 +705,7 @@ def endOfDay() {
     mmwaveDevices?.each { dev ->
         def devKey = deviceKey(dev.id)
         def points = getPointsForDevice(dev.id)
+        def outOfBoundsPoints = getOutOfBoundsPointsForDevice(dev.id)
         def clustersToday = detectClusters(points)
         def unclusteredPointCount = calculateUnclusteredPointCount(points, clustersToday)
 
@@ -644,17 +713,20 @@ def endOfDay() {
 
         def counts = getGhostCounts(devKey, clustersToday)
         summaries[devKey] = counts + [
-            pointCount: points.size(),
-            unclusteredPointCount: unclusteredPointCount
+                pointCount: points.size(),
+                unclusteredPointCount: unclusteredPointCount,
+                outOfBoundsPointCount: outOfBoundsPoints.size()
         ]
         state.lastPointsSnapshot[devKey] = points.collect { clonePoint(it) }
+        state.lastOutOfBoundsSnapshot[devKey] = outOfBoundsPoints.collect { clonePoint(it) }
         state.lastClustersSnapshot[devKey] = clustersToday.collect { snapshotCluster(it) }
 
-        debugLog("Processed ${dev.displayName}: points=${points.size()}, unclustered=${unclusteredPointCount}, clusters=${clustersToday.size()}, persistent=${counts.persistentGhosts}, busted=${counts.bustedGhosts}")
+        debugLog("Processed ${dev.displayName}: points=${points.size()}, out-of-bounds=${outOfBoundsPoints.size()}, unclustered=${unclusteredPointCount}, clusters=${clustersToday.size()}, persistent=${counts.persistentGhosts}, busted=${counts.bustedGhosts}")
     }
 
     state.dailySummary = summaries
     state.dailyPoints = [:]
+    state.dailyOutOfBoundsPoints = [:]
     pruneOldActivationStarts()
 
     if (sendPush && notifyDailySummary) {
@@ -720,22 +792,22 @@ private void mergeDailyCluster(Map stableCluster, Map dailyCluster, Integer curr
     stableCluster.daysSeen = stableCluster.seenHistory.size()
     stableCluster.absentStreak = 0
     stableCluster.consecutiveSeen = ((stableCluster.lastMatchedDay ?: 0) == currentDay - 1) ?
-        ((stableCluster.consecutiveSeen ?: 0) + 1) : 1
+            ((stableCluster.consecutiveSeen ?: 0) + 1) : 1
     stableCluster.lastMatchedDay = currentDay
 }
 
 private Map buildStableCluster(Map dailyCluster, Integer currentDay) {
     [
-        center: clonePoint(dailyCluster.center),
-        bounds: cloneBounds(dailyCluster.bounds),
-        radius: dailyCluster.radius,
-        density: dailyCluster.density,
-        daysSeen: 1,
-        lastSeen: currentDay,
-        seenHistory: [currentDay],
-        consecutiveSeen: 1,
-        absentStreak: 0,
-        lastMatchedDay: currentDay
+            center: clonePoint(dailyCluster.center),
+            bounds: cloneBounds(dailyCluster.bounds),
+            radius: dailyCluster.radius,
+            density: dailyCluster.density,
+            daysSeen: 1,
+            lastSeen: currentDay,
+            seenHistory: [currentDay],
+            consecutiveSeen: 1,
+            absentStreak: 0,
+            lastMatchedDay: currentDay
     ]
 }
 
@@ -754,6 +826,9 @@ private String buildDailySummary() {
         lines << ""
         lines << "${dev.displayName}:"
         lines << "Points processed: ${summary.pointCount}"
+        if (summary.outOfBoundsPointCount) {
+            lines << "Out-of-bounds points: ${summary.outOfBoundsPointCount}"
+        }
         lines << "Non-cluster points: ${summary.unclusteredPointCount ?: 0}"
         lines << "Ghosts today: ${summary.ghostsToday}"
         lines << "Persistent ghosts: ${summary.persistentGhosts}"
@@ -839,9 +914,9 @@ def detectClustersKMeans(List points, Integer k, Integer maxIterations) {
             }
 
             [
-                x: clusterPoints.collect { it.x }.sum() / clusterPoints.size(),
-                y: clusterPoints.collect { it.y }.sum() / clusterPoints.size(),
-                z: clusterPoints.collect { it.z }.sum() / clusterPoints.size()
+                    x: clusterPoints.collect { it.x }.sum() / clusterPoints.size(),
+                    y: clusterPoints.collect { it.y }.sum() / clusterPoints.size(),
+                    z: clusterPoints.collect { it.z }.sum() / clusterPoints.size()
             ]
         }
 
@@ -944,27 +1019,27 @@ private Map buildCluster(List points) {
     def ys = points.collect { it.y }
     def zs = points.collect { it.z }
     def center = [
-        x: xs.sum() / xs.size(),
-        y: ys.sum() / ys.size(),
-        z: zs.sum() / zs.size()
+            x: xs.sum() / xs.size(),
+            y: ys.sum() / ys.size(),
+            z: zs.sum() / zs.size()
     ]
     def bounds = [
-        xmin: xs.min(),
-        xmax: xs.max(),
-        ymin: ys.min(),
-        ymax: ys.max(),
-        zmin: zs.min(),
-        zmax: zs.max()
+            xmin: xs.min(),
+            xmax: xs.max(),
+            ymin: ys.min(),
+            ymax: ys.max(),
+            zmin: zs.min(),
+            zmax: zs.max()
     ]
 
     def maxDistance = points.collect { point -> distance3D(point, center) }.max() ?: 0.0d
 
     [
-        center: center,
-        bounds: bounds,
-        radius: maxDistance,
-        density: points.size(),
-        points: points.collect { clonePoint(it) }
+            center: center,
+            bounds: bounds,
+            radius: maxDistance,
+            density: points.size(),
+            points: points.collect { clonePoint(it) }
     ]
 }
 
@@ -972,9 +1047,9 @@ private Map getGhostCounts(String devKey, List todayClusters) {
     def stableClusters = (state.stabilityData[devKey] ?: []) as List
 
     [
-        ghostsToday: todayClusters?.size() ?: 0,
-        persistentGhosts: stableClusters.count { (it.consecutiveSeen ?: 0) >= safePersistentGhostDays() },
-        bustedGhosts: stableClusters.count { (it.absentStreak ?: 0) >= safeBustedGhostDays() }
+            ghostsToday: todayClusters?.size() ?: 0,
+            persistentGhosts: stableClusters.count { (it.consecutiveSeen ?: 0) >= safePersistentGhostDays() },
+            bustedGhosts: stableClusters.count { (it.absentStreak ?: 0) >= safeBustedGhostDays() }
     ]
 }
 
@@ -993,12 +1068,12 @@ def generateRecommendation() {
             def stabilityPct = calculateStabilityPercent(cluster)
             if (stabilityPct >= safeStableThreshold() && stabilityPct > bestScore) {
                 best = [
-                    deviceId: devKey,
-                    center: clonePoint(cluster.center),
-                    bounds: cloneBounds(cluster.bounds),
-                    radius: cluster.radius,
-                    density: cluster.density,
-                    stabilityPct: stabilityPct
+                        deviceId: devKey,
+                        center: clonePoint(cluster.center),
+                        bounds: cloneBounds(cluster.bounds),
+                        radius: cluster.radius,
+                        density: cluster.density,
+                        stabilityPct: stabilityPct
                 ]
                 bestScore = stabilityPct
             }
@@ -1041,22 +1116,24 @@ private void applySelectedZones(String devKey) {
         def bounds = integerBounds(cluster.bounds)
         debugLog("Applying zone ${zoneIdx + 1} to ${dev.displayName}: ${JsonOutput.toJson(bounds)}")
         dev.setInterferenceArea(
-            zoneIdx + 1,
-            bounds.xmin,
-            bounds.xmax,
-            bounds.ymin,
-            bounds.ymax,
-            bounds.zmin,
-            bounds.zmax
+                zoneIdx + 1,
+                bounds.xmin,
+                bounds.xmax,
+                bounds.ymin,
+                bounds.ymax,
+                bounds.zmin,
+                bounds.zmax
         )
     }
 }
 
 private void clearDeviceStats(String devKey) {
     state.dailyPoints?.remove(devKey)
+    state.dailyOutOfBoundsPoints?.remove(devKey)
     state.stabilityData?.remove(devKey)
     state.dailySummary?.remove(devKey)
     state.lastPointsSnapshot?.remove(devKey)
+    state.lastOutOfBoundsSnapshot?.remove(devKey)
     state.lastClustersSnapshot?.remove(devKey)
 
     if (state.recommendation?.deviceId == devKey) {
@@ -1075,23 +1152,27 @@ private boolean isValidBounds(Map bounds) {
     }
 
     bounds.xmin <= bounds.xmax &&
-        bounds.ymin <= bounds.ymax &&
-        bounds.zmin <= bounds.zmax
+            bounds.ymin <= bounds.ymax &&
+            bounds.zmin <= bounds.zmax
 }
 
 private Map integerBounds(Map bounds) {
     [
-        xmin: Math.round((bounds.xmin ?: 0.0d) * 1000.0d) as Integer,
-        xmax: Math.round((bounds.xmax ?: 0.0d) * 1000.0d) as Integer,
-        ymin: Math.round((bounds.ymin ?: 0.0d) * 1000.0d) as Integer,
-        ymax: Math.round((bounds.ymax ?: 0.0d) * 1000.0d) as Integer,
-        zmin: Math.round((bounds.zmin ?: 0.0d) * 1000.0d) as Integer,
-        zmax: Math.round((bounds.zmax ?: 0.0d) * 1000.0d) as Integer
+            xmin: Math.round((bounds.xmin ?: 0.0d) * 1000.0d) as Integer,
+            xmax: Math.round((bounds.xmax ?: 0.0d) * 1000.0d) as Integer,
+            ymin: Math.round((bounds.ymin ?: 0.0d) * 1000.0d) as Integer,
+            ymax: Math.round((bounds.ymax ?: 0.0d) * 1000.0d) as Integer,
+            zmin: Math.round((bounds.zmin ?: 0.0d) * 1000.0d) as Integer,
+            zmax: Math.round((bounds.zmax ?: 0.0d) * 1000.0d) as Integer
     ]
 }
 
 private List getPointsForDevice(deviceId) {
     ((state.dailyPoints[deviceKey(deviceId)] ?: []) as List).collect { clonePoint(it) }
+}
+
+private List getOutOfBoundsPointsForDevice(deviceId) {
+    ((state.dailyOutOfBoundsPoints[deviceKey(deviceId)] ?: []) as List).collect { clonePoint(it) }
 }
 
 private List getStableClusters(deviceId) {
@@ -1106,29 +1187,32 @@ private List getStableClusters(deviceId) {
 private Map getDisplayData(deviceId) {
     def currentPoints = getPointsForDevice(deviceId)
     def lastPoints = getSnapshotPoints(deviceId)
+    def currentOutOfBounds = getOutOfBoundsPointsForDevice(deviceId)
+    def lastOutOfBounds = getSnapshotOutOfBoundsPoints(deviceId)
     def currentClusters = getTodayClusters(deviceId)
     def historicalClusters = getHistoricalClustersForDisplay(deviceId)
 
     [
-        points: currentPoints ?: lastPoints,
-        currentClusters: currentClusters,
-        historicalClusters: historicalClusters,
-        selectableClusters: buildSelectableClusters(currentClusters, historicalClusters)
+            points: currentPoints ?: lastPoints,
+            outOfBoundsPoints: currentOutOfBounds ?: lastOutOfBounds,
+            currentClusters: currentClusters,
+            historicalClusters: historicalClusters,
+            selectableClusters: buildSelectableClusters(currentClusters, historicalClusters)
     ]
 }
 
 private Map getSummaryForDevice(deviceId) {
     def summary = state.dailySummary?.get(deviceKey(deviceId)) ?: [
-        ghostsToday: 0,
-        persistentGhosts: 0,
-        bustedGhosts: 0,
-        pointCount: 0,
-        unclusteredPointCount: 0
+            ghostsToday: 0,
+            persistentGhosts: 0,
+            bustedGhosts: 0,
+            pointCount: 0,
+            unclusteredPointCount: 0
     ]
 
     if (summary.unclusteredPointCount == null) {
         summary = summary + [
-            unclusteredPointCount: ((summary.ghostsToday ?: 0) == 0 ? (summary.pointCount ?: 0) : 0)
+                unclusteredPointCount: ((summary.ghostsToday ?: 0) == 0 ? (summary.pointCount ?: 0) : 0)
         ]
     }
 
@@ -1146,14 +1230,18 @@ private Map getDisplayCounts(deviceId) {
 
     def summary = getSummaryForDevice(deviceId)
     [
-        ghostsToday: summary.ghostsToday ?: 0,
-        persistentGhosts: summary.persistentGhosts ?: 0,
-        bustedGhosts: summary.bustedGhosts ?: 0
+            ghostsToday: summary.ghostsToday ?: 0,
+            persistentGhosts: summary.persistentGhosts ?: 0,
+            bustedGhosts: summary.bustedGhosts ?: 0
     ]
 }
 
 private List getSnapshotPoints(deviceId) {
     ((state.lastPointsSnapshot?.get(deviceKey(deviceId)) ?: []) as List).collect { clonePoint(it) }
+}
+
+private List getSnapshotOutOfBoundsPoints(deviceId) {
+    ((state.lastOutOfBoundsSnapshot?.get(deviceKey(deviceId)) ?: []) as List).collect { clonePoint(it) }
 }
 
 private List getHistoricalClustersForDisplay(deviceId) {
@@ -1201,13 +1289,14 @@ private BigDecimal calculateStabilityPercent(Map cluster) {
     return (((cluster.daysSeen ?: 0) as BigDecimal) / totalDays) * 100.0d
 }
 
-private String renderClusterPlot(List points, List currentClusters, List historicalClusters) {
-    if (!points && !currentClusters && !historicalClusters) {
+private String renderClusterPlot(List points, List outOfBoundsPoints, List currentClusters, List historicalClusters) {
+    if (!points && !outOfBoundsPoints && !currentClusters && !historicalClusters) {
         return "No points or cluster history available."
     }
 
     def allPointsForScale = []
     allPointsForScale.addAll(points ?: [])
+    allPointsForScale.addAll(outOfBoundsPoints ?: [])
     allPointsForScale.addAll((currentClusters ?: []).collect { it.center })
     allPointsForScale.addAll((historicalClusters ?: []).collect { it.center })
 
@@ -1249,11 +1338,23 @@ private String renderClusterPlot(List points, List currentClusters, List histori
     svg << "<text x='${plotRight}' y='${height - 24}' text-anchor='end' fill='#555555' font-size='10'>${round2(maxX)}</text>"
     svg << "<text x='${plotLeft - 6}' y='${plotBottom + 4}' text-anchor='end' fill='#555555' font-size='10'>${round2(minY)}</text>"
     svg << "<text x='${plotLeft - 6}' y='${plotTop + 4}' text-anchor='end' fill='#555555' font-size='10'>${round2(maxY)}</text>"
-    svg << "<text x='${plotLeft + 6}' y='${plotTop + 12}' fill='#888888' font-size='10'>Gray points = detections</text>"
-    svg << "<text x='${plotLeft + 6}' y='${plotTop + 24}' fill='#1565c0' font-size='10'>Blue ring = saved cluster</text>"
-    svg << "<text x='${plotLeft + 6}' y='${plotTop + 36}' fill='#c62828' font-size='10'>Red dot = current cluster</text>"
+
+    def legendY = plotTop + 12
+    svg << "<text x='${plotLeft + 6}' y='${legendY}' fill='#ff9800' font-size='10'>Orange = in-bounds</text>"
+    legendY += 12
+    if (outOfBoundsPoints) {
+        svg << "<text x='${plotLeft + 6}' y='${legendY}' fill='#888888' font-size='10'>Gray = out-of-bounds</text>"
+        legendY += 12
+    }
+    svg << "<text x='${plotLeft + 6}' y='${legendY}' fill='#1565c0' font-size='10'>Blue ring = saved cluster</text>"
+    legendY += 12
+    svg << "<text x='${plotLeft + 6}' y='${legendY}' fill='#c62828' font-size='10'>Red dot = current cluster</text>"
 
     (points ?: []).each { point ->
+        svg << "<circle cx='${normalizeX(point.x)}' cy='${normalizeY(point.y)}' r='2' fill='#ff9800' />"
+    }
+
+    (outOfBoundsPoints ?: []).each { point ->
         svg << "<circle cx='${normalizeX(point.x)}' cy='${normalizeY(point.y)}' r='2' fill='#888888' />"
     }
 
@@ -1285,16 +1386,16 @@ private String renderClusterDetails(Map cluster, Integer displayIndex) {
     }
 
     renderStatBlock("Cluster ${displayIndex}: ${status}", [
-        "Center": "(${round2(cluster.center.x)}, ${round2(cluster.center.y)}, ${round2(cluster.center.z)}) m",
-        "X range": "${round2(bounds.xmin)} to ${round2(bounds.xmax)}",
-        "Y range": "${round2(bounds.ymin)} to ${round2(bounds.ymax)}",
-        "Z range": "${round2(bounds.zmin)} to ${round2(bounds.zmax)}",
-        "Radius": "${round2(cluster.radius)} m",
-        "Density": cluster.density ?: 0,
-        "Days in window": cluster.daysSeen ?: 0,
-        "Consecutive days": cluster.consecutiveSeen ?: 0,
-        "Missing streak": cluster.absentStreak ?: 0,
-        "Stability": "${round2(cluster.stabilityPct ?: calculateStabilityPercent(cluster))}%"
+            "Center": "(${round2(cluster.center.x)}, ${round2(cluster.center.y)}, ${round2(cluster.center.z)}) m",
+            "X range": "${round2(bounds.xmin)} to ${round2(bounds.xmax)}",
+            "Y range": "${round2(bounds.ymin)} to ${round2(bounds.ymax)}",
+            "Z range": "${round2(bounds.zmin)} to ${round2(bounds.zmax)}",
+            "Radius": "${round2(cluster.radius)} m",
+            "Density": cluster.density ?: 0,
+            "Days in window": cluster.daysSeen ?: 0,
+            "Consecutive days": cluster.consecutiveSeen ?: 0,
+            "Missing streak": cluster.absentStreak ?: 0,
+            "Stability": "${round2(cluster.stabilityPct ?: calculateStabilityPercent(cluster))}%"
     ])
 }
 
@@ -1309,10 +1410,10 @@ private String renderRecommendationSummary(def recommendation) {
     }
 
     renderStatBlock("Recommended Exclusion Zone", [
-        "Device": recommendation.deviceName,
-        "Center": "(${round2(recommendation.center.x)}, ${round2(recommendation.center.y)}, ${round2(recommendation.center.z)}) m",
-        "Radius": "${round2(recommendation.radius)} m",
-        "Stability": "${round2(recommendation.stabilityPct)}%"
+            "Device": recommendation.deviceName,
+            "Center": "(${round2(recommendation.center.x)}, ${round2(recommendation.center.y)}, ${round2(recommendation.center.z)}) m",
+            "Radius": "${round2(recommendation.radius)} m",
+            "Stability": "${round2(recommendation.stabilityPct)}%"
     ])
 }
 
@@ -1326,10 +1427,10 @@ private Map getMainPageOverviewStats() {
     }
 
     [
-        "Configured devices": deviceCount,
-        "Active devices now": activeCount,
-        "Detection modes": ghostModes ? ghostModes.size() : 0,
-        "Processed days": state.totalDays ?: 0
+            "Configured devices": deviceCount,
+            "Active devices now": activeCount,
+            "Detection modes": ghostModes ? ghostModes.size() : 0,
+            "Processed days": state.totalDays ?: 0
     ]
 }
 
@@ -1349,12 +1450,12 @@ private Map getConfigurationSummaryStats() {
     }
 
     [
-        "Devices": summarizeDeviceNames(mmwaveDevices),
-        "Activation": activationSummary,
-        "Boundary": boundarySummary,
-        "Clustering": "${clusteringAlgorithm ?: 'DBSCAN'} / r=${clusterRadius ?: 0.5}m / min=${minClusterEvents ?: 5}",
-        "Persistence": "history ${historyDays ?: 14}d / persistent ${persistentGhostDays ?: 2}d / busted ${bustedGhostDays ?: 2}d",
-        "Notifications": sendPush ? "Enabled" : "Disabled"
+            "Devices": summarizeDeviceNames(mmwaveDevices),
+            "Activation": activationSummary,
+            "Boundary": boundarySummary,
+            "Clustering": "${clusteringAlgorithm ?: 'DBSCAN'} / r=${clusterRadius ?: 0.5}m / min=${minClusterEvents ?: 5}",
+            "Persistence": "history ${historyDays ?: 14}d / persistent ${persistentGhostDays ?: 2}d / busted ${bustedGhostDays ?: 2}d",
+            "Notifications": sendPush ? "Enabled" : "Disabled"
     ]
 }
 
@@ -1374,10 +1475,10 @@ private Map getMainPageStatsSummary() {
     }
 
     [
-        "Last processed ghosts": ghosts,
-        "Persistent ghosts": persistent,
-        "Busted ghosts": busted,
-        "Points in last run": pointsProcessed
+            "Last processed ghosts": ghosts,
+            "Persistent ghosts": persistent,
+            "Busted ghosts": busted,
+            "Points in last run": pointsProcessed
     ]
 }
 
@@ -1396,9 +1497,9 @@ private String summarizeDeviceNames(devices) {
 
 def distance3D(Map a, Map b) {
     Math.sqrt(
-        Math.pow(((a?.x ?: 0.0d) - (b?.x ?: 0.0d)), 2) +
-        Math.pow(((a?.y ?: 0.0d) - (b?.y ?: 0.0d)), 2) +
-        Math.pow(((a?.z ?: 0.0d) - (b?.z ?: 0.0d)), 2)
+            Math.pow(((a?.x ?: 0.0d) - (b?.x ?: 0.0d)), 2) +
+                    Math.pow(((a?.y ?: 0.0d) - (b?.y ?: 0.0d)), 2) +
+                    Math.pow(((a?.z ?: 0.0d) - (b?.z ?: 0.0d)), 2)
     )
 }
 
@@ -1412,32 +1513,32 @@ private String childDni(deviceId) {
 
 private Map cloneCluster(Map cluster) {
     [
-        center: clonePoint(cluster.center),
-        bounds: cloneBounds(cluster.bounds),
-        radius: cluster.radius,
-        density: cluster.density,
-        daysSeen: cluster.daysSeen ?: 0,
-        lastSeen: cluster.lastSeen ?: 0,
-        seenHistory: ((cluster.seenHistory ?: []) as List).collect { it },
-        consecutiveSeen: cluster.consecutiveSeen ?: 0,
-        absentStreak: cluster.absentStreak ?: 0,
-        lastMatchedDay: cluster.lastMatchedDay ?: 0
+            center: clonePoint(cluster.center),
+            bounds: cloneBounds(cluster.bounds),
+            radius: cluster.radius,
+            density: cluster.density,
+            daysSeen: cluster.daysSeen ?: 0,
+            lastSeen: cluster.lastSeen ?: 0,
+            seenHistory: ((cluster.seenHistory ?: []) as List).collect { it },
+            consecutiveSeen: cluster.consecutiveSeen ?: 0,
+            absentStreak: cluster.absentStreak ?: 0,
+            lastMatchedDay: cluster.lastMatchedDay ?: 0
     ]
 }
 
 private Map snapshotCluster(Map cluster) {
     [
-        center: clonePoint(cluster.center),
-        bounds: cloneBounds(cluster.bounds),
-        radius: cluster.radius ?: 0.0d,
-        density: cluster.density ?: 0,
-        points: ((cluster.points ?: []) as List).collect { clonePoint(it) },
-        daysSeen: cluster.daysSeen ?: 0,
-        lastSeen: cluster.lastSeen ?: 0,
-        seenHistory: ((cluster.seenHistory ?: []) as List).collect { it },
-        consecutiveSeen: cluster.consecutiveSeen ?: 0,
-        absentStreak: cluster.absentStreak ?: 0,
-        lastMatchedDay: cluster.lastMatchedDay ?: 0
+            center: clonePoint(cluster.center),
+            bounds: cloneBounds(cluster.bounds),
+            radius: cluster.radius ?: 0.0d,
+            density: cluster.density ?: 0,
+            points: ((cluster.points ?: []) as List).collect { clonePoint(it) },
+            daysSeen: cluster.daysSeen ?: 0,
+            lastSeen: cluster.lastSeen ?: 0,
+            seenHistory: ((cluster.seenHistory ?: []) as List).collect { it },
+            consecutiveSeen: cluster.consecutiveSeen ?: 0,
+            absentStreak: cluster.absentStreak ?: 0,
+            lastMatchedDay: cluster.lastMatchedDay ?: 0
     ]
 }
 
@@ -1447,13 +1548,59 @@ private Map clonePoint(Map point) {
 
 private Map cloneBounds(Map bounds) {
     [
-        xmin: bounds?.xmin ?: 0.0d,
-        xmax: bounds?.xmax ?: 0.0d,
-        ymin: bounds?.ymin ?: 0.0d,
-        ymax: bounds?.ymax ?: 0.0d,
-        zmin: bounds?.zmin ?: 0.0d,
-        zmax: bounds?.zmax ?: 0.0d
+            xmin: bounds?.xmin ?: 0.0d,
+            xmax: bounds?.xmax ?: 0.0d,
+            ymin: bounds?.ymin ?: 0.0d,
+            ymax: bounds?.ymax ?: 0.0d,
+            zmin: bounds?.zmin ?: 0.0d,
+            zmax: bounds?.zmax ?: 0.0d
     ]
+}
+
+private Map getDeviceBounds(dev) {
+    if (!dev) {
+        return null
+    }
+
+    try {
+        // parameter103 = Width Minimum (Left), parameter104 = Width Maximum (Right)
+        def xMin = toDouble(dev.currentValue("parameter103")) ?: toDouble(dev.getSetting("parameter103"))
+        def xMax = toDouble(dev.currentValue("parameter104")) ?: toDouble(dev.getSetting("parameter104"))
+
+        // parameter105 = Depth Minimum (Near), parameter106 = Depth Maximum (Far)
+        def yMin = toDouble(dev.currentValue("parameter105")) ?: toDouble(dev.getSetting("parameter105"))
+        def yMax = toDouble(dev.currentValue("parameter106")) ?: toDouble(dev.getSetting("parameter106"))
+
+        // parameter101 = Height Minimum (Floor), parameter102 = Height Maximum (Ceiling)
+        def zMin = toDouble(dev.currentValue("parameter101")) ?: toDouble(dev.getSetting("parameter101"))
+        def zMax = toDouble(dev.currentValue("parameter102")) ?: toDouble(dev.getSetting("parameter102"))
+
+        if (xMin == null || xMax == null || yMin == null || yMax == null || zMin == null || zMax == null) {
+            return null
+        }
+
+        return [
+                xmin: xMin / 1000.0d,
+                xmax: xMax / 1000.0d,
+                ymin: yMin / 1000.0d,
+                ymax: yMax / 1000.0d,
+                zmin: zMin / 1000.0d,
+                zmax: zMax / 1000.0d
+        ]
+    } catch (Exception ex) {
+        warnLog("Unable to retrieve device bounds for ${dev.displayName}: ${ex.message}")
+        return null
+    }
+}
+
+private boolean isPointWithinBounds(Double x, Double y, Double z, Map bounds) {
+    if (!bounds) {
+        return true
+    }
+
+    return x >= bounds.xmin && x <= bounds.xmax &&
+           y >= bounds.ymin && y <= bounds.ymax &&
+           z >= bounds.zmin && z <= bounds.zmax
 }
 
 private Double toDouble(value) {
