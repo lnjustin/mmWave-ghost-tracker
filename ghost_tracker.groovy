@@ -29,17 +29,17 @@ def mainPage() {
             paragraph renderStatBlock("Configuration Summary", getConfigurationSummaryStats())
         }
 
+        section(getInterface("header", "Statistics")) {
+            href "statsPage", title: "View Detailed Statistics", description: "Per-device graphs, clusters, and interference controls"
+            paragraph renderStatBlock("Current Status", getMainPageStatsSummary())
+        }
+
         section(getInterface("header", "Quick Actions")) {
             input "recommendNow", "button", title: "Generate Recommendation"
 
             if (state.recommendation) {
                 paragraph renderRecommendationSummary(state.recommendation)
             }
-        }
-
-        section(getInterface("header", "Statistics")) {
-            href "statsPage", title: "View Detailed Statistics", description: "Per-device graphs, clusters, and interference controls"
-            paragraph renderStatBlock("Current Status", getMainPageStatsSummary())
         }
     }
 }
@@ -312,12 +312,12 @@ def statsPage() {
                         lastDayStats
                 )
 
-                paragraph renderClusterPlot(displayData.points, displayData.outOfBoundsPoints, displayData.currentClusters, displayData.historicalClusters)
+                paragraph renderClusterPlot(displayData.points, displayData.outOfBoundsPoints, displayData.currentClusters, displayData.historicalClusters, dev)
 
                 if (stableClusters) {
                     paragraph getInterface("subHeader", "Tracked Clusters")
                     stableClusters.eachWithIndex { cluster, idx ->
-                        paragraph renderClusterDetails(cluster, idx + 1)
+                        paragraph renderClusterDetails(cluster, idx + 1, devKey)
                     }
                 } else {
                     paragraph "No stability history yet for this device."
@@ -344,6 +344,7 @@ def statsPage() {
                     paragraph "No clusters are available for interference zone selection."
                 }
 
+                input "reclusterDevice_${devKey}", "button", title: "Recluster All Points for This Device"
                 input "clearDeviceStats_${devKey}", "button", title: "Clear This Device's Statistics"
 
                 paragraph getInterface("line")
@@ -371,6 +372,19 @@ def appButtonHandler(btn) {
     if (btn.startsWith("applyZones_")) {
         def devKey = btn.substring("applyZones_".length())
         applySelectedZones(devKey)
+        return
+    }
+
+    if (btn.startsWith("splitCluster_")) {
+        def clusterKey = btn.substring("splitCluster_".length())
+        splitCluster(clusterKey)
+        return
+    }
+
+    if (btn.startsWith("reclusterDevice_")) {
+        def devKey = btn.substring("reclusterDevice_".length())
+        reclusterDevice(devKey)
+        return
     }
 }
 
@@ -786,6 +800,7 @@ private void mergeDailyCluster(Map stableCluster, Map dailyCluster, Integer curr
     stableCluster.bounds = dailyCluster.bounds
     stableCluster.radius = dailyCluster.radius
     stableCluster.density = dailyCluster.density
+    stableCluster.points = dailyCluster.points  // Store points for cluster splitting
     stableCluster.lastSeen = currentDay
     stableCluster.seenHistory = ((stableCluster.seenHistory ?: []) + currentDay).unique().sort()
     pruneSeenHistory(stableCluster, historyCutoff)
@@ -802,6 +817,7 @@ private Map buildStableCluster(Map dailyCluster, Integer currentDay) {
             bounds: cloneBounds(dailyCluster.bounds),
             radius: dailyCluster.radius,
             density: dailyCluster.density,
+            points: dailyCluster.points?.collect { clonePoint(it) },  // Store points for cluster splitting
             daysSeen: 1,
             lastSeen: currentDay,
             seenHistory: [currentDay],
@@ -1127,6 +1143,125 @@ private void applySelectedZones(String devKey) {
     }
 }
 
+private void splitCluster(String clusterKey) {
+    // Parse clusterKey format: "deviceKey_cluster_index"
+    def parts = clusterKey.split("_cluster_")
+    if (parts.size() != 2) {
+        warnLog("Invalid cluster key format: ${clusterKey}")
+        return
+    }
+
+    def devKey = parts[0]
+    def clusterIndex = (parts[1] as Integer) - 1  // Convert to 0-based index
+
+    // Get the cluster and split radius
+    def stableClusters = (state.stabilityData[devKey] ?: []) as List
+    if (clusterIndex < 0 || clusterIndex >= stableClusters.size()) {
+        warnLog("Invalid cluster index: ${clusterIndex}")
+        return
+    }
+
+    def cluster = stableClusters[clusterIndex]
+    def splitRadiusInput = settings["splitClusterRadius_${clusterKey}"]
+    def splitRadius = splitRadiusInput ? (splitRadiusInput as BigDecimal) : (cluster.radius * 0.5)
+
+    if (!cluster.points || cluster.points.size() < safeMinClusterEvents() * 2) {
+        warnLog("Cluster ${clusterIndex + 1} doesn't have enough points to split")
+        return
+    }
+
+    // Re-cluster the points with tighter radius
+    def subClusters = detectClustersDBSCAN(cluster.points, splitRadius, safeMinClusterEvents())
+
+    if (!subClusters || subClusters.size() <= 1) {
+        infoLog("Cluster ${clusterIndex + 1} could not be split with radius ${splitRadius}m - no sub-clusters found")
+        return
+    }
+
+    infoLog("Successfully split cluster ${clusterIndex + 1} into ${subClusters.size()} sub-clusters")
+
+    // Remove the original cluster
+    stableClusters.remove(clusterIndex)
+
+    // Add the new sub-clusters, preserving stability data where applicable
+    subClusters.each { subCluster ->
+        def newCluster = buildStableCluster(subCluster, state.dayIndex ?: 0)
+        // Copy stability history from parent cluster
+        newCluster.seenHistory = cluster.seenHistory ?: []
+        newCluster.daysSeen = cluster.daysSeen ?: 0
+        newCluster.lastSeen = cluster.lastSeen ?: 0
+        newCluster.consecutiveSeen = cluster.consecutiveSeen ?: 0
+        newCluster.absentStreak = cluster.absentStreak ?: 0
+        newCluster.lastMatchedDay = cluster.lastMatchedDay ?: 0
+        stableClusters << newCluster
+    }
+
+    state.stabilityData[devKey] = stableClusters
+}
+
+private void reclusterDevice(String devKey) {
+    def stableClusters = (state.stabilityData[devKey] ?: []) as List
+
+    if (!stableClusters) {
+        infoLog("No stable clusters found for device ${devKey}")
+        return
+    }
+
+    // Try to collect points from stable clusters first
+    def allPoints = []
+    stableClusters.each { cluster ->
+        if (cluster.points) {
+            allPoints.addAll(cluster.points)
+        }
+    }
+
+    // If no points in stable clusters (old clusters before fix), use snapshot points
+    if (!allPoints) {
+        def snapshotPoints = (state.lastPointsSnapshot[devKey] ?: []) as List
+        if (snapshotPoints) {
+            allPoints.addAll(snapshotPoints)
+            infoLog("Using ${allPoints.size()} snapshot points for reclustering (stable clusters don't have points stored)")
+        }
+    }
+
+    // If still no points, try current daily points
+    if (!allPoints) {
+        def dailyPoints = (state.dailyPoints[devKey] ?: []) as List
+        if (dailyPoints) {
+            allPoints.addAll(dailyPoints)
+            infoLog("Using ${allPoints.size()} current daily points for reclustering")
+        }
+    }
+
+    if (!allPoints) {
+        infoLog("No points available for reclustering device ${devKey}")
+        return
+    }
+
+    infoLog("Reclustering ${allPoints.size()} points for device ${devKey}")
+
+    // Re-run clustering on all points
+    def newClusters = detectClusters(allPoints)
+
+    if (!newClusters) {
+        infoLog("No clusters detected after reclustering")
+        return
+    }
+
+    // Replace stable clusters with new clusters, preserving the current day index
+    def currentDay = state.dayIndex ?: 0
+    def newStableClusters = []
+
+    newClusters.each { cluster ->
+        def newStable = buildStableCluster(cluster, currentDay)
+        newStableClusters << newStable
+    }
+
+    state.stabilityData[devKey] = newStableClusters
+
+    infoLog("Reclustering complete: ${newClusters.size()} new clusters created from ${allPoints.size()} points")
+}
+
 private void clearDeviceStats(String devKey) {
     state.dailyPoints?.remove(devKey)
     state.dailyOutOfBoundsPoints?.remove(devKey)
@@ -1289,7 +1424,7 @@ private BigDecimal calculateStabilityPercent(Map cluster) {
     return (((cluster.daysSeen ?: 0) as BigDecimal) / totalDays) * 100.0d
 }
 
-private String renderClusterPlot(List points, List outOfBoundsPoints, List currentClusters, List historicalClusters) {
+private String renderClusterPlot(List points, List outOfBoundsPoints, List currentClusters, List historicalClusters, dev = null) {
     if (!points && !outOfBoundsPoints && !currentClusters && !historicalClusters) {
         return "No points or cluster history available."
     }
@@ -1297,8 +1432,20 @@ private String renderClusterPlot(List points, List outOfBoundsPoints, List curre
     def allPointsForScale = []
     allPointsForScale.addAll(points ?: [])
     allPointsForScale.addAll(outOfBoundsPoints ?: [])
-    allPointsForScale.addAll((currentClusters ?: []).collect { it.center })
-    allPointsForScale.addAll((historicalClusters ?: []).collect { it.center })
+
+    // Include cluster bounds (not just centers) for proper scaling
+    (currentClusters ?: []).each { cluster ->
+        if (cluster.bounds) {
+            allPointsForScale << [x: cluster.bounds.xmin, y: cluster.bounds.ymin, z: 0]
+            allPointsForScale << [x: cluster.bounds.xmax, y: cluster.bounds.ymax, z: 0]
+        }
+    }
+    (historicalClusters ?: []).each { cluster ->
+        if (cluster.bounds) {
+            allPointsForScale << [x: cluster.bounds.xmin, y: cluster.bounds.ymin, z: 0]
+            allPointsForScale << [x: cluster.bounds.xmax, y: cluster.bounds.ymax, z: 0]
+        }
+    }
 
     def xs = allPointsForScale.collect { it.x }
     def ys = allPointsForScale.collect { it.y }
@@ -1306,6 +1453,18 @@ private String renderClusterPlot(List points, List outOfBoundsPoints, List curre
     def maxX = xs.max()
     def minY = ys.min()
     def maxY = ys.max()
+
+    // Add 20% padding around the data for better visualization
+    def xRange = maxX - minX
+    def yRange = maxY - minY
+    def xPadding = xRange > 0 ? xRange * 0.2 : 0.5
+    def yPadding = yRange > 0 ? yRange * 0.2 : 0.5
+
+    minX -= xPadding
+    maxX += xPadding
+    minY -= yPadding
+    maxY += yPadding
+
     def width = 360
     def height = 280
     def plotLeft = 44
@@ -1330,6 +1489,34 @@ private String renderClusterPlot(List points, List outOfBoundsPoints, List curre
     def svg = new StringBuilder()
     svg << "<svg width='${width}' height='${height}' viewBox='0 0 ${width} ${height}' style='border:1px solid #d0d0d0;background:#fafafa'>"
     svg << "<rect x='${plotLeft}' y='${plotTop}' width='${plotRight - plotLeft}' height='${plotBottom - plotTop}' fill='#ffffff' stroke='#d0d0d0' />"
+
+    // Draw device bounds box if out-of-bounds points exist (gray dashed box)
+    if (outOfBoundsPoints && dev) {
+        def deviceBounds = getDeviceBounds(dev)
+        if (deviceBounds) {
+            def x1 = normalizeX(deviceBounds.xmin)
+            def x2 = normalizeX(deviceBounds.xmax)
+            def y1 = normalizeY(deviceBounds.ymax)
+            def y2 = normalizeY(deviceBounds.ymin)
+            svg << "<rect x='${x1}' y='${y1}' width='${x2 - x1}' height='${y2 - y1}' fill='none' stroke='#888888' stroke-width='1' stroke-dasharray='4,2' />"
+        }
+    }
+
+    // Draw cluster bounds boxes (blue dashed box) - behind points
+    def allClusters = []
+    allClusters.addAll(currentClusters ?: [])
+    allClusters.addAll(historicalClusters ?: [])
+
+    allClusters.each { cluster ->
+        if (cluster.bounds) {
+            def x1 = normalizeX(cluster.bounds.xmin)
+            def x2 = normalizeX(cluster.bounds.xmax)
+            def y1 = normalizeY(cluster.bounds.ymax)
+            def y2 = normalizeY(cluster.bounds.ymin)
+            svg << "<rect x='${x1}' y='${y1}' width='${x2 - x1}' height='${y2 - y1}' fill='none' stroke='#1565c0' stroke-width='1' stroke-dasharray='3,2' />"
+        }
+    }
+
     svg << "<line x1='${plotLeft}' y1='${plotBottom}' x2='${plotRight}' y2='${plotBottom}' stroke='#666666' stroke-width='1' />"
     svg << "<line x1='${plotLeft}' y1='${plotTop}' x2='${plotLeft}' y2='${plotBottom}' stroke='#666666' stroke-width='1' />"
     svg << "<text x='${(plotLeft + plotRight) / 2}' y='${height - 10}' text-anchor='middle' fill='#333333' font-size='11'>X (meters)</text>"
@@ -1345,29 +1532,27 @@ private String renderClusterPlot(List points, List outOfBoundsPoints, List curre
     if (outOfBoundsPoints) {
         svg << "<text x='${plotLeft + 6}' y='${legendY}' fill='#888888' font-size='10'>Gray = out-of-bounds</text>"
         legendY += 12
+        svg << "<text x='${plotLeft + 6}' y='${legendY}' fill='#888888' font-size='10'>Gray box = device bounds</text>"
+        legendY += 12
     }
-    svg << "<text x='${plotLeft + 6}' y='${legendY}' fill='#1565c0' font-size='10'>Blue ring = saved cluster</text>"
+    svg << "<text x='${plotLeft + 6}' y='${legendY}' fill='#1565c0' font-size='10'>Blue box = cluster bounds</text>"
     legendY += 12
     svg << "<text x='${plotLeft + 6}' y='${legendY}' fill='#c62828' font-size='10'>Red dot = current cluster</text>"
+
+    // Draw all points (both in-bounds and out-of-bounds)
+    (outOfBoundsPoints ?: []).each { point ->
+        svg << "<circle cx='${normalizeX(point.x)}' cy='${normalizeY(point.y)}' r='2' fill='#888888' />"
+    }
 
     (points ?: []).each { point ->
         svg << "<circle cx='${normalizeX(point.x)}' cy='${normalizeY(point.y)}' r='2' fill='#ff9800' />"
     }
 
-    (outOfBoundsPoints ?: []).each { point ->
-        svg << "<circle cx='${normalizeX(point.x)}' cy='${normalizeY(point.y)}' r='2' fill='#888888' />"
-    }
-
-    (historicalClusters ?: []).each { cluster ->
-        def centerX = normalizeX(cluster.center.x)
-        def centerY = normalizeY(cluster.center.y)
-        svg << "<circle cx='${centerX}' cy='${centerY}' r='7' fill='none' stroke='#1565c0' stroke-width='2' stroke-dasharray='3,2' />"
-    }
-
+    // Draw current cluster centers (red dots)
     (currentClusters ?: []).each { cluster ->
         def centerX = normalizeX(cluster.center.x)
         def centerY = normalizeY(cluster.center.y)
-        svg << "<circle cx='${centerX}' cy='${centerY}' r='6' fill='#c62828' />"
+        svg << "<circle cx='${centerX}' cy='${centerY}' r='4' fill='#c62828' />"
         svg << "<text x='${centerX + 8}' y='${centerY - 8}' fill='#333333' font-size='10'>${round2(cluster.center.z)}m z</text>"
     }
 
@@ -1375,7 +1560,7 @@ private String renderClusterPlot(List points, List outOfBoundsPoints, List curre
     svg.toString()
 }
 
-private String renderClusterDetails(Map cluster, Integer displayIndex) {
+private String renderClusterDetails(Map cluster, Integer displayIndex, String devKey) {
     def bounds = cluster.bounds ?: [:]
     def status = "Observed"
 
@@ -1385,7 +1570,10 @@ private String renderClusterDetails(Map cluster, Integer displayIndex) {
         status = "Persistent"
     }
 
-    renderStatBlock("Cluster ${displayIndex}: ${status}", [
+    def hasPoints = cluster.points && cluster.points.size() > 0
+    def clusterKey = "${devKey}_cluster_${displayIndex}"
+
+    def html = renderStatBlock("Cluster ${displayIndex}: ${status}", [
             "Center": "(${round2(cluster.center.x)}, ${round2(cluster.center.y)}, ${round2(cluster.center.z)}) m",
             "X range": "${round2(bounds.xmin)} to ${round2(bounds.xmax)}",
             "Y range": "${round2(bounds.ymin)} to ${round2(bounds.ymax)}",
@@ -1397,6 +1585,16 @@ private String renderClusterDetails(Map cluster, Integer displayIndex) {
             "Missing streak": cluster.absentStreak ?: 0,
             "Stability": "${round2(cluster.stabilityPct ?: calculateStabilityPercent(cluster))}%"
     ])
+
+    // Add cluster splitting controls if the cluster has points
+    if (hasPoints && cluster.density >= safeMinClusterEvents() * 2) {
+        html += "<div style='margin-top:8px;'>"
+        html += "<input name='splitClusterRadius_${clusterKey}' type='decimal' title='Split radius (meters)' value='${round2(cluster.radius * 0.5)}' style='width:80px;'/> "
+        html += "<input name='splitCluster_${clusterKey}' type='button' value='Split Cluster ${displayIndex}' style='margin-left:4px;'/>"
+        html += "</div>"
+    }
+
+    html
 }
 
 private String describeClusterOption(Map cluster, Integer idx) {
