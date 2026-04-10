@@ -164,8 +164,8 @@ def settingsPage() {
 
             input "clusterRadius",
                     "decimal",
-                    title: "Cluster radius / match threshold (meters)",
-                    defaultValue: 0.5
+                    title: "Cluster radius / match threshold (cm)",
+                    defaultValue: 50
 
             input "minClusterEvents",
                     "number",
@@ -737,19 +737,15 @@ private Map extractPoints(def payload, dev = null) {
             return
         }
 
-        def xMeters = x / 1000.0d
-        def yMeters = y / 1000.0d
-        def zMeters = z / 1000.0d
-
         def point = [
-                x: xMeters,
-                y: yMeters,
-                z: zMeters
+                x: x,
+                y: y,
+                z: z
         ]
 
         // Apply bounds filtering if enabled
         if (bounds) {
-            if (isPointWithinBounds(xMeters, yMeters, zMeters, bounds)) {
+            if (isPointWithinBounds(x, y, z, bounds)) {
                 inBoundsPoints << point
             } else if (captureOOB) {
                 // Capture out-of-bounds points for visualization
@@ -1414,12 +1410,12 @@ private boolean isValidBounds(Map bounds) {
 
 private Map integerBounds(Map bounds) {
     [
-            xmin: Math.round((bounds.xmin ?: 0.0d) * 1000.0d) as Integer,
-            xmax: Math.round((bounds.xmax ?: 0.0d) * 1000.0d) as Integer,
-            ymin: Math.round((bounds.ymin ?: 0.0d) * 1000.0d) as Integer,
-            ymax: Math.round((bounds.ymax ?: 0.0d) * 1000.0d) as Integer,
-            zmin: Math.round((bounds.zmin ?: 0.0d) * 1000.0d) as Integer,
-            zmax: Math.round((bounds.zmax ?: 0.0d) * 1000.0d) as Integer
+            xmin: Math.round(bounds.xmin ?: 0.0d) as Integer,
+            xmax: Math.round(bounds.xmax ?: 0.0d) as Integer,
+            ymin: Math.round(bounds.ymin ?: 0.0d) as Integer,
+            ymax: Math.round(bounds.ymax ?: 0.0d) as Integer,
+            zmin: Math.round(bounds.zmin ?: 0.0d) as Integer,
+            zmax: Math.round(bounds.zmax ?: 0.0d) as Integer
     ]
 }
 
@@ -1544,12 +1540,12 @@ private Integer calculateUnclusteredPointCount(List points, List clusters) {
 
 private Map getAutoGhostBustBoundary() {
     [
-            xmin: centimetersToMeters(autoBustBoundaryXMin),
-            xmax: centimetersToMeters(autoBustBoundaryXMax),
-            ymin: centimetersToMeters(autoBustBoundaryYMin),
-            ymax: centimetersToMeters(autoBustBoundaryYMax),
-            zmin: centimetersToMeters(autoBustBoundaryZMin),
-            zmax: centimetersToMeters(autoBustBoundaryZMax)
+            xmin: toDouble(autoBustBoundaryXMin),
+            xmax: toDouble(autoBustBoundaryXMax),
+            ymin: toDouble(autoBustBoundaryYMin),
+            ymax: toDouble(autoBustBoundaryYMax),
+            zmin: toDouble(autoBustBoundaryZMin),
+            zmax: toDouble(autoBustBoundaryZMax)
     ]
 }
 
@@ -1647,15 +1643,6 @@ private Map getAggregateBustSourceCounts() {
         totals.unbusted += counts.unbusted
     }
     totals
-}
-
-private Double centimetersToMeters(value) {
-    def cm = toDouble(value)
-    if (cm == null) {
-        return null
-    }
-
-    cm / 100.0d
 }
 
 private BigDecimal calculateStabilityPercent(Map cluster) {
@@ -1762,8 +1749,8 @@ private String renderClusterPlot(List points, List outOfBoundsPoints, List curre
 
     svg << "<line x1='${plotLeft}' y1='${plotBottom}' x2='${plotRight}' y2='${plotBottom}' stroke='#666666' stroke-width='1' />"
     svg << "<line x1='${plotLeft}' y1='${plotTop}' x2='${plotLeft}' y2='${plotBottom}' stroke='#666666' stroke-width='1' />"
-    svg << "<text x='${(plotLeft + plotRight) / 2}' y='${height - 10}' text-anchor='middle' fill='#333333' font-size='11'>X (meters)</text>"
-    svg << "<text x='14' y='${(plotTop + plotBottom) / 2}' text-anchor='middle' fill='#333333' font-size='11' transform='rotate(-90 14 ${(plotTop + plotBottom) / 2})'>Y (meters)</text>"
+    svg << "<text x='${(plotLeft + plotRight) / 2}' y='${height - 10}' text-anchor='middle' fill='#333333' font-size='11'>X (cm)</text>"
+    svg << "<text x='14' y='${(plotTop + plotBottom) / 2}' text-anchor='middle' fill='#333333' font-size='11' transform='rotate(-90 14 ${(plotTop + plotBottom) / 2})'>Y (cm)</text>"
     svg << "<text x='${plotLeft}' y='${height - 24}' text-anchor='start' fill='#555555' font-size='10'>${round2(minX)}</text>"
     svg << "<text x='${plotRight}' y='${height - 24}' text-anchor='end' fill='#555555' font-size='10'>${round2(maxX)}</text>"
     svg << "<text x='${plotLeft - 6}' y='${plotBottom + 4}' text-anchor='end' fill='#555555' font-size='10'>${round2(minY)}</text>"
@@ -1796,7 +1783,7 @@ private String renderClusterPlot(List points, List outOfBoundsPoints, List curre
         def centerX = normalizeX(cluster.center.x)
         def centerY = normalizeY(cluster.center.y)
         svg << "<circle cx='${centerX}' cy='${centerY}' r='4' fill='#c62828' />"
-        svg << "<text x='${centerX + 8}' y='${centerY - 8}' fill='#333333' font-size='10'>${round2(cluster.center.z)}m z</text>"
+        svg << "<text x='${centerX + 8}' y='${centerY - 8}' fill='#333333' font-size='10'>${round2(cluster.center.z)} cm z</text>"
     }
 
     svg << "</svg>"
@@ -1817,11 +1804,11 @@ private String renderClusterDetails(Map cluster, Integer displayIndex, String de
     def clusterKey = "${devKey}_cluster_${displayIndex}"
 
     def html = renderStatBlock("Cluster ${displayIndex}: ${status}", [
-            "Center": "(${round2(cluster.center.x)}, ${round2(cluster.center.y)}, ${round2(cluster.center.z)}) m",
-            "X range": "${round2(bounds.xmin)} to ${round2(bounds.xmax)}",
-            "Y range": "${round2(bounds.ymin)} to ${round2(bounds.ymax)}",
-            "Z range": "${round2(bounds.zmin)} to ${round2(bounds.zmax)}",
-            "Radius": "${round2(cluster.radius)} m",
+            "Center": "(${round2(cluster.center.x)}, ${round2(cluster.center.y)}, ${round2(cluster.center.z)}) cm",
+            "X range": "${round2(bounds.xmin)} to ${round2(bounds.xmax)} cm",
+            "Y range": "${round2(bounds.ymin)} to ${round2(bounds.ymax)} cm",
+            "Z range": "${round2(bounds.zmin)} to ${round2(bounds.zmax)} cm",
+            "Radius": "${round2(cluster.radius)} cm",
             "Density": cluster.density ?: 0,
             "Days in window": cluster.daysSeen ?: 0,
             "Consecutive days": cluster.consecutiveSeen ?: 0,
@@ -1833,7 +1820,7 @@ private String renderClusterDetails(Map cluster, Integer displayIndex, String de
     // Add cluster splitting controls if the cluster has points
     if (hasPoints && cluster.density >= safeMinClusterEvents() * 2) {
         html += "<div style='margin-top:8px;'>"
-        html += "<input name='splitClusterRadius_${clusterKey}' type='decimal' title='Split radius (meters)' value='${round2(cluster.radius * 0.5)}' style='width:80px;'/> "
+        html += "<input name='splitClusterRadius_${clusterKey}' type='decimal' title='Split radius (cm)' value='${round2(cluster.radius * 0.5)}' style='width:80px;'/> "
         html += "<input name='splitCluster_${clusterKey}' type='button' value='Split Cluster ${displayIndex}' style='margin-left:4px;'/>"
         html += "</div>"
     }
@@ -1843,7 +1830,7 @@ private String renderClusterDetails(Map cluster, Integer displayIndex, String de
 
 private String describeClusterOption(Map cluster, Integer idx) {
     def bounds = cluster.bounds ?: [:]
-    "Cluster ${idx + 1}: X ${round2(bounds.xmin)}..${round2(bounds.xmax)}, Y ${round2(bounds.ymin)}..${round2(bounds.ymax)}, Z ${round2(bounds.zmin)}..${round2(bounds.zmax)}"
+    "Cluster ${idx + 1}: X ${round2(bounds.xmin)}..${round2(bounds.xmax)} cm, Y ${round2(bounds.ymin)}..${round2(bounds.ymax)} cm, Z ${round2(bounds.zmin)}..${round2(bounds.zmax)} cm"
 }
 
 private String renderRecommendationSummary(def recommendation) {
@@ -1853,8 +1840,8 @@ private String renderRecommendationSummary(def recommendation) {
 
     renderStatBlock("Recommended Exclusion Zone", [
             "Device": recommendation.deviceName,
-            "Center": "(${round2(recommendation.center.x)}, ${round2(recommendation.center.y)}, ${round2(recommendation.center.z)}) m",
-            "Radius": "${round2(recommendation.radius)} m",
+            "Center": "(${round2(recommendation.center.x)}, ${round2(recommendation.center.y)}, ${round2(recommendation.center.z)}) cm",
+            "Radius": "${round2(recommendation.radius)} cm",
             "Stability": "${round2(recommendation.stabilityPct)}%"
     ])
 }
@@ -1923,7 +1910,7 @@ private Map getConfigurationSummaryStats() {
             "Devices": summarizeDeviceNames(mmwaveDevices),
             "Activation": activationSummary,
             "Boundary": boundarySummary,
-            "Clustering": "${clusteringAlgorithm ?: 'DBSCAN'} / r=${clusterRadius ?: 0.5}m / min=${minClusterEvents ?: 5}",
+            "Clustering": "${clusteringAlgorithm ?: 'DBSCAN'} / r=${clusterRadius ?: 50}cm / min=${minClusterEvents ?: 5}",
             "Persistence": "history ${historyDays ?: 14}d / persistent ${persistentGhostDays ?: 2}d / busted ${bustedGhostDays ?: 2}d",
             "Auto busting": enableAutoGhostBusting ? describeAutoBustConfiguration() : "Disabled",
             "Notifications": sendPush ? "Enabled" : "Disabled"
@@ -2055,12 +2042,12 @@ private Map getDeviceBounds(dev) {
         }
 
         return [
-                xmin: xMin / 1000.0d,
-                xmax: xMax / 1000.0d,
-                ymin: yMin / 1000.0d,
-                ymax: yMax / 1000.0d,
-                zmin: zMin / 1000.0d,
-                zmax: zMax / 1000.0d
+                xmin: xMin,
+                xmax: xMax,
+                ymin: yMin,
+                ymax: yMax,
+                zmin: zMin,
+                zmax: zMax
         ]
     } catch (Exception ex) {
         warnLog("Unable to retrieve device bounds for ${dev.displayName}: ${ex.message}")
@@ -2091,7 +2078,7 @@ private Double toDouble(value) {
 }
 
 private BigDecimal safeClusterRadius() {
-    (clusterRadius ?: 0.5) as BigDecimal
+    (clusterRadius ?: 50) as BigDecimal
 }
 
 private Integer safeMinClusterEvents() {
