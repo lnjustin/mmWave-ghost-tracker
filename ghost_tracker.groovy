@@ -200,6 +200,53 @@ def settingsPage() {
                     defaultValue: 70
         }
 
+        section(getInterface("header", "Automatic Ghost Busting")) {
+            input "enableAutoGhostBusting",
+                    "bool",
+                    title: "Automatically apply interference zones for matching persistent clusters",
+                    defaultValue: false,
+                    submitOnChange: true
+
+            if (enableAutoGhostBusting) {
+                paragraph renderNoteCard("Auto Ghost Busting", "Boundary values below are in centimeters, matching the mmWave report values. Auto mode can either require the full cluster bounds to stay inside the boundary or clamp the applied interference zone to the boundary so nothing beyond it is written.")
+
+                input "autoBustMode",
+                        "enum",
+                        title: "How automatic busting should handle the boundary",
+                        options: [
+                                "Only apply when the full cluster is inside the boundary",
+                                "Apply the overlapping part of the cluster, clamped to the boundary"
+                        ],
+                        defaultValue: "Only apply when the full cluster is inside the boundary",
+                        required: true
+
+                input "autoBustBoundaryXMin",
+                        "decimal",
+                        title: "Boundary X min (cm)",
+                        required: true
+                input "autoBustBoundaryXMax",
+                        "decimal",
+                        title: "Boundary X max (cm)",
+                        required: true
+                input "autoBustBoundaryYMin",
+                        "decimal",
+                        title: "Boundary Y min (cm)",
+                        required: true
+                input "autoBustBoundaryYMax",
+                        "decimal",
+                        title: "Boundary Y max (cm)",
+                        required: true
+                input "autoBustBoundaryZMin",
+                        "decimal",
+                        title: "Boundary Z min (cm)",
+                        required: true
+                input "autoBustBoundaryZMax",
+                        "decimal",
+                        title: "Boundary Z max (cm)",
+                        required: true
+            }
+        }
+
         section(getInterface("header", "Notifications")) {
             input "sendPush",
                     "bool",
@@ -252,6 +299,7 @@ def statsPage() {
         def aggregateToday = 0
         def aggregatePersistent = 0
         def aggregateBusted = 0
+        def aggregateBustSources = getAggregateBustSourceCounts()
 
         mmwaveDevices.each { dev ->
             def displayCounts = getDisplayCounts(dev.id)
@@ -260,11 +308,14 @@ def statsPage() {
             aggregateBusted += displayCounts.bustedGhosts
         }
 
-        section(getInterface("header", "All Devices Summary")) {
-            paragraph renderStatBlock("Network Summary", [
+            section(getInterface("header", "All Devices Summary")) {
+                paragraph renderStatBlock("Network Summary", [
                     "Last processed ghosts": aggregateToday,
                     "Persistent ghosts": aggregatePersistent,
                     "Busted ghosts": aggregateBusted,
+                    "Auto-busted persistent": aggregateBustSources.autoBusted,
+                    "Manual-busted persistent": aggregateBustSources.manualBusted,
+                    "Unbusted persistent": aggregateBustSources.unbusted,
                     "Processed days": state.totalDays ?: 0
             ])
 
@@ -298,6 +349,9 @@ def statsPage() {
                         "Ghosts detected": displayCounts.ghostsToday,
                         "Persistent ghosts": displayCounts.persistentGhosts,
                         "Busted ghosts": displayCounts.bustedGhosts,
+                        "Auto-busted persistent": displayCounts.autoBusted,
+                        "Manual-busted persistent": displayCounts.manualBusted,
+                        "Unbusted persistent": displayCounts.unbusted,
                         "Points processed": lastSummary.pointCount ?: 0,
                         "Non-cluster points": lastSummary.unclusteredPointCount ?: 0
                 ]
@@ -433,6 +487,7 @@ private initializeState() {
     state.recommendation = state.recommendation ?: null
     state.activeDevices = state.activeDevices ?: [:]
     state.activationStart = state.activationStart ?: [:]
+    state.autoBustedZones = state.autoBustedZones ?: [:]
     state.lastMode = state.lastMode ?: location.mode
     state.dayIndex = state.dayIndex ?: 0
     state.totalDays = state.totalDays ?: 0
@@ -724,6 +779,7 @@ def endOfDay() {
         def unclusteredPointCount = calculateUnclusteredPointCount(points, clustersToday)
 
         updateStabilityForDay(dev.id, clustersToday)
+        applyAutomaticGhostBusting(dev)
 
         def counts = getGhostCounts(devKey, clustersToday)
         summaries[devKey] = counts + [
@@ -823,7 +879,9 @@ private Map buildStableCluster(Map dailyCluster, Integer currentDay) {
             seenHistory: [currentDay],
             consecutiveSeen: 1,
             absentStreak: 0,
-            lastMatchedDay: currentDay
+            lastMatchedDay: currentDay,
+            bustMode: null,
+            appliedBounds: null
     ]
 }
 
@@ -849,6 +907,9 @@ private String buildDailySummary() {
         lines << "Ghosts today: ${summary.ghostsToday}"
         lines << "Persistent ghosts: ${summary.persistentGhosts}"
         lines << "Busted ghosts: ${summary.bustedGhosts}"
+        lines << "Auto-busted persistent: ${summary.autoBusted ?: 0}"
+        lines << "Manual-busted persistent: ${summary.manualBusted ?: 0}"
+        lines << "Unbusted persistent: ${summary.unbusted ?: 0}"
     }
 
     lines.join("\n")
@@ -1061,11 +1122,15 @@ private Map buildCluster(List points) {
 
 private Map getGhostCounts(String devKey, List todayClusters) {
     def stableClusters = (state.stabilityData[devKey] ?: []) as List
+    def bustCounts = getPersistentBustSourceCounts(stableClusters)
 
     [
             ghostsToday: todayClusters?.size() ?: 0,
             persistentGhosts: stableClusters.count { (it.consecutiveSeen ?: 0) >= safePersistentGhostDays() },
-            bustedGhosts: stableClusters.count { (it.absentStreak ?: 0) >= safeBustedGhostDays() }
+            bustedGhosts: stableClusters.count { (it.absentStreak ?: 0) >= safeBustedGhostDays() },
+            autoBusted: bustCounts.autoBusted,
+            manualBusted: bustCounts.manualBusted,
+            unbusted: bustCounts.unbusted
     ]
 }
 
@@ -1118,20 +1183,72 @@ private void applySelectedZones(String devKey) {
     }
 
     def clusters = getSelectableClusters(dev.id)
-    selected.eachWithIndex { rawIdx, zoneIdx ->
-        def cluster = clusters[(rawIdx as Integer)]
-        if (!cluster) {
+    def selectedClusters = selected.collect { rawIdx -> clusters[(rawIdx as Integer)] }.findAll { it }
+    def appliedBoundsList = applyZonesToDevice(dev, selectedClusters.collect { [cluster: it, bounds: cloneBounds(it.bounds)] }, "manual selection")
+    updateClusterBustMode(dev.id, selectedClusters, appliedBoundsList, "manual")
+}
+
+private void applyAutomaticGhostBusting(dev) {
+    if (!enableAutoGhostBusting) {
+        clearClusterBustMode(dev.id, "auto")
+        state.autoBustedZones[deviceKey(dev.id)] = []
+        return
+    }
+
+    def autoBounds = getAutoGhostBustBoundary()
+    if (!isValidBounds(autoBounds)) {
+        clearClusterBustMode(dev.id, "auto")
+        state.autoBustedZones[deviceKey(dev.id)] = []
+        warnLog("Automatic ghost busting is enabled, but the configured boundary is invalid.")
+        return
+    }
+
+    def devKey = deviceKey(dev.id)
+    def stableClusters = getStableClusters(dev.id)
+    clearClusterBustMode(dev.id, "auto")
+    def matchingClusters = stableClusters.collect { cluster ->
+        if ((cluster.consecutiveSeen ?: 0) < safePersistentGhostDays()) {
+            return null
+        }
+
+        def appliedBounds = getAutoAppliedBoundsForCluster(cluster, autoBounds)
+        if (!appliedBounds) {
+            return null
+        }
+
+        [cluster: cluster, bounds: appliedBounds]
+    }.findAll { it }
+
+    if (!matchingClusters) {
+        state.autoBustedZones[devKey] = []
+        return
+    }
+
+    def signature = matchingClusters.collect { integerBounds(it.bounds) }
+    if (state.autoBustedZones[devKey] == signature) {
+        debugLog("Skipping auto ghost busting for ${dev.displayName}; matching bounds are unchanged.")
+        updateClusterBustMode(dev.id, matchingClusters.collect { it.cluster }, matchingClusters.collect { it.bounds }, "auto")
+        return
+    }
+
+    def appliedBoundsList = applyZonesToDevice(dev, matchingClusters, "automatic ghost busting")
+    updateClusterBustMode(dev.id, matchingClusters.collect { it.cluster }, appliedBoundsList, "auto")
+    state.autoBustedZones[devKey] = appliedBoundsList.collect { integerBounds(it) }
+}
+
+private List applyZonesToDevice(dev, List zoneSpecs, String sourceLabel) {
+    def appliedBoundsList = []
+
+    (zoneSpecs ?: []).eachWithIndex { zoneSpec, zoneIdx ->
+        def zoneBounds = zoneSpec.bounds
+        if (!isValidBounds(zoneBounds)) {
+            warnLog("Skipped invalid interference bounds for ${dev.displayName} from ${sourceLabel}")
             return
         }
 
-        if (!isValidBounds(cluster.bounds)) {
-            warnLog("Skipped invalid interference bounds for ${dev.displayName}")
-            return
-        }
-
-        def bounds = integerBounds(cluster.bounds)
-        debugLog("Applying zone ${zoneIdx + 1} to ${dev.displayName}: ${JsonOutput.toJson(bounds)}")
-        dev.setInterferenceArea(
+        def bounds = integerBounds(zoneBounds)
+        debugLog("Applying zone ${zoneIdx + 1} to ${dev.displayName} from ${sourceLabel}: ${JsonOutput.toJson(bounds)}")
+        dev.mmWaveSetInterferenceArea(
                 zoneIdx + 1,
                 bounds.xmin,
                 bounds.xmax,
@@ -1140,7 +1257,10 @@ private void applySelectedZones(String devKey) {
                 bounds.zmin,
                 bounds.zmax
         )
+        appliedBoundsList << cloneBounds(zoneBounds)
     }
+
+    appliedBoundsList
 }
 
 private void splitCluster(String clusterKey) {
@@ -1270,6 +1390,7 @@ private void clearDeviceStats(String devKey) {
     state.lastPointsSnapshot?.remove(devKey)
     state.lastOutOfBoundsSnapshot?.remove(devKey)
     state.lastClustersSnapshot?.remove(devKey)
+    state.autoBustedZones?.remove(devKey)
 
     if (state.recommendation?.deviceId == devKey) {
         state.recommendation = [message: "Recommendation cleared because that device's statistics were reset."]
@@ -1341,6 +1462,9 @@ private Map getSummaryForDevice(deviceId) {
             ghostsToday: 0,
             persistentGhosts: 0,
             bustedGhosts: 0,
+            autoBusted: 0,
+            manualBusted: 0,
+            unbusted: 0,
             pointCount: 0,
             unclusteredPointCount: 0
     ]
@@ -1367,7 +1491,10 @@ private Map getDisplayCounts(deviceId) {
     [
             ghostsToday: summary.ghostsToday ?: 0,
             persistentGhosts: summary.persistentGhosts ?: 0,
-            bustedGhosts: summary.bustedGhosts ?: 0
+            bustedGhosts: summary.bustedGhosts ?: 0,
+            autoBusted: summary.autoBusted ?: 0,
+            manualBusted: summary.manualBusted ?: 0,
+            unbusted: summary.unbusted ?: 0
     ]
 }
 
@@ -1413,6 +1540,122 @@ private List dedupeClusters(List clusters) {
 
 private Integer calculateUnclusteredPointCount(List points, List clusters) {
     Math.max(0, (points?.size() ?: 0) - ((clusters ?: []).collect { it.points?.size() ?: 0 }.sum() ?: 0))
+}
+
+private Map getAutoGhostBustBoundary() {
+    [
+            xmin: centimetersToMeters(autoBustBoundaryXMin),
+            xmax: centimetersToMeters(autoBustBoundaryXMax),
+            ymin: centimetersToMeters(autoBustBoundaryYMin),
+            ymax: centimetersToMeters(autoBustBoundaryYMax),
+            zmin: centimetersToMeters(autoBustBoundaryZMin),
+            zmax: centimetersToMeters(autoBustBoundaryZMax)
+    ]
+}
+
+private Map getAutoAppliedBoundsForCluster(Map cluster, Map boundary) {
+    if (!cluster?.bounds || !isValidBounds(boundary)) {
+        return null
+    }
+
+    if (autoBustMode == "Apply the overlapping part of the cluster, clamped to the boundary") {
+        return intersectBounds(cluster.bounds, boundary)
+    }
+
+    if (isBoundsWithinBounds(cluster.bounds, boundary)) {
+        return cloneBounds(cluster.bounds)
+    }
+
+    null
+}
+
+private Map intersectBounds(Map a, Map b) {
+    if (!a || !b) {
+        return null
+    }
+
+    def intersection = [
+            xmin: Math.max(a.xmin ?: 0.0d, b.xmin ?: 0.0d),
+            xmax: Math.min(a.xmax ?: 0.0d, b.xmax ?: 0.0d),
+            ymin: Math.max(a.ymin ?: 0.0d, b.ymin ?: 0.0d),
+            ymax: Math.min(a.ymax ?: 0.0d, b.ymax ?: 0.0d),
+            zmin: Math.max(a.zmin ?: 0.0d, b.zmin ?: 0.0d),
+            zmax: Math.min(a.zmax ?: 0.0d, b.zmax ?: 0.0d)
+    ]
+
+    isValidBounds(intersection) ? intersection : null
+}
+
+private boolean isBoundsWithinBounds(Map inner, Map outer) {
+    if (!isValidBounds(inner) || !isValidBounds(outer)) {
+        return false
+    }
+
+    inner.xmin >= outer.xmin && inner.xmax <= outer.xmax &&
+            inner.ymin >= outer.ymin && inner.ymax <= outer.ymax &&
+            inner.zmin >= outer.zmin && inner.zmax <= outer.zmax
+}
+
+private void updateClusterBustMode(deviceId, List sourceClusters, List appliedBoundsList, String bustMode) {
+    def devKey = deviceKey(deviceId)
+    def stableClusters = ((state.stabilityData[devKey] ?: []) as List).collect { cloneCluster(it) }
+    def remainingStable = stableClusters.collect { it }
+
+    sourceClusters.eachWithIndex { sourceCluster, idx ->
+        def match = findBestMatch(sourceCluster, remainingStable)
+        if (!match) {
+            return
+        }
+
+        if (bustMode == "manual" || match.bustMode != "manual") {
+            match.bustMode = bustMode
+            match.appliedBounds = cloneBounds(appliedBoundsList[idx])
+        }
+        remainingStable.remove(match)
+    }
+
+    state.stabilityData[devKey] = stableClusters
+}
+
+private void clearClusterBustMode(deviceId, String bustMode) {
+    def devKey = deviceKey(deviceId)
+    def stableClusters = ((state.stabilityData[devKey] ?: []) as List).collect { cloneCluster(it) }
+    stableClusters.each { cluster ->
+        if (cluster.bustMode == bustMode) {
+            cluster.bustMode = null
+            cluster.appliedBounds = null
+        }
+    }
+    state.stabilityData[devKey] = stableClusters
+}
+
+private Map getPersistentBustSourceCounts(List stableClusters) {
+    def persistentClusters = (stableClusters ?: []).findAll { (it.consecutiveSeen ?: 0) >= safePersistentGhostDays() }
+    [
+            autoBusted: persistentClusters.count { it.bustMode == "auto" },
+            manualBusted: persistentClusters.count { it.bustMode == "manual" },
+            unbusted: persistentClusters.count { !it.bustMode }
+    ]
+}
+
+private Map getAggregateBustSourceCounts() {
+    def totals = [autoBusted: 0, manualBusted: 0, unbusted: 0]
+    mmwaveDevices?.each { dev ->
+        def counts = getPersistentBustSourceCounts((state.stabilityData[deviceKey(dev.id)] ?: []) as List)
+        totals.autoBusted += counts.autoBusted
+        totals.manualBusted += counts.manualBusted
+        totals.unbusted += counts.unbusted
+    }
+    totals
+}
+
+private Double centimetersToMeters(value) {
+    def cm = toDouble(value)
+    if (cm == null) {
+        return null
+    }
+
+    cm / 100.0d
 }
 
 private BigDecimal calculateStabilityPercent(Map cluster) {
@@ -1583,7 +1826,8 @@ private String renderClusterDetails(Map cluster, Integer displayIndex, String de
             "Days in window": cluster.daysSeen ?: 0,
             "Consecutive days": cluster.consecutiveSeen ?: 0,
             "Missing streak": cluster.absentStreak ?: 0,
-            "Stability": "${round2(cluster.stabilityPct ?: calculateStabilityPercent(cluster))}%"
+            "Stability": "${round2(cluster.stabilityPct ?: calculateStabilityPercent(cluster))}%",
+            "Busting": describeBustMode(cluster)
     ])
 
     // Add cluster splitting controls if the cluster has points
@@ -1632,6 +1876,34 @@ private Map getMainPageOverviewStats() {
     ]
 }
 
+private String describeAutoBustConfiguration() {
+    def boundary = getAutoGhostBustBoundary()
+    def mode = (autoBustMode == "Apply the overlapping part of the cluster, clamped to the boundary") ?
+            "Clamp to boundary" : "Whole cluster only"
+
+    if (!isValidBounds(boundary)) {
+        return "${mode} / boundary incomplete"
+    }
+
+    "${mode} / cm X ${autoBustBoundaryXMin}..${autoBustBoundaryXMax}, Y ${autoBustBoundaryYMin}..${autoBustBoundaryYMax}, Z ${autoBustBoundaryZMin}..${autoBustBoundaryZMax}"
+}
+
+private String describeBustMode(Map cluster) {
+    if ((cluster.consecutiveSeen ?: 0) < safePersistentGhostDays()) {
+        return "Not persistent yet"
+    }
+
+    if (cluster.bustMode == "auto") {
+        return "Automatic"
+    }
+
+    if (cluster.bustMode == "manual") {
+        return "Manual"
+    }
+
+    "Unbusted"
+}
+
 private Map getConfigurationSummaryStats() {
     def boundarySummary = boundaryType ?: "Not set"
     if (boundaryType == "Mode Boundary") {
@@ -1653,6 +1925,7 @@ private Map getConfigurationSummaryStats() {
             "Boundary": boundarySummary,
             "Clustering": "${clusteringAlgorithm ?: 'DBSCAN'} / r=${clusterRadius ?: 0.5}m / min=${minClusterEvents ?: 5}",
             "Persistence": "history ${historyDays ?: 14}d / persistent ${persistentGhostDays ?: 2}d / busted ${bustedGhostDays ?: 2}d",
+            "Auto busting": enableAutoGhostBusting ? describeAutoBustConfiguration() : "Disabled",
             "Notifications": sendPush ? "Enabled" : "Disabled"
     ]
 }
@@ -1720,7 +1993,9 @@ private Map cloneCluster(Map cluster) {
             seenHistory: ((cluster.seenHistory ?: []) as List).collect { it },
             consecutiveSeen: cluster.consecutiveSeen ?: 0,
             absentStreak: cluster.absentStreak ?: 0,
-            lastMatchedDay: cluster.lastMatchedDay ?: 0
+            lastMatchedDay: cluster.lastMatchedDay ?: 0,
+            bustMode: cluster.bustMode,
+            appliedBounds: cloneBounds(cluster.appliedBounds)
     ]
 }
 
@@ -1736,7 +2011,9 @@ private Map snapshotCluster(Map cluster) {
             seenHistory: ((cluster.seenHistory ?: []) as List).collect { it },
             consecutiveSeen: cluster.consecutiveSeen ?: 0,
             absentStreak: cluster.absentStreak ?: 0,
-            lastMatchedDay: cluster.lastMatchedDay ?: 0
+            lastMatchedDay: cluster.lastMatchedDay ?: 0,
+            bustMode: cluster.bustMode,
+            appliedBounds: cloneBounds(cluster.appliedBounds)
     ]
 }
 
