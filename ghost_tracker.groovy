@@ -488,6 +488,8 @@ private initializeState() {
     state.activeDevices = state.activeDevices ?: [:]
     state.activationStart = state.activationStart ?: [:]
     state.autoBustedZones = state.autoBustedZones ?: [:]
+    state.autoManagedZoneRange = state.autoManagedZoneRange ?: [:]
+    state.manualManagedZoneRange = state.manualManagedZoneRange ?: [:]
     state.lastMode = state.lastMode ?: location.mode
     state.dayIndex = state.dayIndex ?: 0
     state.totalDays = state.totalDays ?: 0
@@ -1180,26 +1182,29 @@ private void applySelectedZones(String devKey) {
 
     def clusters = getSelectableClusters(dev.id)
     def selectedClusters = selected.collect { rawIdx -> clusters[(rawIdx as Integer)] }.findAll { it }
-    def appliedBoundsList = applyZonesToDevice(dev, selectedClusters.collect { [cluster: it, bounds: cloneBounds(it.bounds)] }, "manual selection")
+    def appliedBoundsList = applyZonesToDevice(dev, selectedClusters.collect { [cluster: it, bounds: cloneBounds(it.bounds)] }, "manual selection", "manual", 1)
     updateClusterBustMode(dev.id, selectedClusters, appliedBoundsList, "manual")
 }
 
 private void applyAutomaticGhostBusting(dev) {
+    def devKey = deviceKey(dev.id)
+
     if (!enableAutoGhostBusting) {
+        clearManagedZones(dev, "auto")
         clearClusterBustMode(dev.id, "auto")
-        state.autoBustedZones[deviceKey(dev.id)] = []
+        state.autoBustedZones[devKey] = []
         return
     }
 
     def autoBounds = getAutoGhostBustBoundary()
     if (!isValidBounds(autoBounds)) {
+        clearManagedZones(dev, "auto")
         clearClusterBustMode(dev.id, "auto")
-        state.autoBustedZones[deviceKey(dev.id)] = []
+        state.autoBustedZones[devKey] = []
         warnLog("Automatic ghost busting is enabled, but the configured boundary is invalid.")
         return
     }
 
-    def devKey = deviceKey(dev.id)
     def stableClusters = getStableClusters(dev.id)
     clearClusterBustMode(dev.id, "auto")
     def matchingClusters = stableClusters.collect { cluster ->
@@ -1216,6 +1221,7 @@ private void applyAutomaticGhostBusting(dev) {
     }.findAll { it }
 
     if (!matchingClusters) {
+        clearManagedZones(dev, "auto")
         state.autoBustedZones[devKey] = []
         return
     }
@@ -1227,13 +1233,21 @@ private void applyAutomaticGhostBusting(dev) {
         return
     }
 
-    def appliedBoundsList = applyZonesToDevice(dev, matchingClusters, "automatic ghost busting")
+    def autoStartIndex = getAutoZoneStartIndex(devKey)
+    def appliedBoundsList = applyZonesToDevice(dev, matchingClusters, "automatic ghost busting", "auto", autoStartIndex)
     updateClusterBustMode(dev.id, matchingClusters.collect { it.cluster }, appliedBoundsList, "auto")
     state.autoBustedZones[devKey] = appliedBoundsList.collect { integerBounds(it) }
 }
 
 private List applyZonesToDevice(dev, List zoneSpecs, String sourceLabel) {
+    applyZonesToDevice(dev, zoneSpecs, sourceLabel, null, 1)
+}
+
+private List applyZonesToDevice(dev, List zoneSpecs, String sourceLabel, String managedType, Integer startIndex) {
     def appliedBoundsList = []
+    def devKey = deviceKey(dev.id)
+    def previousRange = getManagedZoneRange(devKey, managedType)
+    def safeStartIndex = Math.max(1, startIndex ?: 1)
 
     (zoneSpecs ?: []).eachWithIndex { zoneSpec, zoneIdx ->
         def zoneBounds = zoneSpec.bounds
@@ -1243,9 +1257,10 @@ private List applyZonesToDevice(dev, List zoneSpecs, String sourceLabel) {
         }
 
         def bounds = integerBounds(zoneBounds)
-        debugLog("Applying zone ${zoneIdx + 1} to ${dev.displayName} from ${sourceLabel}: ${JsonOutput.toJson(bounds)}")
+        def actualZoneIdx = safeStartIndex + zoneIdx
+        debugLog("Applying zone ${actualZoneIdx} to ${dev.displayName} from ${sourceLabel}: ${JsonOutput.toJson(bounds)}")
         dev.mmWaveSetInterferenceArea(
-                zoneIdx + 1,
+                actualZoneIdx,
                 bounds.xmin,
                 bounds.xmax,
                 bounds.ymin,
@@ -1256,7 +1271,78 @@ private List applyZonesToDevice(dev, List zoneSpecs, String sourceLabel) {
         appliedBoundsList << cloneBounds(zoneBounds)
     }
 
+    if (managedType) {
+        def newIndexes = buildManagedZoneIndexes(safeStartIndex, (zoneSpecs ?: []).size())
+        clearManagedZoneIndexes(dev, previousRange.indexes.findAll { !newIndexes.contains(it) })
+        setManagedZoneRange(devKey, managedType, safeStartIndex, (zoneSpecs ?: []).size())
+    }
+
     appliedBoundsList
+}
+
+private Integer getAutoZoneStartIndex(String devKey) {
+    def manualRange = getManagedZoneRange(devKey, "manual")
+    (manualRange.end ?: 0) + 1
+}
+
+private void clearManagedZones(dev, String managedType) {
+    def devKey = deviceKey(dev.id)
+    def previousRange = getManagedZoneRange(devKey, managedType)
+    clearManagedZoneIndexes(dev, previousRange.indexes)
+    setManagedZoneRange(devKey, managedType, 1, 0)
+}
+
+private void clearManagedZoneIndexes(dev, List zoneIndexes) {
+    if (!dev || !zoneIndexes) {
+        return
+    }
+
+    zoneIndexes.unique().sort().each { zoneIdx ->
+        debugLog("Clearing auto-managed zone ${zoneIdx} on ${dev.displayName}")
+        // A zero-volume zone effectively removes the previously applied exclusion area.
+        dev.mmWaveSetInterferenceArea(zoneIdx, 0, 0, 0, 0, 0, 0)
+    }
+}
+
+private Map getManagedZoneRange(String devKey, String managedType) {
+    if (managedType == "auto") {
+        return normalizeManagedZoneRange(state.autoManagedZoneRange[devKey])
+    }
+    if (managedType == "manual") {
+        return normalizeManagedZoneRange(state.manualManagedZoneRange[devKey])
+    }
+    [start: 1, count: 0, end: 0, indexes: []]
+}
+
+private void setManagedZoneRange(String devKey, String managedType, Integer startIndex, Integer count) {
+    def normalized = normalizeManagedZoneRange([start: startIndex, count: count])
+    if (managedType == "auto") {
+        state.autoManagedZoneRange[devKey] = [start: normalized.start, count: normalized.count]
+    } else if (managedType == "manual") {
+        state.manualManagedZoneRange[devKey] = [start: normalized.start, count: normalized.count]
+    }
+}
+
+private Map normalizeManagedZoneRange(Map range) {
+    def start = Math.max(1, (range?.start ?: 1) as Integer)
+    def count = Math.max(0, (range?.count ?: 0) as Integer)
+    def indexes = buildManagedZoneIndexes(start, count)
+    [
+            start: start,
+            count: count,
+            end: count > 0 ? (start + count - 1) : (start - 1),
+            indexes: indexes
+    ]
+}
+
+private List buildManagedZoneIndexes(Integer startIndex, Integer count) {
+    def start = Math.max(1, startIndex ?: 1)
+    def safeCount = Math.max(0, count ?: 0)
+    if (safeCount <= 0) {
+        return []
+    }
+
+    (start..<(start + safeCount)).collect { it as Integer }
 }
 
 private void splitCluster(String clusterKey) {
@@ -1387,6 +1473,8 @@ private void clearDeviceStats(String devKey) {
     state.lastOutOfBoundsSnapshot?.remove(devKey)
     state.lastClustersSnapshot?.remove(devKey)
     state.autoBustedZones?.remove(devKey)
+    state.autoManagedZoneRange?.remove(devKey)
+    state.manualManagedZoneRange?.remove(devKey)
 
     if (state.recommendation?.deviceId == devKey) {
         state.recommendation = [message: "Recommendation cleared because that device's statistics were reset."]
@@ -1525,7 +1613,7 @@ private List dedupeClusters(List clusters) {
     def deduped = []
     (clusters ?: []).each { cluster ->
         def duplicate = deduped.find { existing ->
-            distance3D(existing.center, cluster.center) <= 0.05d
+            distance3D(existing.center, cluster.center) <= 5.0d
         }
         if (!duplicate) {
             deduped << snapshotCluster(cluster)
@@ -1676,6 +1764,11 @@ private String renderClusterPlot(List points, List outOfBoundsPoints, List curre
             allPointsForScale << [x: cluster.bounds.xmax, y: cluster.bounds.ymax, z: 0]
         }
     }
+    def deviceBounds = dev ? getDeviceBounds(dev) : null
+    if (isValidBounds(deviceBounds)) {
+        allPointsForScale << [x: deviceBounds.xmin, y: deviceBounds.ymin, z: 0]
+        allPointsForScale << [x: deviceBounds.xmax, y: deviceBounds.ymax, z: 0]
+    }
 
     def xs = allPointsForScale.collect { it.x }
     def ys = allPointsForScale.collect { it.y }
@@ -1720,16 +1813,13 @@ private String renderClusterPlot(List points, List outOfBoundsPoints, List curre
     svg << "<svg width='${width}' height='${height}' viewBox='0 0 ${width} ${height}' style='border:1px solid #d0d0d0;background:#fafafa'>"
     svg << "<rect x='${plotLeft}' y='${plotTop}' width='${plotRight - plotLeft}' height='${plotBottom - plotTop}' fill='#ffffff' stroke='#d0d0d0' />"
 
-    // Draw device bounds box if out-of-bounds points exist (gray dashed box)
-    if (outOfBoundsPoints && dev) {
-        def deviceBounds = getDeviceBounds(dev)
-        if (deviceBounds) {
-            def x1 = normalizeX(deviceBounds.xmin)
-            def x2 = normalizeX(deviceBounds.xmax)
-            def y1 = normalizeY(deviceBounds.ymax)
-            def y2 = normalizeY(deviceBounds.ymin)
-            svg << "<rect x='${x1}' y='${y1}' width='${x2 - x1}' height='${y2 - y1}' fill='none' stroke='#888888' stroke-width='1' stroke-dasharray='4,2' />"
-        }
+    // Draw device bounds box (gray dashed box)
+    if (isValidBounds(deviceBounds)) {
+        def x1 = normalizeX(deviceBounds.xmin)
+        def x2 = normalizeX(deviceBounds.xmax)
+        def y1 = normalizeY(deviceBounds.ymax)
+        def y2 = normalizeY(deviceBounds.ymin)
+        svg << "<rect x='${x1}' y='${y1}' width='${x2 - x1}' height='${y2 - y1}' fill='none' stroke='#888888' stroke-width='1' stroke-dasharray='4,2' />"
     }
 
     // Draw cluster bounds boxes (blue dashed box) - behind points
@@ -1762,6 +1852,8 @@ private String renderClusterPlot(List points, List outOfBoundsPoints, List curre
     if (outOfBoundsPoints) {
         svg << "<text x='${plotLeft + 6}' y='${legendY}' fill='#888888' font-size='10'>Gray = out-of-bounds</text>"
         legendY += 12
+    }
+    if (isValidBounds(deviceBounds)) {
         svg << "<text x='${plotLeft + 6}' y='${legendY}' fill='#888888' font-size='10'>Gray box = device bounds</text>"
         legendY += 12
     }
