@@ -154,6 +154,39 @@ def settingsPage() {
             }
         }
 
+        section(getInterface("header", "Correlation Tracking")) {
+            if (!mmwaveDevices) {
+                paragraph "Select mmWave switches first to configure cross-device correlation tracking."
+            } else {
+                paragraph getInterface("note", "For each mmWave device, choose other devices and the attributes to watch. The app will sample current attribute values during mmWave activity and summarize whether ghost-present samples and ghost appearances correlate with those values or recent state changes.")
+                input "correlationChangeWindowSeconds",
+                        "number",
+                        title: "Treat an attribute change as coincident if it happened within this many seconds before a ghost appearance",
+                        defaultValue: 60
+
+                mmwaveDevices.each { dev ->
+                    def devKey = deviceKey(dev.id)
+                    input "correlationDevices_${devKey}",
+                            "capability.actuator",
+                            title: "Devices to correlate with ${dev.displayName}",
+                            multiple: true,
+                            required: false,
+                            submitOnChange: true
+
+                    def selectedCorrelationDevices = (settings["correlationDevices_${devKey}"] ?: []) as List
+                    selectedCorrelationDevices.each { trackedDev ->
+                        def attributeOptions = getDeviceAttributeOptions(trackedDev)
+                        input "correlationAttrs_${devKey}_${deviceKey(trackedDev.id)}",
+                                "enum",
+                                title: "Attributes to track for ${trackedDev.displayName}",
+                                options: attributeOptions,
+                                multiple: true,
+                                required: false
+                    }
+                }
+            }
+        }
+
         section(getInterface("header", "Clustering")) {
             input "clusteringAlgorithm",
                     "enum",
@@ -290,7 +323,12 @@ def settingsPage() {
 def statsPage() {
     initializeState()
 
-    dynamicPage(name: "statsPage", install: false, uninstall: false) {
+    def shouldAutoRefresh = (state.statsPageRefreshUntil ?: 0L) > now()
+    if (!shouldAutoRefresh) {
+        state.statsPageRefreshUntil = null
+    }
+
+    dynamicPage(name: "statsPage", install: false, uninstall: false, refreshInterval: shouldAutoRefresh ? 1 : null) {
         if (!mmwaveDevices) {
             section { paragraph "No mmWave devices configured." }
             return
@@ -366,7 +404,16 @@ def statsPage() {
                         lastDayStats
                 )
 
-                paragraph renderClusterPlot(displayData.points, displayData.outOfBoundsPoints, displayData.currentClusters, displayData.historicalClusters, dev)
+                paragraph getInterface("subHeader", "X / Y View")
+                paragraph renderClusterPlot(displayData.points, displayData.outOfBoundsPoints, displayData.currentClusters, displayData.historicalClusters, dev, "x", "y")
+                paragraph getInterface("subHeader", "X / Z View")
+                paragraph renderClusterPlot(displayData.points, displayData.outOfBoundsPoints, displayData.currentClusters, displayData.historicalClusters, dev, "x", "z")
+
+                def correlationSummary = renderCorrelationSummary(dev.id)
+                if (correlationSummary) {
+                    paragraph getInterface("subHeader", "Correlation Tracking")
+                    paragraph correlationSummary
+                }
 
                 if (stableClusters) {
                     paragraph getInterface("subHeader", "Tracked Clusters")
@@ -414,30 +461,35 @@ def appButtonHandler(btn) {
 
     if (btn == "recommendNow") {
         generateRecommendation()
+        scheduleStatsPageRefresh()
         return
     }
 
     if (btn.startsWith("clearDeviceStats_")) {
         def devKey = btn.substring("clearDeviceStats_".length())
         clearDeviceStats(devKey)
+        scheduleStatsPageRefresh()
         return
     }
 
     if (btn.startsWith("applyZones_")) {
         def devKey = btn.substring("applyZones_".length())
         applySelectedZones(devKey)
+        scheduleStatsPageRefresh()
         return
     }
 
     if (btn.startsWith("splitCluster_")) {
         def clusterKey = btn.substring("splitCluster_".length())
         splitCluster(clusterKey)
+        scheduleStatsPageRefresh()
         return
     }
 
     if (btn.startsWith("reclusterDevice_")) {
         def devKey = btn.substring("reclusterDevice_".length())
         reclusterDevice(devKey)
+        scheduleStatsPageRefresh()
         return
     }
 }
@@ -467,6 +519,11 @@ private initialize() {
         subscribe(dev, "targetInfo", targetInfoHandler)
     }
 
+    getAllConfiguredCorrelationTrackers().each { tracker ->
+        subscribe(tracker.device, tracker.attribute, correlationAttributeHandler)
+        seedCorrelationAttributeState(tracker.device, tracker.attribute)
+    }
+
     if (activationMode == "Conditioned On Virtual Switch") {
         getChildDevices()?.each { child ->
             subscribe(child, "switch", activatorSwitchHandler)
@@ -490,6 +547,10 @@ private initializeState() {
     state.autoBustedZones = state.autoBustedZones ?: [:]
     state.autoManagedZoneRange = state.autoManagedZoneRange ?: [:]
     state.manualManagedZoneRange = state.manualManagedZoneRange ?: [:]
+    state.correlationDaily = state.correlationDaily ?: [:]
+    state.correlationHistory = state.correlationHistory ?: [:]
+    state.correlationStatus = state.correlationStatus ?: [:]
+    state.correlationGhostPresence = state.correlationGhostPresence ?: [:]
     state.lastMode = state.lastMode ?: location.mode
     state.dayIndex = state.dayIndex ?: 0
     state.totalDays = state.totalDays ?: 0
@@ -655,6 +716,22 @@ def activatorSwitchHandler(evt) {
     updateDetectionState()
 }
 
+def correlationAttributeHandler(evt) {
+    def trackedDevice = evt?.device
+    if (!trackedDevice || !evt?.name) {
+        return
+    }
+
+    def trackedKey = deviceKey(trackedDevice.id)
+    def currentStatus = (state.correlationStatus[trackedKey] ?: [:]) as Map
+    currentStatus[evt.name] = [
+            value: normalizeCorrelationValue(evt.value),
+            updatedAt: now()
+    ]
+    state.correlationStatus[trackedKey] = currentStatus
+    debugLog("Correlation attribute changed: ${trackedDevice.displayName} ${evt.name}=${evt.value}")
+}
+
 def targetInfoHandler(evt) {
     def dev = evt?.device
     if (!dev) {
@@ -694,6 +771,8 @@ def targetInfoHandler(evt) {
     } else {
         debugLog("Stored ${result.inBounds.size()} points for ${dev.displayName}; total=${currentPoints.size()}")
     }
+
+    recordCorrelationSample(dev, result)
 }
 
 private parseTargetPayload(String rawValue) {
@@ -771,7 +850,7 @@ def endOfDay() {
 
     mmwaveDevices?.each { dev ->
         def devKey = deviceKey(dev.id)
-        def points = getPointsForDevice(dev.id)
+        def points = getEffectivePointsForDevice(dev.id)
         def outOfBoundsPoints = getOutOfBoundsPointsForDevice(dev.id)
         def clustersToday = detectClusters(points)
         def unclusteredPointCount = calculateUnclusteredPointCount(points, clustersToday)
@@ -785,9 +864,11 @@ def endOfDay() {
                 unclusteredPointCount: unclusteredPointCount,
                 outOfBoundsPointCount: outOfBoundsPoints.size()
         ]
+        recordCorrelationDay(devKey, counts)
         state.lastPointsSnapshot[devKey] = points.collect { clonePoint(it) }
         state.lastOutOfBoundsSnapshot[devKey] = outOfBoundsPoints.collect { clonePoint(it) }
         state.lastClustersSnapshot[devKey] = clustersToday.collect { snapshotCluster(it) }
+        state.correlationGhostPresence[devKey] = false
 
         debugLog("Processed ${dev.displayName}: points=${points.size()}, out-of-bounds=${outOfBoundsPoints.size()}, unclustered=${unclusteredPointCount}, clusters=${clustersToday.size()}, persistent=${counts.persistentGhosts}, busted=${counts.bustedGhosts}")
     }
@@ -795,6 +876,7 @@ def endOfDay() {
     state.dailySummary = summaries
     state.dailyPoints = [:]
     state.dailyOutOfBoundsPoints = [:]
+    state.correlationDaily = [:]
     pruneOldActivationStarts()
 
     if (sendPush && notifyDailySummary) {
@@ -934,7 +1016,195 @@ private void pruneOldActivationStarts() {
 }
 
 private List getTodayClusters(deviceId) {
-    detectClusters(getPointsForDevice(deviceId))
+    detectClusters(getEffectivePointsForDevice(deviceId))
+}
+
+private List getAllConfiguredCorrelationTrackers() {
+    def trackers = []
+    mmwaveDevices?.each { dev ->
+        trackers.addAll(getConfiguredCorrelationTrackersForDevice(deviceKey(dev.id)))
+    }
+    trackers.unique { tracker -> "${tracker.mmwaveKey}:${tracker.deviceKey}:${tracker.attribute}" }
+}
+
+private List getConfiguredCorrelationTrackersForDevice(String mmwaveKey) {
+    def selectedDevices = (settings["correlationDevices_${mmwaveKey}"] ?: []) as List
+    def trackers = []
+
+    selectedDevices.each { trackedDev ->
+        def attrs = (settings["correlationAttrs_${mmwaveKey}_${deviceKey(trackedDev.id)}"] ?: []) as List
+        attrs = attrs.collect { it?.toString()?.trim() }.findAll { it }.unique()
+
+        attrs.each { attr ->
+            trackers << [
+                    mmwaveKey: mmwaveKey,
+                    device: trackedDev,
+                    deviceKey: deviceKey(trackedDev.id),
+                    deviceName: trackedDev.displayName,
+                    attribute: attr
+            ]
+        }
+    }
+
+    trackers
+}
+
+private List getDeviceAttributeOptions(dev) {
+    if (!dev) {
+        return []
+    }
+
+    try {
+        def attrs = dev.supportedAttributes ?: dev.getSupportedAttributes()
+        (attrs ?: []).collect { it?.name?.toString() }.findAll { it }.unique().sort()
+    } catch (Exception ex) {
+        debugLog("Unable to inspect attributes for ${dev.displayName}: ${ex.message}")
+        []
+    }
+}
+
+private void seedCorrelationAttributeState(dev, String attribute) {
+    if (!dev || !attribute) {
+        return
+    }
+
+    try {
+        def value = dev.currentValue(attribute)
+        if (value != null) {
+            def trackedKey = deviceKey(dev.id)
+            def currentStatus = (state.correlationStatus[trackedKey] ?: [:]) as Map
+            currentStatus[attribute] = [
+                    value: normalizeCorrelationValue(value),
+                    updatedAt: now()
+            ]
+            state.correlationStatus[trackedKey] = currentStatus
+        }
+    } catch (Exception ex) {
+        debugLog("Unable to seed correlation state for ${dev.displayName} ${attribute}: ${ex.message}")
+    }
+}
+
+private void recordCorrelationSample(dev, Map result) {
+    def mmwaveKey = deviceKey(dev?.id)
+    def trackers = getConfiguredCorrelationTrackersForDevice(mmwaveKey)
+    if (!trackers) {
+        return
+    }
+
+    def dailyForDevice = ((state.correlationDaily[mmwaveKey] ?: [:]) as Map).collectEntries { key, value ->
+        [(key): cloneCorrelationTrackerStats(value as Map)]
+    }
+    def ghostPresent = getTodayClusters(dev.id).size() > 0
+    def priorGhostPresent = state.correlationGhostPresence[mmwaveKey] ?: false
+    def ghostAppearance = ghostPresent && !priorGhostPresent
+    state.correlationGhostPresence[mmwaveKey] = ghostPresent
+    def nowMs = now()
+    def changeWindowMs = safeCorrelationChangeWindowSeconds() * 1000L
+
+    trackers.each { tracker ->
+        def trackerKey = "${tracker.deviceKey}:${tracker.attribute}"
+        def trackerStats = cloneCorrelationTrackerStats((dailyForDevice[trackerKey] ?: [
+                deviceName: tracker.deviceName,
+                attribute: tracker.attribute,
+                samples: 0,
+                ghostSamples: 0,
+                clearSamples: 0,
+                ghostAppearances: 0,
+                ghostAppearancesNearAnyChange: 0,
+                values: [:],
+                changeToValues: [:]
+        ]) as Map)
+        def currentValue = getTrackedCorrelationValue(tracker.device, tracker.attribute)
+        def valueKey = normalizeCorrelationValue(currentValue)
+        def recentChange = (((state.correlationStatus[tracker.deviceKey] ?: [:]) as Map)[tracker.attribute]?.updatedAt ?: 0L) > 0L &&
+                (nowMs - ((((state.correlationStatus[tracker.deviceKey] ?: [:]) as Map)[tracker.attribute]?.updatedAt ?: 0L) as Long)) <= changeWindowMs
+        trackerStats.samples = (trackerStats.samples ?: 0) + 1
+        if (ghostPresent) {
+            trackerStats.ghostSamples = (trackerStats.ghostSamples ?: 0) + 1
+        } else {
+            trackerStats.clearSamples = (trackerStats.clearSamples ?: 0) + 1
+        }
+        trackerStats.lastValue = valueKey
+
+        def valueStats = ((trackerStats.values ?: [:])[valueKey] ?: [
+                samples: 0,
+                ghostSamples: 0,
+                clearSamples: 0
+        ]) as Map
+        valueStats.samples = (valueStats.samples ?: 0) + 1
+        if (ghostPresent) {
+            valueStats.ghostSamples = (valueStats.ghostSamples ?: 0) + 1
+        } else {
+            valueStats.clearSamples = (valueStats.clearSamples ?: 0) + 1
+        }
+        trackerStats.values = (trackerStats.values ?: [:]) + [(valueKey): valueStats]
+
+        if (ghostAppearance) {
+            trackerStats.ghostAppearances = (trackerStats.ghostAppearances ?: 0) + 1
+            if (recentChange) {
+                trackerStats.ghostAppearancesNearAnyChange = (trackerStats.ghostAppearancesNearAnyChange ?: 0) + 1
+                def changedValueStats = ((trackerStats.changeToValues ?: [:])[valueKey] ?: [ghostAppearances: 0]) as Map
+                changedValueStats.ghostAppearances = (changedValueStats.ghostAppearances ?: 0) + 1
+                trackerStats.changeToValues = (trackerStats.changeToValues ?: [:]) + [(valueKey): changedValueStats]
+            }
+        }
+
+        dailyForDevice[trackerKey] = trackerStats
+    }
+
+    state.correlationDaily[mmwaveKey] = dailyForDevice
+}
+
+private String getTrackedCorrelationValue(dev, String attribute) {
+    def cachedValue = state.correlationStatus[deviceKey(dev?.id)]?.get(attribute)?.value
+    if (cachedValue != null) {
+        return normalizeCorrelationValue(cachedValue)
+    }
+
+    try {
+        return normalizeCorrelationValue(dev?.currentValue(attribute))
+    } catch (Exception ex) {
+        debugLog("Unable to read correlation value for ${dev?.displayName} ${attribute}: ${ex.message}")
+        return "unknown"
+    }
+}
+
+private String normalizeCorrelationValue(value) {
+    value == null ? "unknown" : value.toString()
+}
+
+private Map cloneCorrelationTrackerStats(Map stats) {
+    [
+            deviceName: stats.deviceName,
+            attribute: stats.attribute,
+            samples: stats.samples ?: 0,
+            ghostSamples: stats.ghostSamples ?: 0,
+            clearSamples: stats.clearSamples ?: 0,
+            ghostAppearances: stats.ghostAppearances ?: 0,
+            ghostAppearancesNearAnyChange: stats.ghostAppearancesNearAnyChange ?: 0,
+            lastValue: stats.lastValue,
+            values: ((stats.values ?: [:]) as Map).collectEntries { key, value ->
+                [(key): [
+                        samples: value.samples ?: 0,
+                        ghostSamples: value.ghostSamples ?: 0,
+                        clearSamples: value.clearSamples ?: 0
+                ]]
+            },
+            changeToValues: ((stats.changeToValues ?: [:]) as Map).collectEntries { key, value ->
+                [(key): [
+                        ghostAppearances: value.ghostAppearances ?: 0
+                ]]
+            }
+    ]
+}
+
+private List getEffectivePointsForDevice(deviceId) {
+    def points = getPointsForDevice(deviceId)
+    if (!filterPointsByDeviceBounds) {
+        return points
+    }
+
+    filterPointsToDeviceBounds(points, deviceKey(deviceId))
 }
 
 private List detectClusters(List points) {
@@ -1440,13 +1710,19 @@ private void reclusterDevice(String devKey) {
         return
     }
 
-    infoLog("Reclustering ${allPoints.size()} points for device ${devKey}")
+    def filteredPoints = filterPointsToDeviceBounds(allPoints, devKey)
+    if (filterPointsByDeviceBounds) {
+        infoLog("Reclustering ${filteredPoints.size()} in-bounds points for device ${devKey} (from ${allPoints.size()} total)")
+    } else {
+        infoLog("Reclustering ${filteredPoints.size()} points for device ${devKey}")
+    }
 
     // Re-run clustering on all points
-    def newClusters = detectClusters(allPoints)
+    def newClusters = detectClusters(filteredPoints)
 
     if (!newClusters) {
         infoLog("No clusters detected after reclustering")
+        state.lastClustersSnapshot[devKey] = []
         return
     }
 
@@ -1460,8 +1736,34 @@ private void reclusterDevice(String devKey) {
     }
 
     state.stabilityData[devKey] = newStableClusters
+    state.lastClustersSnapshot[devKey] = newClusters.collect { snapshotCluster(it) }
+    state.lastPointsSnapshot[devKey] = filteredPoints.collect { clonePoint(it) }
 
-    infoLog("Reclustering complete: ${newClusters.size()} new clusters created from ${allPoints.size()} points")
+    infoLog("Reclustering complete: ${newClusters.size()} new clusters created from ${filteredPoints.size()} points")
+}
+
+private void recordCorrelationDay(String devKey, Map ghostCounts) {
+    def dailyStats = ((state.correlationDaily[devKey] ?: [:]) as Map).collectEntries { key, value ->
+        [(key): cloneCorrelationTrackerStats(value as Map)]
+    }
+    if (!dailyStats) {
+        return
+    }
+
+    def history = ((state.correlationHistory[devKey] ?: []) as List).collect { entry ->
+        [
+                day: entry.day,
+                trackers: ((entry.trackers ?: [:]) as Map).collectEntries { key, value ->
+                    [(key): cloneCorrelationTrackerStats(value as Map)]
+                }
+        ]
+    }
+
+    history << [
+            day: state.dayIndex ?: 0,
+            trackers: dailyStats
+    ]
+    state.correlationHistory[devKey] = history.takeRight(safeHistoryDays())
 }
 
 private void clearDeviceStats(String devKey) {
@@ -1475,6 +1777,9 @@ private void clearDeviceStats(String devKey) {
     state.autoBustedZones?.remove(devKey)
     state.autoManagedZoneRange?.remove(devKey)
     state.manualManagedZoneRange?.remove(devKey)
+    state.correlationDaily?.remove(devKey)
+    state.correlationHistory?.remove(devKey)
+    state.correlationGhostPresence?.remove(devKey)
 
     if (state.recommendation?.deviceId == devKey) {
         state.recommendation = [message: "Recommendation cleared because that device's statistics were reset."]
@@ -1483,17 +1788,21 @@ private void clearDeviceStats(String devKey) {
 
 private boolean isValidBounds(Map bounds) {
     if (!bounds) {
+        debugLog("isValidBounds: rejected null/empty bounds")
         return false
     }
 
     def values = [bounds.xmin, bounds.xmax, bounds.ymin, bounds.ymax, bounds.zmin, bounds.zmax]
     if (values.any { it == null }) {
+        debugLog("isValidBounds: rejected bounds with null value(s): ${JsonOutput.toJson(bounds)}")
         return false
     }
 
-    bounds.xmin <= bounds.xmax &&
+    def valid = bounds.xmin <= bounds.xmax &&
             bounds.ymin <= bounds.ymax &&
             bounds.zmin <= bounds.zmax
+    debugLog("isValidBounds: ${valid ? 'accepted' : 'rejected'} ${JsonOutput.toJson(bounds)}")
+    valid
 }
 
 private Map integerBounds(Map bounds) {
@@ -1525,7 +1834,7 @@ private List getStableClusters(deviceId) {
 }
 
 private Map getDisplayData(deviceId) {
-    def currentPoints = getPointsForDevice(deviceId)
+    def currentPoints = getEffectivePointsForDevice(deviceId)
     def lastPoints = getSnapshotPoints(deviceId)
     def currentOutOfBounds = getOutOfBoundsPointsForDevice(deviceId)
     def lastOutOfBounds = getSnapshotOutOfBoundsPoints(deviceId)
@@ -1742,46 +2051,90 @@ private BigDecimal calculateStabilityPercent(Map cluster) {
     return (((cluster.daysSeen ?: 0) as BigDecimal) / totalDays) * 100.0d
 }
 
-private String renderClusterPlot(List points, List outOfBoundsPoints, List currentClusters, List historicalClusters, dev = null) {
-    if (!points && !outOfBoundsPoints && !currentClusters && !historicalClusters) {
+private String renderClusterPlot(List points, List outOfBoundsPoints, List currentClusters, List historicalClusters, dev = null, String horizontalAxis = "x", String verticalAxis = "y") {
+    def deviceBounds = dev ? getDeviceBounds(dev) : null
+    def validDeviceBounds = isValidBounds(deviceBounds)
+    def legendItems = ["<tspan fill='#ff9800'>Orange</tspan><tspan fill='#333333'> = in-bounds</tspan>"]
+    def hMinField = "${horizontalAxis}min"
+    def hMaxField = "${horizontalAxis}max"
+    def vMinField = "${verticalAxis}min"
+    def vMaxField = "${verticalAxis}max"
+    def annotationAxis = ["x", "y", "z"].find { it != horizontalAxis && it != verticalAxis }
+
+    if (!points && !outOfBoundsPoints && !currentClusters && !historicalClusters && !validDeviceBounds) {
         return "No points or cluster history available."
     }
 
+    def displayInBoundsPoints = []
+    def displayOutOfBoundsPoints = []
+    def allDisplayPoints = []
+    allDisplayPoints.addAll(points ?: [])
+    allDisplayPoints.addAll(outOfBoundsPoints ?: [])
+
+    if (validDeviceBounds) {
+        allDisplayPoints.each { point ->
+            if (isPointWithinBounds(point.x, point.y, point.z, deviceBounds)) {
+                displayInBoundsPoints << point
+            } else {
+                displayOutOfBoundsPoints << point
+            }
+        }
+    } else {
+        displayInBoundsPoints.addAll(points ?: [])
+        displayOutOfBoundsPoints.addAll(outOfBoundsPoints ?: [])
+    }
+
+    if (displayOutOfBoundsPoints) {
+        legendItems << "<tspan fill='#888888'>Gray</tspan><tspan fill='#333333'> = out-of-bounds</tspan>"
+    }
+    if (validDeviceBounds) {
+        legendItems << "<tspan fill='#888888'>Gray box</tspan><tspan fill='#333333'> = device bounds</tspan>"
+    }
+    legendItems << "<tspan fill='#1565c0'>Blue box</tspan><tspan fill='#333333'> = cluster bounds</tspan>"
+    legendItems << "<tspan fill='#c62828'>Red dot</tspan><tspan fill='#333333'> = current cluster</tspan>"
+    def legendRows = legendItems.collate(2)
+    def legendRowHeight = 12
+    def legendBandHeight = 8 + (legendRows.size() * legendRowHeight)
+
     def allPointsForScale = []
-    allPointsForScale.addAll(points ?: [])
-    allPointsForScale.addAll(outOfBoundsPoints ?: [])
+    allPointsForScale.addAll(displayInBoundsPoints.collect { [(horizontalAxis): it[horizontalAxis], (verticalAxis): it[verticalAxis]] })
+    allPointsForScale.addAll(displayOutOfBoundsPoints.collect { [(horizontalAxis): it[horizontalAxis], (verticalAxis): it[verticalAxis]] })
 
     // Include cluster bounds (not just centers) for proper scaling
     (currentClusters ?: []).each { cluster ->
         if (cluster.bounds) {
-            allPointsForScale << [x: cluster.bounds.xmin, y: cluster.bounds.ymin, z: 0]
-            allPointsForScale << [x: cluster.bounds.xmax, y: cluster.bounds.ymax, z: 0]
+            allPointsForScale << [(horizontalAxis): cluster.bounds[hMinField], (verticalAxis): cluster.bounds[vMinField]]
+            allPointsForScale << [(horizontalAxis): cluster.bounds[hMaxField], (verticalAxis): cluster.bounds[vMaxField]]
         }
     }
     (historicalClusters ?: []).each { cluster ->
         if (cluster.bounds) {
-            allPointsForScale << [x: cluster.bounds.xmin, y: cluster.bounds.ymin, z: 0]
-            allPointsForScale << [x: cluster.bounds.xmax, y: cluster.bounds.ymax, z: 0]
+            allPointsForScale << [(horizontalAxis): cluster.bounds[hMinField], (verticalAxis): cluster.bounds[vMinField]]
+            allPointsForScale << [(horizontalAxis): cluster.bounds[hMaxField], (verticalAxis): cluster.bounds[vMaxField]]
         }
     }
-    def deviceBounds = dev ? getDeviceBounds(dev) : null
-    if (isValidBounds(deviceBounds)) {
-        allPointsForScale << [x: deviceBounds.xmin, y: deviceBounds.ymin, z: 0]
-        allPointsForScale << [x: deviceBounds.xmax, y: deviceBounds.ymax, z: 0]
+    if (validDeviceBounds) {
+        allPointsForScale << [(horizontalAxis): deviceBounds[hMinField], (verticalAxis): deviceBounds[vMinField]]
+        allPointsForScale << [(horizontalAxis): deviceBounds[hMaxField], (verticalAxis): deviceBounds[vMaxField]]
     }
 
-    def xs = allPointsForScale.collect { it.x }
-    def ys = allPointsForScale.collect { it.y }
+    def xs = allPointsForScale.collect { it[horizontalAxis] }
+    def ys = allPointsForScale.collect { it[verticalAxis] }
     def minX = xs.min()
     def maxX = xs.max()
     def minY = ys.min()
     def maxY = ys.max()
 
-    // Add 20% padding around the data for better visualization
-    def xRange = maxX - minX
-    def yRange = maxY - minY
-    def xPadding = xRange > 0 ? xRange * 0.2 : 0.5
-    def yPadding = yRange > 0 ? yRange * 0.2 : 0.5
+    def boundaryXRange = validDeviceBounds ? (deviceBounds[hMaxField] - deviceBounds[hMinField]) : null
+    def boundaryYRange = validDeviceBounds ? (deviceBounds[vMaxField] - deviceBounds[vMinField]) : null
+    def dataXRange = maxX - minX
+    def dataYRange = maxY - minY
+
+    // Keep the full device boundary visible at all times and pad around it for context.
+    def xBaseRange = Math.max(dataXRange ?: 0.0d, boundaryXRange ?: 0.0d)
+    def yBaseRange = Math.max(dataYRange ?: 0.0d, boundaryYRange ?: 0.0d)
+    def xPadding = Math.max(xBaseRange * 0.12d, 10.0d)
+    def yPadding = Math.max(yBaseRange * 0.12d, 10.0d)
 
     minX -= xPadding
     maxX += xPadding
@@ -1789,11 +2142,32 @@ private String renderClusterPlot(List points, List outOfBoundsPoints, List curre
     maxY += yPadding
 
     def width = 360
-    def height = 280
-    def plotLeft = 44
+    def height = 324 + Math.max(0, legendRows.size() - 2) * 12
+    def plotLeft = 62
     def plotRight = width - 16
-    def plotTop = 18
-    def plotBottom = height - 42
+    def plotTop = legendBandHeight + 14
+    def plotBottom = height - 62
+    def plotWidth = plotRight - plotLeft
+    def plotHeight = plotBottom - plotTop
+
+    // Maintain equal units-per-pixel on both axes so the device boundary is not visually distorted.
+    def currentXRange = maxX - minX
+    def currentYRange = maxY - minY
+    if (currentXRange > 0 && currentYRange > 0) {
+        def xUnitsPerPixel = currentXRange / plotWidth
+        def yUnitsPerPixel = currentYRange / plotHeight
+        if (xUnitsPerPixel > yUnitsPerPixel) {
+            def expandedYRange = xUnitsPerPixel * plotHeight
+            def yCenter = (minY + maxY) / 2.0d
+            minY = yCenter - (expandedYRange / 2.0d)
+            maxY = yCenter + (expandedYRange / 2.0d)
+        } else if (yUnitsPerPixel > xUnitsPerPixel) {
+            def expandedXRange = yUnitsPerPixel * plotWidth
+            def xCenter = (minX + maxX) / 2.0d
+            minX = xCenter - (expandedXRange / 2.0d)
+            maxX = xCenter + (expandedXRange / 2.0d)
+        }
+    }
 
     def normalizeX = { value ->
         if (maxX == minX) {
@@ -1811,14 +2185,19 @@ private String renderClusterPlot(List points, List outOfBoundsPoints, List curre
 
     def svg = new StringBuilder()
     svg << "<svg width='${width}' height='${height}' viewBox='0 0 ${width} ${height}' style='border:1px solid #d0d0d0;background:#fafafa'>"
+    svg << "<rect x='${plotLeft}' y='8' width='${plotWidth}' height='${legendBandHeight}' rx='3' ry='3' fill='rgba(255,255,255,0.96)' stroke='#d7dde1' />"
+    legendRows.eachWithIndex { row, rowIndex ->
+        def legendText = row.join("<tspan fill='#333333'>  |  </tspan>")
+        svg << "<text x='${plotLeft + 6}' y='${20 + (rowIndex * legendRowHeight)}' fill='#333333' font-size='9'>${legendText}</text>"
+    }
     svg << "<rect x='${plotLeft}' y='${plotTop}' width='${plotRight - plotLeft}' height='${plotBottom - plotTop}' fill='#ffffff' stroke='#d0d0d0' />"
 
     // Draw device bounds box (gray dashed box)
-    if (isValidBounds(deviceBounds)) {
-        def x1 = normalizeX(deviceBounds.xmin)
-        def x2 = normalizeX(deviceBounds.xmax)
-        def y1 = normalizeY(deviceBounds.ymax)
-        def y2 = normalizeY(deviceBounds.ymin)
+    if (validDeviceBounds) {
+        def x1 = normalizeX(deviceBounds[hMinField])
+        def x2 = normalizeX(deviceBounds[hMaxField])
+        def y1 = normalizeY(deviceBounds[vMaxField])
+        def y2 = normalizeY(deviceBounds[vMinField])
         svg << "<rect x='${x1}' y='${y1}' width='${x2 - x1}' height='${y2 - y1}' fill='none' stroke='#888888' stroke-width='1' stroke-dasharray='4,2' />"
     }
 
@@ -1829,57 +2208,173 @@ private String renderClusterPlot(List points, List outOfBoundsPoints, List curre
 
     allClusters.each { cluster ->
         if (cluster.bounds) {
-            def x1 = normalizeX(cluster.bounds.xmin)
-            def x2 = normalizeX(cluster.bounds.xmax)
-            def y1 = normalizeY(cluster.bounds.ymax)
-            def y2 = normalizeY(cluster.bounds.ymin)
+            def x1 = normalizeX(cluster.bounds[hMinField])
+            def x2 = normalizeX(cluster.bounds[hMaxField])
+            def y1 = normalizeY(cluster.bounds[vMaxField])
+            def y2 = normalizeY(cluster.bounds[vMinField])
             svg << "<rect x='${x1}' y='${y1}' width='${x2 - x1}' height='${y2 - y1}' fill='none' stroke='#1565c0' stroke-width='1' stroke-dasharray='3,2' />"
         }
     }
 
     svg << "<line x1='${plotLeft}' y1='${plotBottom}' x2='${plotRight}' y2='${plotBottom}' stroke='#666666' stroke-width='1' />"
     svg << "<line x1='${plotLeft}' y1='${plotTop}' x2='${plotLeft}' y2='${plotBottom}' stroke='#666666' stroke-width='1' />"
-    svg << "<text x='${(plotLeft + plotRight) / 2}' y='${height - 10}' text-anchor='middle' fill='#333333' font-size='11'>X (cm)</text>"
-    svg << "<text x='14' y='${(plotTop + plotBottom) / 2}' text-anchor='middle' fill='#333333' font-size='11' transform='rotate(-90 14 ${(plotTop + plotBottom) / 2})'>Y (cm)</text>"
-    svg << "<text x='${plotLeft}' y='${height - 24}' text-anchor='start' fill='#555555' font-size='10'>${round2(minX)}</text>"
-    svg << "<text x='${plotRight}' y='${height - 24}' text-anchor='end' fill='#555555' font-size='10'>${round2(maxX)}</text>"
-    svg << "<text x='${plotLeft - 6}' y='${plotBottom + 4}' text-anchor='end' fill='#555555' font-size='10'>${round2(minY)}</text>"
-    svg << "<text x='${plotLeft - 6}' y='${plotTop + 4}' text-anchor='end' fill='#555555' font-size='10'>${round2(maxY)}</text>"
-
-    def legendY = plotTop + 12
-    svg << "<text x='${plotLeft + 6}' y='${legendY}' fill='#ff9800' font-size='10'>Orange = in-bounds</text>"
-    legendY += 12
-    if (outOfBoundsPoints) {
-        svg << "<text x='${plotLeft + 6}' y='${legendY}' fill='#888888' font-size='10'>Gray = out-of-bounds</text>"
-        legendY += 12
+    if (horizontalAxis == "x" && minX <= 0 && maxX >= 0) {
+        def zeroX = normalizeX(0.0d)
+        svg << "<line x1='${zeroX}' y1='${plotTop}' x2='${zeroX}' y2='${plotBottom}' stroke='#b0bec5' stroke-width='1' stroke-dasharray='2,2' />"
+        svg << "<text x='${zeroX}' y='${plotBottom + 34}' text-anchor='middle' fill='#455a64' font-size='10'>0</text>"
     }
-    if (isValidBounds(deviceBounds)) {
-        svg << "<text x='${plotLeft + 6}' y='${legendY}' fill='#888888' font-size='10'>Gray box = device bounds</text>"
-        legendY += 12
+    svg << "<text x='${(plotLeft + plotRight) / 2}' y='${height - 12}' text-anchor='middle' fill='#333333' font-size='11'>${horizontalAxis.toUpperCase()} (cm)</text>"
+    svg << "<text x='14' y='${(plotTop + plotBottom) / 2}' text-anchor='middle' fill='#333333' font-size='11' transform='rotate(-90 14 ${(plotTop + plotBottom) / 2})'>${verticalAxis.toUpperCase()} (cm)</text>"
+    svg << "<text x='${plotLeft}' y='${plotBottom + 34}' text-anchor='start' fill='#555555' font-size='10'>${round2(minX)}</text>"
+    svg << "<text x='${plotRight}' y='${plotBottom + 34}' text-anchor='end' fill='#555555' font-size='10'>${round2(maxX)}</text>"
+    svg << "<text x='${plotLeft - 24}' y='${plotBottom + 4}' text-anchor='end' fill='#555555' font-size='10'>${round2(minY)}</text>"
+    svg << "<text x='${plotLeft - 24}' y='${plotTop + 4}' text-anchor='end' fill='#555555' font-size='10'>${round2(maxY)}</text>"
+    if (validDeviceBounds) {
+        def xMinLabelX = normalizeX(deviceBounds[hMinField])
+        def xMaxLabelX = normalizeX(deviceBounds[hMaxField])
+        def yMinLabelY = normalizeY(deviceBounds[vMinField])
+        def yMaxLabelY = normalizeY(deviceBounds[vMaxField])
+        svg << "<line x1='${xMinLabelX}' y1='${plotBottom}' x2='${xMinLabelX}' y2='${plotBottom + 8}' stroke='#888888' stroke-width='1' />"
+        svg << "<line x1='${xMaxLabelX}' y1='${plotBottom}' x2='${xMaxLabelX}' y2='${plotBottom + 8}' stroke='#888888' stroke-width='1' />"
+        svg << "<text x='${xMinLabelX}' y='${plotBottom + 20}' text-anchor='middle' fill='#ef6c00' font-size='9' font-weight='bold'>${round2(deviceBounds[hMinField])}</text>"
+        svg << "<text x='${xMaxLabelX}' y='${plotBottom + 20}' text-anchor='middle' fill='#ef6c00' font-size='9' font-weight='bold'>${round2(deviceBounds[hMaxField])}</text>"
+        svg << "<line x1='${plotLeft - 7}' y1='${yMinLabelY}' x2='${plotLeft}' y2='${yMinLabelY}' stroke='#888888' stroke-width='1' />"
+        svg << "<line x1='${plotLeft - 7}' y1='${yMaxLabelY}' x2='${plotLeft}' y2='${yMaxLabelY}' stroke='#888888' stroke-width='1' />"
+        svg << "<text x='${plotLeft - 10}' y='${yMinLabelY + 4}' text-anchor='end' fill='#ef6c00' font-size='9' font-weight='bold'>${round2(deviceBounds[vMinField])}</text>"
+        svg << "<text x='${plotLeft - 10}' y='${yMaxLabelY + 4}' text-anchor='end' fill='#ef6c00' font-size='9' font-weight='bold'>${round2(deviceBounds[vMaxField])}</text>"
     }
-    svg << "<text x='${plotLeft + 6}' y='${legendY}' fill='#1565c0' font-size='10'>Blue box = cluster bounds</text>"
-    legendY += 12
-    svg << "<text x='${plotLeft + 6}' y='${legendY}' fill='#c62828' font-size='10'>Red dot = current cluster</text>"
 
     // Draw all points (both in-bounds and out-of-bounds)
-    (outOfBoundsPoints ?: []).each { point ->
-        svg << "<circle cx='${normalizeX(point.x)}' cy='${normalizeY(point.y)}' r='2' fill='#888888' />"
+    displayOutOfBoundsPoints.each { point ->
+        svg << "<circle cx='${normalizeX(point[horizontalAxis])}' cy='${normalizeY(point[verticalAxis])}' r='2' fill='#888888' />"
     }
 
-    (points ?: []).each { point ->
-        svg << "<circle cx='${normalizeX(point.x)}' cy='${normalizeY(point.y)}' r='2' fill='#ff9800' />"
+    displayInBoundsPoints.each { point ->
+        svg << "<circle cx='${normalizeX(point[horizontalAxis])}' cy='${normalizeY(point[verticalAxis])}' r='2' fill='#ff9800' />"
     }
 
     // Draw current cluster centers (red dots)
     (currentClusters ?: []).each { cluster ->
-        def centerX = normalizeX(cluster.center.x)
-        def centerY = normalizeY(cluster.center.y)
+        def centerX = normalizeX(cluster.center[horizontalAxis])
+        def centerY = normalizeY(cluster.center[verticalAxis])
         svg << "<circle cx='${centerX}' cy='${centerY}' r='4' fill='#c62828' />"
-        svg << "<text x='${centerX + 8}' y='${centerY - 8}' fill='#333333' font-size='10'>${round2(cluster.center.z)} cm z</text>"
+        if (annotationAxis && cluster.center[annotationAxis] != null) {
+            svg << "<text x='${centerX + 8}' y='${centerY - 8}' fill='#333333' font-size='10'>${annotationAxis.toUpperCase()} ${round2(cluster.center[annotationAxis])}</text>"
+        }
     }
 
     svg << "</svg>"
     svg.toString()
+}
+
+private String renderCorrelationSummary(deviceId) {
+    def devKey = deviceKey(deviceId)
+    def configuredTrackers = getConfiguredCorrelationTrackersForDevice(devKey)
+    if (!configuredTrackers) {
+        return null
+    }
+
+    def todayStats = (state.correlationDaily[devKey] ?: [:]) as Map
+    def history = ((state.correlationHistory[devKey] ?: []) as List)
+    def coincidenceWindow = safeCorrelationChangeWindowSeconds()
+    def cards = new StringBuilder()
+
+    configuredTrackers.each { tracker ->
+        def trackerKey = "${tracker.deviceKey}:${tracker.attribute}"
+        def aggregate = emptyCorrelationAggregate(tracker.deviceName, tracker.attribute)
+        history.each { entry ->
+            mergeCorrelationAggregate(aggregate, (((entry.trackers ?: [:]) as Map)[trackerKey] ?: [:]) as Map)
+        }
+        mergeCorrelationAggregate(aggregate, (todayStats[trackerKey] ?: [:]) as Map)
+
+        def ghostSamplePct = percent(aggregate.ghostSamples, aggregate.samples)
+        def anyChangePct = percent(aggregate.ghostAppearancesNearAnyChange, aggregate.ghostAppearances)
+        def topValues = ((aggregate.values ?: [:]) as Map)
+                .sort { a, b -> ((b.value.ghostSamples ?: 0) + (b.value.clearSamples ?: 0)) <=> ((a.value.ghostSamples ?: 0) + (a.value.clearSamples ?: 0)) }
+                .collect { value, stats ->
+                    "${value}: ghost ${percent(stats.ghostSamples, aggregate.ghostSamples)} | clear ${percent(stats.clearSamples, aggregate.clearSamples)}"
+                }
+                .take(3)
+        def topChangeValues = ((aggregate.changeToValues ?: [:]) as Map)
+                .sort { a, b -> (b.value.ghostAppearances ?: 0) <=> (a.value.ghostAppearances ?: 0) }
+                .collect { value, stats ->
+                    "${value}: ${percent(stats.ghostAppearances, aggregate.ghostAppearances)} of appearances"
+                }
+                .take(3)
+
+        def body = new StringBuilder()
+        body << "<div style='margin-bottom:10px;'>"
+        body << "<div style='font-weight:bold; color:#333333; margin-bottom:4px;'>${tracker.deviceName} / ${tracker.attribute}</div>"
+        body << "<div style='color:#555555; margin-bottom:4px;'>Ghost-present samples: ${aggregate.ghostSamples ?: 0} / ${aggregate.samples ?: 0} (${ghostSamplePct})</div>"
+        body << "<div style='color:#555555; margin-bottom:4px;'>Ghost appearances near any change in last ${coincidenceWindow}s: ${aggregate.ghostAppearancesNearAnyChange ?: 0} / ${aggregate.ghostAppearances ?: 0} (${anyChangePct})</div>"
+        if (aggregate.lastValue != null) {
+            body << "<div style='color:#555555; margin-bottom:4px;'>Latest sampled value: ${aggregate.lastValue}</div>"
+        }
+        if (topValues) {
+            body << "<div style='color:#555555; margin-bottom:4px;'>Value mix: ${topValues.join(' | ')}</div>"
+        }
+        if (topChangeValues) {
+            body << "<div style='color:#555555;'>Change-to values before appearance: ${topChangeValues.join(' | ')}</div>"
+        }
+        body << "</div>"
+        cards << renderNoteCard("Correlation", body.toString())
+    }
+
+    cards.toString()
+}
+
+private Map emptyCorrelationAggregate(String deviceName, String attribute) {
+    [
+            deviceName: deviceName,
+            attribute: attribute,
+            samples: 0,
+            ghostSamples: 0,
+            clearSamples: 0,
+            ghostAppearances: 0,
+            ghostAppearancesNearAnyChange: 0,
+            lastValue: null,
+            values: [:],
+            changeToValues: [:]
+    ]
+}
+
+private void mergeCorrelationAggregate(Map aggregate, Map stats) {
+    if (!stats) {
+        return
+    }
+
+    aggregate.samples = (aggregate.samples ?: 0) + (stats.samples ?: 0)
+    aggregate.ghostSamples = (aggregate.ghostSamples ?: 0) + (stats.ghostSamples ?: 0)
+    aggregate.clearSamples = (aggregate.clearSamples ?: 0) + (stats.clearSamples ?: 0)
+    aggregate.ghostAppearances = (aggregate.ghostAppearances ?: 0) + (stats.ghostAppearances ?: 0)
+    aggregate.ghostAppearancesNearAnyChange = (aggregate.ghostAppearancesNearAnyChange ?: 0) + (stats.ghostAppearancesNearAnyChange ?: 0)
+    if (stats.lastValue != null) {
+        aggregate.lastValue = stats.lastValue
+    }
+
+    ((stats.values ?: [:]) as Map).each { key, value ->
+        def existing = (aggregate.values[key] ?: [ghostSamples: 0, clearSamples: 0]) as Map
+        existing.ghostSamples = (existing.ghostSamples ?: 0) + (value.ghostSamples ?: 0)
+        existing.clearSamples = (existing.clearSamples ?: 0) + (value.clearSamples ?: 0)
+        aggregate.values[key] = existing
+    }
+
+    ((stats.changeToValues ?: [:]) as Map).each { key, value ->
+        def existing = (aggregate.changeToValues[key] ?: [ghostAppearances: 0]) as Map
+        existing.ghostAppearances = (existing.ghostAppearances ?: 0) + (value.ghostAppearances ?: 0)
+        aggregate.changeToValues[key] = existing
+    }
+}
+
+private Integer safeCorrelationChangeWindowSeconds() {
+    Math.max(1, (correlationChangeWindowSeconds ?: 60) as Integer)
+}
+
+private String percent(Number numerator, Number denominator) {
+    if (!denominator || denominator.toDouble() <= 0.0d) {
+        return "0%"
+    }
+    "${round2((numerator ?: 0).toDouble() * 100.0d / denominator.toDouble())}%"
 }
 
 private String renderClusterDetails(Map cluster, Integer displayIndex, String devKey) {
@@ -2057,6 +2552,26 @@ private String deviceKey(deviceId) {
     deviceId?.toString()
 }
 
+private void scheduleStatsPageRefresh() {
+    state.statsPageRefreshUntil = now() + 3000L
+}
+
+private List filterPointsToDeviceBounds(List points, String devKey) {
+    if (!filterPointsByDeviceBounds) {
+        return (points ?: []).collect { clonePoint(it) }
+    }
+
+    def dev = mmwaveDevices?.find { deviceKey(it?.id) == devKey }
+    def bounds = dev ? getDeviceBounds(dev) : null
+    if (!isValidBounds(bounds)) {
+        return (points ?: []).collect { clonePoint(it) }
+    }
+
+    (points ?: []).findAll { point ->
+        isPointWithinBounds(point.x, point.y, point.z, bounds)
+    }.collect { clonePoint(it) }
+}
+
 private String childDni(deviceId) {
     "${app.id}-${deviceKey(deviceId)}"
 }
@@ -2113,27 +2628,43 @@ private Map cloneBounds(Map bounds) {
 
 private Map getDeviceBounds(dev) {
     if (!dev) {
+        debugLog("getDeviceBounds: no device provided")
         return null
     }
 
     try {
         // parameter103 = Width Minimum (Left), parameter104 = Width Maximum (Right)
-        def xMin = toDouble(dev.currentValue("parameter103")) ?: toDouble(dev.getSetting("parameter103"))
-        def xMax = toDouble(dev.currentValue("parameter104")) ?: toDouble(dev.getSetting("parameter104"))
+        def currentXMin = toDouble(dev.currentValue("parameter103"))
+        def settingXMin = toDouble(dev.getSetting("parameter103"))
+        def currentXMax = toDouble(dev.currentValue("parameter104"))
+        def settingXMax = toDouble(dev.getSetting("parameter104"))
+        def xMin = firstNonNullDouble(firstNonNullDouble(currentXMin, settingXMin), -600.0d)
+        def xMax = firstNonNullDouble(firstNonNullDouble(currentXMax, settingXMax), 600.0d)
 
         // parameter105 = Depth Minimum (Near), parameter106 = Depth Maximum (Far)
-        def yMin = toDouble(dev.currentValue("parameter105")) ?: toDouble(dev.getSetting("parameter105"))
-        def yMax = toDouble(dev.currentValue("parameter106")) ?: toDouble(dev.getSetting("parameter106"))
+        def currentYMin = toDouble(dev.currentValue("parameter105"))
+        def settingYMin = toDouble(dev.getSetting("parameter105"))
+        def currentYMax = toDouble(dev.currentValue("parameter106"))
+        def settingYMax = toDouble(dev.getSetting("parameter106"))
+        def yMin = firstNonNullDouble(firstNonNullDouble(currentYMin, settingYMin), 0.0d)
+        def yMax = firstNonNullDouble(firstNonNullDouble(currentYMax, settingYMax), 600.0d)
 
         // parameter101 = Height Minimum (Floor), parameter102 = Height Maximum (Ceiling)
-        def zMin = toDouble(dev.currentValue("parameter101")) ?: toDouble(dev.getSetting("parameter101"))
-        def zMax = toDouble(dev.currentValue("parameter102")) ?: toDouble(dev.getSetting("parameter102"))
+        def currentZMin = toDouble(dev.currentValue("parameter101"))
+        def settingZMin = toDouble(dev.getSetting("parameter101"))
+        def currentZMax = toDouble(dev.currentValue("parameter102"))
+        def settingZMax = toDouble(dev.getSetting("parameter102"))
+        def zMin = firstNonNullDouble(firstNonNullDouble(currentZMin, settingZMin), -300.0d)
+        def zMax = firstNonNullDouble(firstNonNullDouble(currentZMax, settingZMax), 300.0d)
 
-        if (xMin == null || xMax == null || yMin == null || yMax == null || zMin == null || zMax == null) {
-            return null
-        }
+        debugLog("getDeviceBounds: ${dev.displayName} raw values " +
+                JsonOutput.toJson([
+                        current: [xmin: currentXMin, xmax: currentXMax, ymin: currentYMin, ymax: currentYMax, zmin: currentZMin, zmax: currentZMax],
+                        settings: [xmin: settingXMin, xmax: settingXMax, ymin: settingYMin, ymax: settingYMax, zmin: settingZMin, zmax: settingZMax],
+                        resolved: [xmin: xMin, xmax: xMax, ymin: yMin, ymax: yMax, zmin: zMin, zmax: zMax]
+                ]))
 
-        return [
+        def bounds = [
                 xmin: xMin,
                 xmax: xMax,
                 ymin: yMin,
@@ -2141,10 +2672,16 @@ private Map getDeviceBounds(dev) {
                 zmin: zMin,
                 zmax: zMax
         ]
+        debugLog("getDeviceBounds: ${dev.displayName} returning ${JsonOutput.toJson(bounds)}")
+        return bounds
     } catch (Exception ex) {
         warnLog("Unable to retrieve device bounds for ${dev.displayName}: ${ex.message}")
         return null
     }
+}
+
+private Double firstNonNullDouble(Double primary, Double fallback) {
+    primary != null ? primary : fallback
 }
 
 private boolean isPointWithinBounds(Double x, Double y, Double z, Map bounds) {
