@@ -29,8 +29,8 @@ def mainPage() {
             paragraph renderStatBlock("Configuration Summary", getConfigurationSummaryStats())
         }
 
-        section(getInterface("header", "Statistics")) {
-            href "statsPage", title: "View Detailed Statistics", description: "Per-device graphs, clusters, and interference controls"
+        section(getInterface("header", "Analysis & Controls")) {
+            href "statsPage", title: "View Device Analysis And Interference Controls", description: "Per-device graphs, cluster states, and interference area controls"
             paragraph renderStatBlock("Current Status", getMainPageStatsSummary())
         }
 
@@ -350,11 +350,13 @@ def statsPage() {
             section(getInterface("header", "All Devices Summary")) {
                 paragraph renderStatBlock("Network Summary", [
                     "Last processed ghosts": aggregateToday,
+                    "Detected, not persistent": sortedDevices.collect { getDisplayCounts(it.id).detectedGhosts ?: 0 }.sum() ?: 0,
                     "Persistent ghosts": aggregatePersistent,
+                    "Targeted ghosts": sortedDevices.collect { getDisplayCounts(it.id).targetedGhosts ?: 0 }.sum() ?: 0,
                     "Busted ghosts": aggregateBusted,
-                    "Auto-busted persistent": aggregateBustSources.autoBusted,
-                    "Manual-busted persistent": aggregateBustSources.manualBusted,
-                    "Unbusted persistent": aggregateBustSources.unbusted,
+                    "Auto-targeted persistent": aggregateBustSources.autoBusted,
+                    "Manual-targeted persistent": aggregateBustSources.manualBusted,
+                    "Untargeted persistent": aggregateBustSources.unbusted,
                     "Processed days": state.totalDays ?: 0
             ])
 
@@ -397,12 +399,14 @@ def statsPage() {
                 }
 
                 def lastDayStats = [
+                        "Detected, not persistent": displayCounts.detectedGhosts,
                         "Ghosts detected": displayCounts.ghostsToday,
                         "Persistent ghosts": displayCounts.persistentGhosts,
+                        "Targeted ghosts": displayCounts.targetedGhosts,
                         "Busted ghosts": displayCounts.bustedGhosts,
-                        "Auto-busted persistent": displayCounts.autoBusted,
-                        "Manual-busted persistent": displayCounts.manualBusted,
-                        "Unbusted persistent": displayCounts.unbusted,
+                        "Auto-targeted persistent": displayCounts.autoBusted,
+                        "Manual-targeted persistent": displayCounts.manualBusted,
+                        "Untargeted persistent": displayCounts.unbusted,
                         "Points processed": lastSummary.pointCount ?: 0,
                         "Non-cluster points": lastSummary.unclusteredPointCount ?: 0
                 ]
@@ -448,17 +452,40 @@ def statsPage() {
                 if (displayData.selectableClusters) {
                     input "blockClusters_${devKey}",
                             "enum",
-                            title: "Clusters to convert to interference zones",
-                            multiple: true,
+                            title: "Cluster to set as an interference area",
+                            multiple: false,
                             required: false,
                             options: displayData.selectableClusters.collectEntries { cluster ->
                                 def idx = displayData.selectableClusters.indexOf(cluster)
                                 [(idx.toString()): describeClusterOption(cluster, idx)]
                             }
-                    input "applyZones_${devKey}", "button", title: "Apply Selected Interference Zones"
+                    input "targetAreaIndex_${devKey}",
+                            "enum",
+                            title: "Interference area index to write on the device (0-3)",
+                            multiple: false,
+                            required: false,
+                            options: interferenceAreaIndexOptions()
+                    input "applyZones_${devKey}", "button", title: "Set Selected Cluster As Interference Area"
                 } else {
                     paragraph "No clusters are available for interference zone selection."
                 }
+
+                paragraph renderInterferenceAreasCard(dev.id)
+                paragraph renderNoteCard("Manual Area Memory", "Use the fields below to record an interference area that already exists on the device. This does not write to the device; it only lets the app remember the area for tracking targeted and busted ghosts.")
+                input "manualAreaIndex_${devKey}",
+                        "enum",
+                        title: "Remembered interference area index (0-3)",
+                        multiple: false,
+                        required: false,
+                        options: interferenceAreaIndexOptions()
+                input "manualAreaXMin_${devKey}", "decimal", title: "X min (cm)", required: false
+                input "manualAreaXMax_${devKey}", "decimal", title: "X max (cm)", required: false
+                input "manualAreaYMin_${devKey}", "decimal", title: "Y min (cm)", required: false
+                input "manualAreaYMax_${devKey}", "decimal", title: "Y max (cm)", required: false
+                input "manualAreaZMin_${devKey}", "decimal", title: "Z min (cm)", required: false
+                input "manualAreaZMax_${devKey}", "decimal", title: "Z max (cm)", required: false
+                input "saveManualArea_${devKey}", "button", title: "Remember Manual Interference Area"
+                input "clearRememberedArea_${devKey}", "button", title: "Clear Remembered Interference Area"
 
                 input "reclusterDevice_${devKey}", "button", title: "Recluster All Points for This Device"
                 input "clearDeviceStats_${devKey}", "button", title: "Clear This Device's Statistics"
@@ -490,6 +517,20 @@ def appButtonHandler(btn) {
     if (btn.startsWith("applyZones_")) {
         def devKey = btn.substring("applyZones_".length())
         applySelectedZones(devKey)
+        scheduleStatsPageRefresh()
+        return
+    }
+
+    if (btn.startsWith("saveManualArea_")) {
+        def devKey = btn.substring("saveManualArea_".length())
+        saveManualInterferenceArea(devKey)
+        scheduleStatsPageRefresh()
+        return
+    }
+
+    if (btn.startsWith("clearRememberedArea_")) {
+        def devKey = btn.substring("clearRememberedArea_".length())
+        clearRememberedInterferenceArea(devKey)
         scheduleStatsPageRefresh()
         return
     }
@@ -560,6 +601,7 @@ private initializeState() {
     state.activeDevices = state.activeDevices ?: [:]
     state.activationStart = state.activationStart ?: [:]
     state.autoBustedZones = state.autoBustedZones ?: [:]
+    state.interferenceAreas = state.interferenceAreas ?: [:]
     state.autoManagedZoneRange = state.autoManagedZoneRange ?: [:]
     state.manualManagedZoneRange = state.manualManagedZoneRange ?: [:]
     state.correlationDaily = state.correlationDaily ?: [:]
@@ -943,6 +985,7 @@ private updateStabilityForDay(deviceId, List clustersToday) {
     state.stabilityData[devKey] = stableClusters.findAll { cluster ->
         cluster.daysSeen > 0 || (cluster.absentStreak ?: 0) < safeHistoryDays()
     }
+    syncClusterTargetsForDevice(devKey)
 }
 
 private void recordActiveTrackingDay(String devKey, Integer currentDay, boolean wasActiveToday) {
@@ -1019,6 +1062,8 @@ private Map buildStableCluster(Map dailyCluster, Integer currentDay) {
             absentStreak: 0,
             lastMatchedDay: currentDay,
             bustMode: null,
+            targetSource: null,
+            targetAreaIndex: null,
             appliedBounds: null
     ]
 }
@@ -1043,11 +1088,13 @@ private String buildDailySummary() {
         }
         lines << "Non-cluster points: ${summary.unclusteredPointCount ?: 0}"
         lines << "Ghosts today: ${summary.ghostsToday}"
+        lines << "Detected, not persistent: ${summary.detectedGhosts ?: 0}"
         lines << "Persistent ghosts: ${summary.persistentGhosts}"
+        lines << "Targeted ghosts: ${summary.targetedGhosts ?: 0}"
         lines << "Busted ghosts: ${summary.bustedGhosts}"
-        lines << "Auto-busted persistent: ${summary.autoBusted ?: 0}"
-        lines << "Manual-busted persistent: ${summary.manualBusted ?: 0}"
-        lines << "Unbusted persistent: ${summary.unbusted ?: 0}"
+        lines << "Auto-targeted persistent: ${summary.autoBusted ?: 0}"
+        lines << "Manual-targeted persistent: ${summary.manualBusted ?: 0}"
+        lines << "Untargeted persistent: ${summary.unbusted ?: 0}"
     }
 
     lines.join("\n")
@@ -1452,8 +1499,10 @@ private Map getGhostCounts(String devKey, List todayClusters) {
 
     [
             ghostsToday: todayClusters?.size() ?: 0,
-            persistentGhosts: stableClusters.count { (it.consecutiveSeen ?: 0) >= safePersistentGhostDays() },
-            bustedGhosts: stableClusters.count { (it.absentStreak ?: 0) >= safeBustedGhostDays() },
+            detectedGhosts: stableClusters.count { !isClusterPersistent(it) && !isClusterTargeted(it) && !isClusterBusted(it) },
+            persistentGhosts: stableClusters.count { isClusterPersistent(it) && !isClusterTargeted(it) && !isClusterBusted(it) },
+            targetedGhosts: stableClusters.count { isClusterTargeted(it) && !isClusterBusted(it) },
+            bustedGhosts: stableClusters.count { isClusterBusted(it) },
             autoBusted: bustCounts.autoBusted,
             manualBusted: bustCounts.manualBusted,
             unbusted: bustCounts.unbusted
@@ -1503,15 +1552,26 @@ private void applySelectedZones(String devKey) {
         return
     }
 
-    def selected = settings["blockClusters_${devKey}"]
-    if (!selected) {
+    def selectedRaw = settings["blockClusters_${devKey}"]
+    def selectedIndex = selectedRaw instanceof Collection ? selectedRaw?.find { it != null } : selectedRaw
+    def areaIndex = safeInterferenceAreaIndex(settings["targetAreaIndex_${devKey}"])
+    if (selectedIndex == null || areaIndex == null) {
+        warnLog("Choose both a cluster and an interference area index for ${dev.displayName} before applying.")
         return
     }
 
     def clusters = getSelectableClusters(dev.id)
-    def selectedClusters = selected.collect { rawIdx -> clusters[(rawIdx as Integer)] }.findAll { it }
-    def appliedBoundsList = applyZonesToDevice(dev, selectedClusters.collect { [cluster: it, bounds: cloneBounds(it.bounds)] }, "manual selection", "manual", 1)
-    updateClusterBustMode(dev.id, selectedClusters, appliedBoundsList, "manual")
+    def selectedCluster = clusters[(selectedIndex as Integer)]
+    if (!selectedCluster?.bounds || !isValidBounds(selectedCluster.bounds)) {
+        warnLog("Selected cluster is not available for ${dev.displayName}.")
+        return
+    }
+
+    def zoneSpec = [cluster: selectedCluster, bounds: cloneBounds(selectedCluster.bounds), areaIndex: areaIndex]
+    def appliedZoneSpecs = applyZonesToDevice(dev, [zoneSpec], "manual cluster selection")
+    rememberAppliedZones(devKey, appliedZoneSpecs, "manual")
+    updateClusterBustMode(dev.id, [selectedCluster], appliedZoneSpecs, "manual")
+    syncClusterTargetsForDevice(devKey)
 }
 
 private void applyAutomaticGhostBusting(dev) {
@@ -1521,6 +1581,7 @@ private void applyAutomaticGhostBusting(dev) {
         clearManagedZones(dev, "auto")
         clearClusterBustMode(dev.id, "auto")
         state.autoBustedZones[devKey] = []
+        syncClusterTargetsForDevice(devKey)
         return
     }
 
@@ -1536,7 +1597,7 @@ private void applyAutomaticGhostBusting(dev) {
     def stableClusters = getStableClusters(dev.id)
     clearClusterBustMode(dev.id, "auto")
     def matchingClusters = stableClusters.collect { cluster ->
-        if ((cluster.consecutiveSeen ?: 0) < safePersistentGhostDays()) {
+        if (!isClusterPersistent(cluster) || isClusterTargeted(cluster)) {
             return null
         }
 
@@ -1551,44 +1612,58 @@ private void applyAutomaticGhostBusting(dev) {
     if (!matchingClusters) {
         clearManagedZones(dev, "auto")
         state.autoBustedZones[devKey] = []
+        syncClusterTargetsForDevice(devKey)
         return
     }
 
-    def signature = matchingClusters.collect { integerBounds(it.bounds) }
+    def assignedIndexes = getAutoAssignableIndexes(devKey, matchingClusters.size())
+    if (!assignedIndexes) {
+        warnLog("No free interference area indexes remain for automatic ghost busting on ${dev.displayName}.")
+        clearManagedZones(dev, "auto")
+        state.autoBustedZones[devKey] = []
+        syncClusterTargetsForDevice(devKey)
+        return
+    }
+
+    def limitedMatches = []
+    matchingClusters.take(assignedIndexes.size()).eachWithIndex { spec, idx ->
+        limitedMatches << (spec + [areaIndex: assignedIndexes[idx]])
+    }
+    def signature = limitedMatches.collect { [areaIndex: it.areaIndex, bounds: integerBounds(it.bounds)] }
     if (state.autoBustedZones[devKey] == signature) {
         debugLog("Skipping auto ghost busting for ${dev.displayName}; matching bounds are unchanged.")
-        updateClusterBustMode(dev.id, matchingClusters.collect { it.cluster }, matchingClusters.collect { it.bounds }, "auto")
+        updateClusterBustMode(dev.id, limitedMatches.collect { it.cluster }, limitedMatches, "auto")
+        syncClusterTargetsForDevice(devKey)
         return
     }
 
-    def autoStartIndex = getAutoZoneStartIndex(devKey)
-    def appliedBoundsList = applyZonesToDevice(dev, matchingClusters, "automatic ghost busting", "auto", autoStartIndex)
-    updateClusterBustMode(dev.id, matchingClusters.collect { it.cluster }, appliedBoundsList, "auto")
-    state.autoBustedZones[devKey] = appliedBoundsList.collect { integerBounds(it) }
+    clearManagedZones(dev, "auto")
+    def appliedZoneSpecs = applyZonesToDevice(dev, limitedMatches, "automatic ghost busting")
+    rememberAppliedZones(devKey, appliedZoneSpecs, "auto")
+    updateClusterBustMode(dev.id, limitedMatches.collect { it.cluster }, appliedZoneSpecs, "auto")
+    state.autoBustedZones[devKey] = appliedZoneSpecs.collect { [areaIndex: it.areaIndex, bounds: integerBounds(it.bounds)] }
+    syncClusterTargetsForDevice(devKey)
 }
 
 private List applyZonesToDevice(dev, List zoneSpecs, String sourceLabel) {
-    applyZonesToDevice(dev, zoneSpecs, sourceLabel, null, 1)
-}
+    def appliedZoneSpecs = []
 
-private List applyZonesToDevice(dev, List zoneSpecs, String sourceLabel, String managedType, Integer startIndex) {
-    def appliedBoundsList = []
-    def devKey = deviceKey(dev.id)
-    def previousRange = getManagedZoneRange(devKey, managedType)
-    def safeStartIndex = Math.max(1, startIndex ?: 1)
-
-    (zoneSpecs ?: []).eachWithIndex { zoneSpec, zoneIdx ->
+    (zoneSpecs ?: []).each { zoneSpec ->
         def zoneBounds = zoneSpec.bounds
+        def areaIndex = safeInterferenceAreaIndex(zoneSpec.areaIndex)
         if (!isValidBounds(zoneBounds)) {
             warnLog("Skipped invalid interference bounds for ${dev.displayName} from ${sourceLabel}")
             return
         }
+        if (areaIndex == null) {
+            warnLog("Skipped interference area with invalid index for ${dev.displayName} from ${sourceLabel}")
+            return
+        }
 
         def bounds = integerBounds(zoneBounds)
-        def actualZoneIdx = safeStartIndex + zoneIdx
-        debugLog("Applying zone ${actualZoneIdx} to ${dev.displayName} from ${sourceLabel}: ${JsonOutput.toJson(bounds)}")
+        debugLog("Applying interference area ${areaIndex} to ${dev.displayName} from ${sourceLabel}: ${JsonOutput.toJson(bounds)}")
         dev.mmWaveSetInterferenceArea(
-                actualZoneIdx,
+                areaIndex,
                 bounds.xmin,
                 bounds.xmax,
                 bounds.ymin,
@@ -1596,28 +1671,23 @@ private List applyZonesToDevice(dev, List zoneSpecs, String sourceLabel, String 
                 bounds.zmin,
                 bounds.zmax
         )
-        appliedBoundsList << cloneBounds(zoneBounds)
+        appliedZoneSpecs << [
+                areaIndex: areaIndex,
+                bounds: cloneBounds(zoneBounds),
+                cluster: zoneSpec.cluster
+        ]
     }
 
-    if (managedType) {
-        def newIndexes = buildManagedZoneIndexes(safeStartIndex, (zoneSpecs ?: []).size())
-        clearManagedZoneIndexes(dev, previousRange.indexes.findAll { !newIndexes.contains(it) })
-        setManagedZoneRange(devKey, managedType, safeStartIndex, (zoneSpecs ?: []).size())
-    }
-
-    appliedBoundsList
-}
-
-private Integer getAutoZoneStartIndex(String devKey) {
-    def manualRange = getManagedZoneRange(devKey, "manual")
-    (manualRange.end ?: 0) + 1
+    appliedZoneSpecs
 }
 
 private void clearManagedZones(dev, String managedType) {
     def devKey = deviceKey(dev.id)
-    def previousRange = getManagedZoneRange(devKey, managedType)
-    clearManagedZoneIndexes(dev, previousRange.indexes)
-    setManagedZoneRange(devKey, managedType, 1, 0)
+    def indexes = getRememberedInterferenceAreas(devKey)
+            .findAll { it.source == managedType }
+            .collect { it.areaIndex as Integer }
+    clearManagedZoneIndexes(dev, indexes)
+    indexes.each { idx -> clearRememberedInterferenceArea(devKey, idx as Integer, false) }
 }
 
 private void clearManagedZoneIndexes(dev, List zoneIndexes) {
@@ -1629,6 +1699,113 @@ private void clearManagedZoneIndexes(dev, List zoneIndexes) {
         debugLog("Clearing auto-managed zone ${zoneIdx} on ${dev.displayName}")
         // A zero-volume zone effectively removes the previously applied exclusion area.
         dev.mmWaveSetInterferenceArea(zoneIdx, 0, 0, 0, 0, 0, 0)
+    }
+}
+
+private Map interferenceAreaIndexOptions() {
+    ["0": "0", "1": "1", "2": "2", "3": "3"]
+}
+
+private Integer safeInterferenceAreaIndex(value) {
+    if (value == null || value == "") {
+        return null
+    }
+
+    try {
+        def idx = value as Integer
+        (idx >= 0 && idx <= 3) ? idx : null
+    } catch (Exception ignored) {
+        null
+    }
+}
+
+private List getRememberedInterferenceAreas(String devKey) {
+    (((state.interferenceAreas ?: [:])[devKey] ?: [:]) as Map).collect { idx, area ->
+        [
+                areaIndex: idx as Integer,
+                bounds: cloneBounds(area.bounds),
+                source: area.source ?: "manual-entry",
+                updatedAt: area.updatedAt ?: 0L
+        ]
+    }.sort { a, b -> (a.areaIndex as Integer) <=> (b.areaIndex as Integer) }
+}
+
+private void rememberInterferenceArea(String devKey, Integer areaIndex, Map bounds, String source) {
+    if (!devKey || areaIndex == null || !isValidBounds(bounds)) {
+        return
+    }
+
+    def current = (((state.interferenceAreas ?: [:])[devKey] ?: [:]) as Map).collectEntries { key, value ->
+        [(key): [bounds: cloneBounds(value.bounds), source: value.source, updatedAt: value.updatedAt]]
+    }
+    current[areaIndex.toString()] = [
+            bounds: cloneBounds(bounds),
+            source: source,
+            updatedAt: now()
+    ]
+    state.interferenceAreas[devKey] = current
+}
+
+private void rememberAppliedZones(String devKey, List appliedZoneSpecs, String source) {
+    (appliedZoneSpecs ?: []).each { zoneSpec ->
+        rememberInterferenceArea(devKey, zoneSpec.areaIndex as Integer, zoneSpec.bounds as Map, source)
+    }
+}
+
+private List getAutoAssignableIndexes(String devKey, Integer neededCount) {
+    def remembered = getRememberedInterferenceAreas(devKey)
+    def reserved = remembered.findAll { it.source != "auto" }.collect { it.areaIndex as Integer }
+    def existingAuto = remembered.findAll { it.source == "auto" }.collect { it.areaIndex as Integer }.sort()
+    def free = (0..3).findAll { !reserved.contains(it) && !existingAuto.contains(it) }
+    (existingAuto + free).take(Math.max(0, neededCount ?: 0))
+}
+
+private Map getManualInterferenceAreaInput(String devKey) {
+    [
+            areaIndex: safeInterferenceAreaIndex(settings["manualAreaIndex_${devKey}"]),
+            bounds: [
+                    xmin: toDouble(settings["manualAreaXMin_${devKey}"]),
+                    xmax: toDouble(settings["manualAreaXMax_${devKey}"]),
+                    ymin: toDouble(settings["manualAreaYMin_${devKey}"]),
+                    ymax: toDouble(settings["manualAreaYMax_${devKey}"]),
+                    zmin: toDouble(settings["manualAreaZMin_${devKey}"]),
+                    zmax: toDouble(settings["manualAreaZMax_${devKey}"])
+            ]
+    ]
+}
+
+private void saveManualInterferenceArea(String devKey) {
+    def input = getManualInterferenceAreaInput(devKey)
+    if (input.areaIndex == null || !isValidBounds(input.bounds as Map)) {
+        warnLog("Enter a valid interference area index and bounds before saving the remembered area for ${devKey}.")
+        return
+    }
+
+    rememberInterferenceArea(devKey, input.areaIndex as Integer, input.bounds as Map, "manual-entry")
+    syncClusterTargetsForDevice(devKey)
+}
+
+private void clearRememberedInterferenceArea(String devKey) {
+    def areaIndex = safeInterferenceAreaIndex(settings["manualAreaIndex_${devKey}"])
+    if (areaIndex == null) {
+        warnLog("Choose an interference area index to clear for ${devKey}.")
+        return
+    }
+    clearRememberedInterferenceArea(devKey, areaIndex, true)
+}
+
+private void clearRememberedInterferenceArea(String devKey, Integer areaIndex, boolean syncTargets) {
+    if (!devKey || areaIndex == null) {
+        return
+    }
+
+    def current = (((state.interferenceAreas ?: [:])[devKey] ?: [:]) as Map).collectEntries { key, value ->
+        [(key): value]
+    }
+    current.remove(areaIndex.toString())
+    state.interferenceAreas[devKey] = current
+    if (syncTargets) {
+        syncClusterTargetsForDevice(devKey)
     }
 }
 
@@ -1724,10 +1901,15 @@ private void splitCluster(String clusterKey) {
         newCluster.consecutiveSeen = cluster.consecutiveSeen ?: 0
         newCluster.absentStreak = cluster.absentStreak ?: 0
         newCluster.lastMatchedDay = cluster.lastMatchedDay ?: 0
+        newCluster.bustMode = cluster.bustMode
+        newCluster.targetSource = cluster.targetSource
+        newCluster.targetAreaIndex = cluster.targetAreaIndex
+        newCluster.appliedBounds = cloneBounds(cluster.appliedBounds)
         stableClusters << newCluster
     }
 
     state.stabilityData[devKey] = stableClusters
+    syncClusterTargetsForDevice(devKey)
 }
 
 private void reclusterDevice(String devKey) {
@@ -1796,6 +1978,7 @@ private void reclusterDevice(String devKey) {
     }
 
     state.stabilityData[devKey] = newStableClusters
+    syncClusterTargetsForDevice(devKey)
     state.lastClustersSnapshot[devKey] = newClusters.collect { snapshotCluster(it) }
     state.lastPointsSnapshot[devKey] = filteredPoints.collect { clonePoint(it) }
 
@@ -1898,19 +2081,21 @@ private List getStableClusters(deviceId) {
 private Map getClusterSummary(deviceId) {
     def devKey = deviceKey(deviceId)
     def stableClusters = getStableClusters(deviceId)
-    def persistentClusters = stableClusters.findAll { (it.consecutiveSeen ?: 0) >= safePersistentGhostDays() }
-    def bustedClusters = stableClusters.findAll { (it.absentStreak ?: 0) >= safeBustedGhostDays() }
-    def observedClusters = stableClusters.findAll { (it.consecutiveSeen ?: 0) < safePersistentGhostDays() && (it.absentStreak ?: 0) < safeBustedGhostDays() }
+    def persistentClusters = stableClusters.findAll { isClusterPersistent(it) && !isClusterTargeted(it) && !isClusterBusted(it) }
+    def targetedClusters = stableClusters.findAll { isClusterTargeted(it) && !isClusterBusted(it) }
+    def bustedClusters = stableClusters.findAll { isClusterBusted(it) }
+    def detectedClusters = stableClusters.findAll { !isClusterPersistent(it) && !isClusterTargeted(it) && !isClusterBusted(it) }
     def bustCounts = getPersistentBustSourceCounts((state.stabilityData[devKey] ?: []) as List)
 
     [
             "Tracked clusters": stableClusters.size(),
+            "Detected, not persistent": detectedClusters.size(),
             "Persistent": persistentClusters.size(),
-            "Observed only": observedClusters.size(),
+            "Targeted": targetedClusters.size(),
             "Busted": bustedClusters.size(),
-            "Auto-busted persistent": bustCounts.autoBusted,
-            "Manual-busted persistent": bustCounts.manualBusted,
-            "Unbusted persistent": bustCounts.unbusted,
+            "Auto-targeted persistent": bustCounts.autoBusted,
+            "Manual-targeted persistent": bustCounts.manualBusted,
+            "Untargeted persistent": bustCounts.unbusted,
             "Tracking days in window": getActiveTrackingDaysForDevice(deviceId)
     ]
 }
@@ -1935,7 +2120,9 @@ private Map getDisplayData(deviceId) {
 private Map getSummaryForDevice(deviceId) {
     def summary = state.dailySummary?.get(deviceKey(deviceId)) ?: [
             ghostsToday: 0,
+            detectedGhosts: 0,
             persistentGhosts: 0,
+            targetedGhosts: 0,
             bustedGhosts: 0,
             autoBusted: 0,
             manualBusted: 0,
@@ -1965,7 +2152,9 @@ private Map getDisplayCounts(deviceId) {
     def summary = getSummaryForDevice(deviceId)
     [
             ghostsToday: summary.ghostsToday ?: 0,
+            detectedGhosts: summary.detectedGhosts ?: 0,
             persistentGhosts: summary.persistentGhosts ?: 0,
+            targetedGhosts: summary.targetedGhosts ?: 0,
             bustedGhosts: summary.bustedGhosts ?: 0,
             autoBusted: summary.autoBusted ?: 0,
             manualBusted: summary.manualBusted ?: 0,
@@ -2082,9 +2271,11 @@ private void updateClusterBustMode(deviceId, List sourceClusters, List appliedBo
             return
         }
 
-        if (bustMode == "manual" || match.bustMode != "manual") {
+        if (bustMode == "manual" || match.targetSource != "manual") {
             match.bustMode = bustMode
-            match.appliedBounds = cloneBounds(appliedBoundsList[idx])
+            match.targetSource = bustMode
+            match.targetAreaIndex = appliedBoundsList[idx]?.areaIndex
+            match.appliedBounds = cloneBounds(appliedBoundsList[idx]?.bounds as Map)
         }
         remainingStable.remove(match)
     }
@@ -2096,20 +2287,67 @@ private void clearClusterBustMode(deviceId, String bustMode) {
     def devKey = deviceKey(deviceId)
     def stableClusters = ((state.stabilityData[devKey] ?: []) as List).collect { cloneCluster(it) }
     stableClusters.each { cluster ->
-        if (cluster.bustMode == bustMode) {
+        if ((cluster.targetSource ?: cluster.bustMode) == bustMode) {
             cluster.bustMode = null
+            cluster.targetSource = null
+            cluster.targetAreaIndex = null
             cluster.appliedBounds = null
         }
     }
     state.stabilityData[devKey] = stableClusters
 }
 
+private void syncClusterTargetsForDevice(String devKey) {
+    def stableClusters = ((state.stabilityData[devKey] ?: []) as List).collect { cloneCluster(it) }
+    if (!stableClusters) {
+        return
+    }
+
+    def rememberedAreas = getRememberedInterferenceAreas(devKey)
+    def areasByIndex = rememberedAreas.collectEntries { area -> [(area.areaIndex.toString()): area] }
+
+    stableClusters.each { cluster ->
+        def targetIndex = cluster.targetAreaIndex != null ? cluster.targetAreaIndex.toString() : null
+        def existingArea = targetIndex != null ? areasByIndex[targetIndex] : null
+
+        if (existingArea && boundsOverlap(cluster.appliedBounds ?: cluster.bounds, existingArea.bounds)) {
+            cluster.targetAreaIndex = existingArea.areaIndex
+            cluster.targetSource = existingArea.source
+            cluster.bustMode = existingArea.source in ["manual", "auto"] ? existingArea.source : cluster.bustMode
+            cluster.appliedBounds = cloneBounds(existingArea.bounds)
+            return
+        }
+
+        def matchedArea = isClusterPersistent(cluster) ? rememberedAreas.find { area ->
+            boundsOverlap(cluster.bounds, area.bounds)
+        } : null
+
+        if (matchedArea) {
+            cluster.targetAreaIndex = matchedArea.areaIndex
+            cluster.targetSource = matchedArea.source
+            cluster.bustMode = matchedArea.source in ["manual", "auto"] ? matchedArea.source : cluster.bustMode
+            cluster.appliedBounds = cloneBounds(matchedArea.bounds)
+        } else {
+            cluster.targetAreaIndex = null
+            cluster.targetSource = null
+            cluster.bustMode = null
+            cluster.appliedBounds = null
+        }
+    }
+
+    state.stabilityData[devKey] = stableClusters
+}
+
+private boolean boundsOverlap(Map a, Map b) {
+    intersectBounds(a, b) != null
+}
+
 private Map getPersistentBustSourceCounts(List stableClusters) {
-    def persistentClusters = (stableClusters ?: []).findAll { (it.consecutiveSeen ?: 0) >= safePersistentGhostDays() }
+    def persistentClusters = (stableClusters ?: []).findAll { isClusterPersistent(it) || isClusterTargeted(it) || isClusterBusted(it) }
     [
-            autoBusted: persistentClusters.count { it.bustMode == "auto" },
-            manualBusted: persistentClusters.count { it.bustMode == "manual" },
-            unbusted: persistentClusters.count { !it.bustMode }
+            autoBusted: persistentClusters.count { (it.targetSource ?: it.bustMode) == "auto" },
+            manualBusted: persistentClusters.count { (it.targetSource ?: it.bustMode) in ["manual", "manual-entry"] },
+            unbusted: persistentClusters.count { isClusterPersistent(it) && !isClusterTargeted(it) && !isClusterBusted(it) }
     ]
 }
 
@@ -2152,6 +2390,18 @@ private Integer getActiveTrackingDaysForCluster(Map cluster) {
             .unique()
             .sort()
     activeDays.size()
+}
+
+private boolean isClusterPersistent(Map cluster) {
+    (cluster?.consecutiveSeen ?: 0) >= safePersistentGhostDays()
+}
+
+private boolean isClusterTargeted(Map cluster) {
+    cluster?.targetAreaIndex != null || cluster?.targetSource != null || cluster?.appliedBounds != null
+}
+
+private boolean isClusterBusted(Map cluster) {
+    isClusterTargeted(cluster) && ((cluster?.absentStreak ?: 0) >= safeBustedGhostDays())
 }
 
 private Map calculatePlotScale(List points, List outOfBoundsPoints, List currentClusters, List historicalClusters, dev = null, String horizontalAxis = "x", String verticalAxis = "y", Map preferredScale = null) {
@@ -2503,6 +2753,19 @@ private String renderCorrelationSummary(deviceId) {
     cards.toString()
 }
 
+private String renderInterferenceAreasCard(deviceId) {
+    def devKey = deviceKey(deviceId)
+    def rememberedAreas = getRememberedInterferenceAreas(devKey)
+    if (!rememberedAreas) {
+        return renderNoteCard("Remembered Interference Areas", "No interference areas are currently remembered for this device.")
+    }
+
+    def rows = rememberedAreas.collect { area ->
+        "Index ${area.areaIndex}: X ${round2(area.bounds.xmin)}..${round2(area.bounds.xmax)}, Y ${round2(area.bounds.ymin)}..${round2(area.bounds.ymax)}, Z ${round2(area.bounds.zmin)}..${round2(area.bounds.zmax)} (${describeTargetSource(area.source)})"
+    }
+    renderNoteCard("Remembered Interference Areas", rows.join("<br>"))
+}
+
 private Map emptyCorrelationAggregate(String deviceName, String attribute) {
     [
             deviceName: deviceName,
@@ -2559,13 +2822,7 @@ private String percent(Number numerator, Number denominator) {
 
 private String renderClusterDetails(Map cluster, Integer displayIndex, String devKey) {
     def bounds = cluster.bounds ?: [:]
-    def status = "Observed"
-
-    if ((cluster.absentStreak ?: 0) >= safeBustedGhostDays()) {
-        status = "Busted"
-    } else if ((cluster.consecutiveSeen ?: 0) >= safePersistentGhostDays()) {
-        status = "Persistent"
-    }
+    def status = determineClusterState(cluster)
 
     def hasPoints = cluster.points && cluster.points.size() > 0
     def clusterKey = "${devKey}_cluster_${displayIndex}"
@@ -2581,7 +2838,9 @@ private String renderClusterDetails(Map cluster, Integer displayIndex, String de
             "Consecutive days": cluster.consecutiveSeen ?: 0,
             "Missing streak": cluster.absentStreak ?: 0,
             "Stability": "${round2(cluster.stabilityPct ?: calculateStabilityPercent(cluster))}%",
-            "Busting": describeBustMode(cluster)
+            "Target area index": cluster.targetAreaIndex != null ? cluster.targetAreaIndex : "None",
+            "Target source": cluster.targetSource ? describeTargetSource(cluster.targetSource) : "None",
+            "Targeting": describeBustMode(cluster)
     ])
 
     // Add cluster splitting controls if the cluster has points
@@ -2643,19 +2902,45 @@ private String describeAutoBustConfiguration() {
 }
 
 private String describeBustMode(Map cluster) {
-    if ((cluster.consecutiveSeen ?: 0) < safePersistentGhostDays()) {
-        return "Not persistent yet"
+    if (isClusterBusted(cluster)) {
+        return "Area ${cluster.targetAreaIndex} (${describeTargetSource(cluster.targetSource)}) eliminated this ghost for ${cluster.absentStreak ?: 0} active day(s)"
     }
 
-    if (cluster.bustMode == "auto") {
-        return "Automatic"
+    if (isClusterTargeted(cluster)) {
+        return "Area ${cluster.targetAreaIndex} (${describeTargetSource(cluster.targetSource)}) is targeting this ghost"
     }
 
-    if (cluster.bustMode == "manual") {
-        return "Manual"
+    if (isClusterPersistent(cluster)) {
+        return "Persistent but not targeted"
     }
 
-    "Unbusted"
+    "Detected but not persistent"
+}
+
+private String determineClusterState(Map cluster) {
+    if (isClusterBusted(cluster)) {
+        return "Busted"
+    }
+    if (isClusterTargeted(cluster)) {
+        return "Targeted"
+    }
+    if (isClusterPersistent(cluster)) {
+        return "Persistent"
+    }
+    "Detected"
+}
+
+private String describeTargetSource(String source) {
+    switch (source) {
+        case "auto":
+            return "Automatic"
+        case "manual":
+            return "App-applied"
+        case "manual-entry":
+            return "Remembered manually"
+        default:
+            return source ?: "Unknown"
+    }
 }
 
 private Map getConfigurationSummaryStats() {
@@ -2686,7 +2971,9 @@ private Map getConfigurationSummaryStats() {
 
 private Map getMainPageStatsSummary() {
     def ghosts = 0
+    def detected = 0
     def persistent = 0
+    def targeted = 0
     def busted = 0
     def pointsProcessed = 0
 
@@ -2694,14 +2981,18 @@ private Map getMainPageStatsSummary() {
         def displayCounts = getDisplayCounts(dev.id)
         def summary = getSummaryForDevice(dev.id)
         ghosts += displayCounts.ghostsToday ?: 0
+        detected += displayCounts.detectedGhosts ?: 0
         persistent += displayCounts.persistentGhosts ?: 0
+        targeted += displayCounts.targetedGhosts ?: 0
         busted += displayCounts.bustedGhosts ?: 0
         pointsProcessed += summary.pointCount ?: 0
     }
 
     [
             "Last processed ghosts": ghosts,
+            "Detected, not persistent": detected,
             "Persistent ghosts": persistent,
+            "Targeted ghosts": targeted,
             "Busted ghosts": busted,
             "Points in last run": pointsProcessed
     ]
@@ -2776,6 +3067,8 @@ private Map cloneCluster(Map cluster) {
             absentStreak: cluster.absentStreak ?: 0,
             lastMatchedDay: cluster.lastMatchedDay ?: 0,
             bustMode: cluster.bustMode,
+            targetSource: cluster.targetSource ?: cluster.bustMode,
+            targetAreaIndex: cluster.targetAreaIndex,
             appliedBounds: cloneBounds(cluster.appliedBounds)
     ]
 }
@@ -2795,6 +3088,8 @@ private Map snapshotCluster(Map cluster) {
             absentStreak: cluster.absentStreak ?: 0,
             lastMatchedDay: cluster.lastMatchedDay ?: 0,
             bustMode: cluster.bustMode,
+            targetSource: cluster.targetSource ?: cluster.bustMode,
+            targetAreaIndex: cluster.targetAreaIndex,
             appliedBounds: cloneBounds(cluster.appliedBounds)
     ]
 }
