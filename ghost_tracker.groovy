@@ -322,6 +322,7 @@ def settingsPage() {
 
 def statsPage() {
     initializeState()
+    def sortedDevices = getSortedMmwaveDevices()
 
     def shouldAutoRefresh = (state.statsPageRefreshUntil ?: 0L) > now()
     if (!shouldAutoRefresh) {
@@ -329,7 +330,7 @@ def statsPage() {
     }
 
     dynamicPage(name: "statsPage", install: false, uninstall: false, refreshInterval: shouldAutoRefresh ? 1 : null) {
-        if (!mmwaveDevices) {
+        if (!sortedDevices) {
             section { paragraph "No mmWave devices configured." }
             return
         }
@@ -339,7 +340,7 @@ def statsPage() {
         def aggregateBusted = 0
         def aggregateBustSources = getAggregateBustSourceCounts()
 
-        mmwaveDevices.each { dev ->
+        sortedDevices.each { dev ->
             def displayCounts = getDisplayCounts(dev.id)
             aggregateToday += displayCounts.ghostsToday
             aggregatePersistent += displayCounts.persistentGhosts
@@ -362,7 +363,7 @@ def statsPage() {
             }
         }
 
-        mmwaveDevices.each { dev ->
+        sortedDevices.each { dev ->
             def devKey = deviceKey(dev.id)
             def todayPoints = getPointsForDevice(dev.id)
             def todayOutOfBounds = getOutOfBoundsPointsForDevice(dev.id)
@@ -372,8 +373,20 @@ def statsPage() {
             def displayCounts = getDisplayCounts(dev.id)
             def displayData = getDisplayData(dev.id)
             def lastSummary = getSummaryForDevice(dev.id)
+            def clusterSummary = getClusterSummary(dev.id)
+            def xyScale = calculatePlotScale(
+                    displayData.points,
+                    displayData.outOfBoundsPoints,
+                    displayData.currentClusters,
+                    displayData.historicalClusters,
+                    dev,
+                    "x",
+                    "y"
+            )
 
             section(getInterface("header", "Device: ${dev.displayName}")) {
+                paragraph renderStatBlock("Cluster Summary", clusterSummary)
+
                 def currentStats = [
                         "Points buffered": todayPoints.size(),
                         "Ghosts detected": liveCounts.ghostsToday,
@@ -404,10 +417,12 @@ def statsPage() {
                         lastDayStats
                 )
 
-                paragraph getInterface("subHeader", "X / Y View")
-                paragraph renderClusterPlot(displayData.points, displayData.outOfBoundsPoints, displayData.currentClusters, displayData.historicalClusters, dev, "x", "y")
-                paragraph getInterface("subHeader", "X / Z View")
-                paragraph renderClusterPlot(displayData.points, displayData.outOfBoundsPoints, displayData.currentClusters, displayData.historicalClusters, dev, "x", "z")
+                paragraph renderSideBySidePlots(
+                        "X / Y View",
+                        renderClusterPlot(displayData.points, displayData.outOfBoundsPoints, displayData.currentClusters, displayData.historicalClusters, dev, "x", "y", xyScale),
+                        "X / Z View",
+                        renderClusterPlot(displayData.points, displayData.outOfBoundsPoints, displayData.currentClusters, displayData.historicalClusters, dev, "x", "z", xyScale)
+                )
 
                 def correlationSummary = renderCorrelationSummary(dev.id)
                 if (correlationSummary) {
@@ -551,6 +566,8 @@ private initializeState() {
     state.correlationHistory = state.correlationHistory ?: [:]
     state.correlationStatus = state.correlationStatus ?: [:]
     state.correlationGhostPresence = state.correlationGhostPresence ?: [:]
+    state.deviceActiveDayHistory = state.deviceActiveDayHistory ?: [:]
+    state.deviceActiveToday = state.deviceActiveToday ?: [:]
     state.lastMode = state.lastMode ?: location.mode
     state.dayIndex = state.dayIndex ?: 0
     state.totalDays = state.totalDays ?: 0
@@ -598,6 +615,7 @@ private activateDetection(dev) {
     sendMmWaveBind(dev)
     state.activeDevices[deviceKey(dev.id)] = true
     state.activationStart[deviceKey(dev.id)] = now()
+    state.deviceActiveToday[deviceKey(dev.id)] = true
     infoLog("Ghost detection activated for ${dev.displayName}")
 
     if (notifyOnActivate) {
@@ -850,6 +868,7 @@ def endOfDay() {
 
     mmwaveDevices?.each { dev ->
         def devKey = deviceKey(dev.id)
+        recordActiveTrackingDay(devKey, state.dayIndex as Integer, (state.deviceActiveToday[devKey] ?: false) || isDeviceActive(dev))
         def points = getEffectivePointsForDevice(dev.id)
         def outOfBoundsPoints = getOutOfBoundsPointsForDevice(dev.id)
         def clustersToday = detectClusters(points)
@@ -876,6 +895,7 @@ def endOfDay() {
     state.dailySummary = summaries
     state.dailyPoints = [:]
     state.dailyOutOfBoundsPoints = [:]
+    state.deviceActiveToday = [:]
     state.correlationDaily = [:]
     pruneOldActivationStarts()
 
@@ -888,6 +908,11 @@ private updateStabilityForDay(deviceId, List clustersToday) {
     def devKey = deviceKey(deviceId)
     def currentDay = state.dayIndex ?: 0
     def historyCutoff = Math.max(1, currentDay - safeHistoryDays() + 1)
+    def activeDayHistory = (((state.deviceActiveDayHistory ?: [:])[devKey] ?: []) as List)
+            .collect { it as Integer }
+            .findAll { it >= historyCutoff }
+            .unique()
+            .sort()
     def stableClusters = ((state.stabilityData[devKey] ?: []) as List).collect { cloneCluster(it) }
     def remainingStable = stableClusters.collect { it }
 
@@ -912,11 +937,43 @@ private updateStabilityForDay(deviceId, List clustersToday) {
     stableClusters.each { cluster ->
         pruneSeenHistory(cluster, historyCutoff)
         cluster.daysSeen = cluster.seenHistory.size()
+        cluster.activeDayHistory = activeDayHistory.collect { it }
     }
 
     state.stabilityData[devKey] = stableClusters.findAll { cluster ->
         cluster.daysSeen > 0 || (cluster.absentStreak ?: 0) < safeHistoryDays()
     }
+}
+
+private void recordActiveTrackingDay(String devKey, Integer currentDay, boolean wasActiveToday) {
+    if (!devKey) {
+        return
+    }
+
+    if (!wasActiveToday) {
+        pruneActiveDayHistory(devKey, currentDay)
+        return
+    }
+
+    def activeDays = (((state.deviceActiveDayHistory ?: [:])[devKey] ?: []) as List).collect { it as Integer }
+    activeDays << currentDay
+    state.deviceActiveDayHistory[devKey] = activeDays.unique().sort()
+    pruneActiveDayHistory(devKey, currentDay)
+}
+
+private void pruneActiveDayHistory(String devKey, Integer currentDay = null) {
+    if (!devKey) {
+        return
+    }
+
+    def day = currentDay ?: (state.dayIndex ?: 0)
+    def historyCutoff = Math.max(1, day - safeHistoryDays() + 1)
+    def activeDays = (((state.deviceActiveDayHistory ?: [:])[devKey] ?: []) as List)
+            .collect { it as Integer }
+            .findAll { it >= historyCutoff }
+            .unique()
+            .sort()
+    state.deviceActiveDayHistory[devKey] = activeDays
 }
 
 private Map findBestMatch(Map cluster, List stableClusters) {
@@ -957,6 +1014,7 @@ private Map buildStableCluster(Map dailyCluster, Integer currentDay) {
             daysSeen: 1,
             lastSeen: currentDay,
             seenHistory: [currentDay],
+            activeDayHistory: [currentDay],
             consecutiveSeen: 1,
             absentStreak: 0,
             lastMatchedDay: currentDay,
@@ -1660,6 +1718,7 @@ private void splitCluster(String clusterKey) {
         def newCluster = buildStableCluster(subCluster, state.dayIndex ?: 0)
         // Copy stability history from parent cluster
         newCluster.seenHistory = cluster.seenHistory ?: []
+        newCluster.activeDayHistory = cluster.activeDayHistory ?: []
         newCluster.daysSeen = cluster.daysSeen ?: 0
         newCluster.lastSeen = cluster.lastSeen ?: 0
         newCluster.consecutiveSeen = cluster.consecutiveSeen ?: 0
@@ -1732,6 +1791,7 @@ private void reclusterDevice(String devKey) {
 
     newClusters.each { cluster ->
         def newStable = buildStableCluster(cluster, currentDay)
+        newStable.activeDayHistory = (((state.deviceActiveDayHistory ?: [:])[devKey] ?: []) as List).collect { it as Integer }
         newStableClusters << newStable
     }
 
@@ -1780,6 +1840,8 @@ private void clearDeviceStats(String devKey) {
     state.correlationDaily?.remove(devKey)
     state.correlationHistory?.remove(devKey)
     state.correlationGhostPresence?.remove(devKey)
+    state.deviceActiveDayHistory?.remove(devKey)
+    state.deviceActiveToday?.remove(devKey)
 
     if (state.recommendation?.deviceId == devKey) {
         state.recommendation = [message: "Recommendation cleared because that device's statistics were reset."]
@@ -1831,6 +1893,26 @@ private List getStableClusters(deviceId) {
         clone.stabilityPct = calculateStabilityPercent(cluster)
         clone
     }
+}
+
+private Map getClusterSummary(deviceId) {
+    def devKey = deviceKey(deviceId)
+    def stableClusters = getStableClusters(deviceId)
+    def persistentClusters = stableClusters.findAll { (it.consecutiveSeen ?: 0) >= safePersistentGhostDays() }
+    def bustedClusters = stableClusters.findAll { (it.absentStreak ?: 0) >= safeBustedGhostDays() }
+    def observedClusters = stableClusters.findAll { (it.consecutiveSeen ?: 0) < safePersistentGhostDays() && (it.absentStreak ?: 0) < safeBustedGhostDays() }
+    def bustCounts = getPersistentBustSourceCounts((state.stabilityData[devKey] ?: []) as List)
+
+    [
+            "Tracked clusters": stableClusters.size(),
+            "Persistent": persistentClusters.size(),
+            "Observed only": observedClusters.size(),
+            "Busted": bustedClusters.size(),
+            "Auto-busted persistent": bustCounts.autoBusted,
+            "Manual-busted persistent": bustCounts.manualBusted,
+            "Unbusted persistent": bustCounts.unbusted,
+            "Tracking days in window": getActiveTrackingDaysForDevice(deviceId)
+    ]
 }
 
 private Map getDisplayData(deviceId) {
@@ -2043,26 +2125,45 @@ private Map getAggregateBustSourceCounts() {
 }
 
 private BigDecimal calculateStabilityPercent(Map cluster) {
-    def totalDays = state.totalDays ?: 0
-    if (totalDays <= 0) {
+    def activeDays = getActiveTrackingDaysForCluster(cluster)
+    if (activeDays <= 0) {
         return 0.0d
     }
 
-    return (((cluster.daysSeen ?: 0) as BigDecimal) / totalDays) * 100.0d
+    return (((cluster.daysSeen ?: 0) as BigDecimal) / activeDays) * 100.0d
 }
 
-private String renderClusterPlot(List points, List outOfBoundsPoints, List currentClusters, List historicalClusters, dev = null, String horizontalAxis = "x", String verticalAxis = "y") {
+private Integer getActiveTrackingDaysForDevice(deviceId) {
+    def devKey = deviceKey(deviceId)
+    pruneActiveDayHistory(devKey)
+    (((state.deviceActiveDayHistory ?: [:])[devKey] ?: []) as List).size()
+}
+
+private Integer getActiveTrackingDaysForCluster(Map cluster) {
+    if (!cluster) {
+        return 0
+    }
+
+    def currentDay = state.dayIndex ?: 0
+    def historyCutoff = Math.max(1, currentDay - safeHistoryDays() + 1)
+    def activeDays = ((cluster.activeDayHistory ?: []) as List)
+            .collect { it as Integer }
+            .findAll { it >= historyCutoff }
+            .unique()
+            .sort()
+    activeDays.size()
+}
+
+private Map calculatePlotScale(List points, List outOfBoundsPoints, List currentClusters, List historicalClusters, dev = null, String horizontalAxis = "x", String verticalAxis = "y", Map preferredScale = null) {
     def deviceBounds = dev ? getDeviceBounds(dev) : null
     def validDeviceBounds = isValidBounds(deviceBounds)
-    def legendItems = ["<tspan fill='#ff9800'>Orange</tspan><tspan fill='#333333'> = in-bounds</tspan>"]
     def hMinField = "${horizontalAxis}min"
     def hMaxField = "${horizontalAxis}max"
     def vMinField = "${verticalAxis}min"
     def vMaxField = "${verticalAxis}max"
-    def annotationAxis = ["x", "y", "z"].find { it != horizontalAxis && it != verticalAxis }
 
     if (!points && !outOfBoundsPoints && !currentClusters && !historicalClusters && !validDeviceBounds) {
-        return "No points or cluster history available."
+        return null
     }
 
     def displayInBoundsPoints = []
@@ -2083,18 +2184,6 @@ private String renderClusterPlot(List points, List outOfBoundsPoints, List curre
         displayInBoundsPoints.addAll(points ?: [])
         displayOutOfBoundsPoints.addAll(outOfBoundsPoints ?: [])
     }
-
-    if (displayOutOfBoundsPoints) {
-        legendItems << "<tspan fill='#888888'>Gray</tspan><tspan fill='#333333'> = out-of-bounds</tspan>"
-    }
-    if (validDeviceBounds) {
-        legendItems << "<tspan fill='#888888'>Gray box</tspan><tspan fill='#333333'> = device bounds</tspan>"
-    }
-    legendItems << "<tspan fill='#1565c0'>Blue box</tspan><tspan fill='#333333'> = cluster bounds</tspan>"
-    legendItems << "<tspan fill='#c62828'>Red dot</tspan><tspan fill='#333333'> = current cluster</tspan>"
-    def legendRows = legendItems.collate(2)
-    def legendRowHeight = 12
-    def legendBandHeight = 8 + (legendRows.size() * legendRowHeight)
 
     def allPointsForScale = []
     allPointsForScale.addAll(displayInBoundsPoints.collect { [(horizontalAxis): it[horizontalAxis], (verticalAxis): it[verticalAxis]] })
@@ -2142,10 +2231,10 @@ private String renderClusterPlot(List points, List outOfBoundsPoints, List curre
     maxY += yPadding
 
     def width = 360
-    def height = 324 + Math.max(0, legendRows.size() - 2) * 12
+    def height = 324
     def plotLeft = 62
     def plotRight = width - 16
-    def plotTop = legendBandHeight + 14
+    def plotTop = 46
     def plotBottom = height - 62
     def plotWidth = plotRight - plotLeft
     def plotHeight = plotBottom - plotTop
@@ -2166,6 +2255,97 @@ private String renderClusterPlot(List points, List outOfBoundsPoints, List curre
             def xCenter = (minX + maxX) / 2.0d
             minX = xCenter - (expandedXRange / 2.0d)
             maxX = xCenter + (expandedXRange / 2.0d)
+        }
+    }
+
+    if (preferredScale?.minX != null && preferredScale?.maxX != null && horizontalAxis == (preferredScale.horizontalAxis ?: horizontalAxis)) {
+        minX = preferredScale.minX
+        maxX = preferredScale.maxX
+    }
+
+    [
+            minX: minX,
+            maxX: maxX,
+            minY: minY,
+            maxY: maxY,
+            width: width,
+            height: height,
+            plotLeft: plotLeft,
+            plotRight: plotRight,
+            horizontalAxis: horizontalAxis,
+            verticalAxis: verticalAxis
+    ]
+}
+
+private String renderClusterPlot(List points, List outOfBoundsPoints, List currentClusters, List historicalClusters, dev = null, String horizontalAxis = "x", String verticalAxis = "y", Map preferredScale = null) {
+    def scale = calculatePlotScale(points, outOfBoundsPoints, currentClusters, historicalClusters, dev, horizontalAxis, verticalAxis, preferredScale)
+    if (!scale) {
+        return "No points or cluster history available."
+    }
+
+    def deviceBounds = dev ? getDeviceBounds(dev) : null
+    def validDeviceBounds = isValidBounds(deviceBounds)
+    def legendItems = ["<tspan fill='#ff9800'>Orange</tspan><tspan fill='#333333'> = in-bounds</tspan>"]
+    def hMinField = "${horizontalAxis}min"
+    def hMaxField = "${horizontalAxis}max"
+    def vMinField = "${verticalAxis}min"
+    def vMaxField = "${verticalAxis}max"
+    def annotationAxis = ["x", "y", "z"].find { it != horizontalAxis && it != verticalAxis }
+
+    def displayInBoundsPoints = []
+    def displayOutOfBoundsPoints = []
+    def allDisplayPoints = []
+    allDisplayPoints.addAll(points ?: [])
+    allDisplayPoints.addAll(outOfBoundsPoints ?: [])
+
+    if (validDeviceBounds) {
+        allDisplayPoints.each { point ->
+            if (isPointWithinBounds(point.x, point.y, point.z, deviceBounds)) {
+                displayInBoundsPoints << point
+            } else {
+                displayOutOfBoundsPoints << point
+            }
+        }
+    } else {
+        displayInBoundsPoints.addAll(points ?: [])
+        displayOutOfBoundsPoints.addAll(outOfBoundsPoints ?: [])
+    }
+
+    if (displayOutOfBoundsPoints) {
+        legendItems << "<tspan fill='#888888'>Gray</tspan><tspan fill='#333333'> = out-of-bounds</tspan>"
+    }
+    if (validDeviceBounds) {
+        legendItems << "<tspan fill='#888888'>Gray box</tspan><tspan fill='#333333'> = device bounds</tspan>"
+    }
+    legendItems << "<tspan fill='#1565c0'>Blue box</tspan><tspan fill='#333333'> = cluster bounds</tspan>"
+    legendItems << "<tspan fill='#c62828'>Red dot</tspan><tspan fill='#333333'> = current cluster</tspan>"
+    def legendRows = legendItems.collate(2)
+    def legendRowHeight = 12
+    def legendBandHeight = 8 + (legendRows.size() * legendRowHeight)
+    def width = scale.width
+    def height = scale.height + Math.max(0, legendRows.size() - 2) * 12
+    def plotLeft = scale.plotLeft
+    def plotRight = scale.plotRight
+    def plotTop = legendBandHeight + 14
+    def plotBottom = height - 62
+    def plotWidth = plotRight - plotLeft
+    def plotHeight = plotBottom - plotTop
+    def minX = scale.minX
+    def maxX = scale.maxX
+    def minY = scale.minY
+    def maxY = scale.maxY
+
+    // Preserve the inherited X scale and still keep equal units-per-pixel in each plot.
+    def currentXRange = maxX - minX
+    def currentYRange = maxY - minY
+    if (currentXRange > 0 && currentYRange > 0) {
+        def xUnitsPerPixel = currentXRange / plotWidth
+        def yUnitsPerPixel = currentYRange / plotHeight
+        if (xUnitsPerPixel > yUnitsPerPixel) {
+            def expandedYRange = xUnitsPerPixel * plotHeight
+            def yCenter = (minY + maxY) / 2.0d
+            minY = yCenter - (expandedYRange / 2.0d)
+            maxY = yCenter + (expandedYRange / 2.0d)
         }
     }
 
@@ -2527,12 +2707,18 @@ private Map getMainPageStatsSummary() {
     ]
 }
 
+private List getSortedMmwaveDevices() {
+    ((mmwaveDevices ?: []) as List).sort { a, b ->
+        (a?.displayName ?: "").toLowerCase() <=> (b?.displayName ?: "").toLowerCase()
+    }
+}
+
 private String summarizeDeviceNames(devices) {
     if (!devices) {
         return "None selected"
     }
 
-    def names = devices.collect { it.displayName }
+    def names = devices.collect { it.displayName }.sort { it?.toLowerCase() ?: "" }
     if (names.size() <= 2) {
         return names.join(", ")
     }
@@ -2585,6 +2771,7 @@ private Map cloneCluster(Map cluster) {
             daysSeen: cluster.daysSeen ?: 0,
             lastSeen: cluster.lastSeen ?: 0,
             seenHistory: ((cluster.seenHistory ?: []) as List).collect { it },
+            activeDayHistory: ((cluster.activeDayHistory ?: []) as List).collect { it },
             consecutiveSeen: cluster.consecutiveSeen ?: 0,
             absentStreak: cluster.absentStreak ?: 0,
             lastMatchedDay: cluster.lastMatchedDay ?: 0,
@@ -2603,6 +2790,7 @@ private Map snapshotCluster(Map cluster) {
             daysSeen: cluster.daysSeen ?: 0,
             lastSeen: cluster.lastSeen ?: 0,
             seenHistory: ((cluster.seenHistory ?: []) as List).collect { it },
+            activeDayHistory: ((cluster.activeDayHistory ?: []) as List).collect { it },
             consecutiveSeen: cluster.consecutiveSeen ?: 0,
             absentStreak: cluster.absentStreak ?: 0,
             lastMatchedDay: cluster.lastMatchedDay ?: 0,
@@ -2743,6 +2931,15 @@ private String renderDualStatBlocks(String leftTitle, Map leftStats, String righ
 <tr>
 <td style='width:50%; vertical-align:top;'>${renderStatBlock(leftTitle, leftStats)}</td>
 <td style='width:50%; vertical-align:top;'>${renderStatBlock(rightTitle, rightStats)}</td>
+</tr>
+</table>"""
+}
+
+private String renderSideBySidePlots(String leftTitle, String leftPlot, String rightTitle, String rightPlot) {
+    """<table style='width:100%; border-collapse:separate; border-spacing:8px 0;'>
+<tr>
+<td style='width:50%; vertical-align:top;'>${getInterface("subHeader", leftTitle)}${leftPlot}</td>
+<td style='width:50%; vertical-align:top;'>${getInterface("subHeader", rightTitle)}${rightPlot}</td>
 </tr>
 </table>"""
 }
