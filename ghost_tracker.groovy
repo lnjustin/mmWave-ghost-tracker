@@ -4,7 +4,7 @@ import groovy.json.JsonSlurper
 definition(
         name: "mmWave Ghost Buster",
         namespace: "lnjustin",
-        author: "Justin Leonard",
+        author: "lnjustin",
         description: "Detects persistent mmWave ghost targets and recommends interference zones",
         category: "Utility",
         iconUrl: "",
@@ -20,17 +20,15 @@ preferences {
 
 def mainPage() {
     dynamicPage(name: "mainPage", install: true, uninstall: true) {
-        section(getInterface("header", "Summary")) {
+        section() {
+            paragraph renderHomeHeroCard()
+        }
+        section(getInterface("header", "Ghost Detection")) {
+
             paragraph renderMetricDashboard([
                     [title: "Summary", stats: getMainPageHeadlineSummary()]
             ], 1)
-        }
-
-        section(getInterface("header", "Device Analysis")) {
             href "statsPage", title: "View Device Analysis And Interference Controls", description: "Per-device graphs, ghost states, and interference area controls"
-            paragraph renderMetricDashboard([
-                    [title: "Current Status", stats: getMainPageStatsSummary()]
-            ], 1)
         }
 
         section(getInterface("header", "Quick Actions")) {
@@ -41,18 +39,11 @@ def mainPage() {
             }
         }
 
-        section(getInterface("header", "Overview")) {
-            paragraph renderMetricDashboard([
-                    [title: "Setup Status", stats: getMainPageOverviewStats()]
-            ], 1)
-        }
-
         section(getInterface("header", "Configuration")) {
             href "settingsPage", title: "Configure Devices and Detection", description: "Choose devices, activation, clustering, persistence, and notifications"
             paragraph renderMetricDashboard([
                     [title: "Configuration Summary", stats: getConfigurationSummaryStats()]
             ], 1)
-            paragraph renderNoteCard("Ghost Tracking", "This app tracks ghosts. Internally, each tracked ghost is represented by one tracked cluster of mmWave points.")
         }
     }
 }
@@ -464,7 +455,7 @@ def statsPage() {
                 if (displayData.selectableClusters) {
                     input "blockClusters_${devKey}",
                             "enum",
-                            title: "Ghost to set as an interference area",
+                            title: "Ghost to target with an interference area",
                             multiple: false,
                             required: false,
                             options: displayData.selectableClusters.collectEntries { cluster ->
@@ -479,14 +470,14 @@ def statsPage() {
                             required: false,
                             options: interferenceAreaIndexOptions(),
                             width: 4
-                    input "applyZones_${devKey}", "button", title: "Set Selected Cluster As Interference Area"
+                    input "applyZones_${devKey}", "button", title: "Target Selected Ghost With An Interference Area"
                 } else {
-                    paragraph "No clusters are available for interference zone selection."
+                    paragraph "No ghosts are available for interference area targeting."
                 }
 
                 paragraph renderInterferenceAreasCard(dev.id)
 
-                input "reclusterDevice_${devKey}", "button", title: "Recluster All Points for This Device"
+                input "reclusterDevice_${devKey}", "button", title: "Re-evaluate All Ghost Points For This Device"
                 input "clearDeviceStats_${devKey}", "button", title: "Clear This Device's Statistics"
 
                 paragraph getInterface("line")
@@ -1544,7 +1535,7 @@ def generateRecommendation() {
                         bounds: cloneBounds(cluster.bounds),
                         radius: cluster.radius,
                         density: cluster.density,
-                        stabilityPct: stabilityPct
+                        stabilityPct: Math.min(100.0d, stabilityPct as Double)
                 ]
                 bestScore = stabilityPct
             }
@@ -1552,7 +1543,7 @@ def generateRecommendation() {
     }
 
     if (!best) {
-        state.recommendation = [message: "No stable cluster currently meets the threshold."]
+        state.recommendation = [message: "No stable ghost currently meets the threshold."]
         return
     }
 
@@ -2420,7 +2411,8 @@ private BigDecimal calculateStabilityPercent(Map cluster) {
         return 0.0d
     }
 
-    return (((cluster.daysSeen ?: 0) as BigDecimal) / activeDays) * 100.0d
+    def seenDays = Math.min((cluster.daysSeen ?: 0) as Integer, activeDays)
+    return (((seenDays ?: 0) as BigDecimal) / activeDays) * 100.0d
 }
 
 private Integer getActiveTrackingDaysForDevice(deviceId) {
@@ -2473,7 +2465,7 @@ private boolean isGhostBusted(String devKey, Map cluster) {
     isGhostTargeted(devKey, cluster) && ((cluster?.absentStreak ?: 0) >= safeBustedGhostDays())
 }
 
-private Map plotStateStyle(Map cluster, List historicalClusters, List rememberedAreas = []) {
+private Map plotStateStyle(Map cluster, List historicalClusters, List currentClusters = [], List rememberedAreas = [], boolean historicalOnly = false) {
     def matched = (historicalClusters ?: []).find { existing ->
         distance3D(existing.center, cluster.center) <= safeClusterRadius()
     } ?: cluster
@@ -2488,9 +2480,9 @@ private Map plotStateStyle(Map cluster, List historicalClusters, List remembered
         return [stroke: "#c62828", fill: "rgba(198,40,40,0.14)", dash: null]
     }
     if (isClusterPersistent(matched)) {
-        return [stroke: "#ef6c00", fill: "none", dash: "3,2"]
+        return [stroke: "#ef6c00", fill: historicalOnly ? "rgba(239,108,0,0.14)" : "none", dash: "3,2"]
     }
-    return [stroke: "#1565c0", fill: "none", dash: "3,2"]
+    return [stroke: "#1565c0", fill: historicalOnly ? "rgba(21,101,192,0.14)" : "none", dash: "3,2"]
 }
 
 private Map classifyPlotPoints(List points, List outOfBoundsPoints, dev) {
@@ -2745,18 +2737,26 @@ private String renderClusterPlot(List points, List outOfBoundsPoints, List curre
         svg << "<rect x='${x1}' y='${y1}' width='${x2 - x1}' height='${y2 - y1}' fill='none' stroke='#888888' stroke-width='1' stroke-dasharray='4,2' />"
     }
 
-    // Draw cluster bounds boxes (blue dashed box) - behind points
-    def allClusters = []
-    allClusters.addAll(currentClusters ?: [])
-    allClusters.addAll(historicalClusters ?: [])
+    // Draw current ghost boxes plus unmatched historical ghosts behind points.
+    def drawClusters = []
+    drawClusters.addAll((currentClusters ?: []).collect { [cluster: it, historicalOnly: false] })
+    (historicalClusters ?: []).each { historicalCluster ->
+        def hasCurrentMatch = (currentClusters ?: []).any { currentCluster ->
+            distance3D(currentCluster.center, historicalCluster.center) <= safeClusterRadius()
+        }
+        if (!hasCurrentMatch) {
+            drawClusters << [cluster: historicalCluster, historicalOnly: true]
+        }
+    }
 
-    allClusters.each { cluster ->
+    drawClusters.each { entry ->
+        def cluster = entry.cluster as Map
         if (cluster.bounds) {
             def x1 = normalizeX(cluster.bounds[hMinField])
             def x2 = normalizeX(cluster.bounds[hMaxField])
             def y1 = normalizeY(cluster.bounds[vMaxField])
             def y2 = normalizeY(cluster.bounds[vMinField])
-            def style = plotStateStyle(cluster, historicalClusters, rememberedAreas)
+            def style = plotStateStyle(cluster, historicalClusters, currentClusters, rememberedAreas, entry.historicalOnly as boolean)
             def dashAttr = style.dash ? " stroke-dasharray='${style.dash}'" : ""
             svg << "<rect x='${x1}' y='${y1}' width='${x2 - x1}' height='${y2 - y1}' fill='${style.fill}' stroke='${style.stroke}' stroke-width='1.6'${dashAttr} />"
         }
@@ -2841,11 +2841,13 @@ private String renderCorrelationSummary(deviceId) {
 
         def body = new StringBuilder()
         body << "<div style='margin-bottom:10px;'>"
-        body << "<div style='font-weight:bold; color:#333333; margin-bottom:4px;'>${tracker.deviceName} / ${tracker.attribute}</div>"
-        body << "<div style='font-weight:bold; color:${assessment.color}; margin-bottom:4px;'>${assessment.headline}</div>"
-        body << "<div style='color:#555555; margin-bottom:4px;'>${assessment.summary}</div>"
+        body << "<div style='font-weight:bold; color:#333333; margin-bottom:8px;'>${tracker.deviceName} / ${tracker.attribute}</div>"
+        body << "<div style='border:1px solid ${assessment.border}; background:${assessment.background}; padding:10px; margin-bottom:8px;'>"
+        body << "<div style='font-weight:bold; color:${assessment.color}; font-size:15px; margin-bottom:4px;'>${assessment.headline}</div>"
+        body << "<div style='color:#444444;'>${assessment.summary}</div>"
+        body << "</div>"
         body << "<div style='color:#555555; margin-bottom:4px;'>Ghost-present samples: ${aggregate.ghostSamples ?: 0} / ${aggregate.samples ?: 0} (${percent(aggregate.ghostSamples, aggregate.samples)})</div>"
-        body << "<div style='color:#555555; margin-bottom:4px;'>Ghost appearances near a change in the last ${coincidenceWindow}s: ${aggregate.ghostAppearancesNearAnyChange ?: 0} / ${aggregate.ghostAppearances ?: 0} (${percent(aggregate.ghostAppearancesNearAnyChange, aggregate.ghostAppearances)})</div>"
+        body << "<div style='color:#555555; margin-bottom:4px;'>Ghost appearance events within ${coincidenceWindow}s after an attribute change: ${aggregate.ghostAppearancesNearAnyChange ?: 0} / ${aggregate.ghostAppearances ?: 0} (${percent(aggregate.ghostAppearancesNearAnyChange, aggregate.ghostAppearances)})</div>"
         if (aggregate.lastValue != null) {
             body << "<div style='color:#555555; margin-bottom:4px;'>Latest sampled value: ${aggregate.lastValue}</div>"
         }
@@ -2856,7 +2858,7 @@ private String renderCorrelationSummary(deviceId) {
             body << "<div style='color:#555555;'>${assessment.changeLine}</div>"
         }
         body << "</div>"
-        cards << renderNoteCard("Correlation", body.toString())
+        cards << "<div style='border-left:4px solid ${assessment.border}; background:#ffffff; padding:10px; margin:4px 0;'>${body}</div>"
     }
 
     cards.toString()
@@ -2887,20 +2889,28 @@ private Map assessCorrelation(Map aggregate) {
     def changePct = appearanceCount > 0 ? (nearChangeCount as Double) / appearanceCount.toDouble() : 0.0d
 
     def headline = "No clear correlation signal"
-    def color = "#616161"
-    def summary = "The current data does not strongly separate ghost activity from normal activity."
+    def color = "#424242"
+    def border = "#cfd8dc"
+    def background = "#f8fafc"
+    def summary = "So far, ghost activity does not line up clearly with this device or attribute."
 
     if (strongest && strongest.bias >= 0.55d && (strongest.stats.ghostSamples ?: 0) >= 5) {
         headline = "Possible correlation with value '${strongest.value}'"
         color = "#c62828"
+        border = "#ef9a9a"
+        background = "#ffebee"
         summary = "Ghosts are concentrated when this attribute is '${strongest.value}', and much less common in the other observed values."
     } else if (changePct >= 0.5d && appearanceCount >= 4) {
         headline = "Possible correlation with recent changes"
         color = "#ef6c00"
+        border = "#ffcc80"
+        background = "#fff3e0"
         summary = "Ghost appearances often happen shortly after this attribute changes."
     } else if (ghostSamples >= 10 && clearSamples >= 10 && rankedValues.size() > 1) {
         headline = "Weak correlation signal"
         color = "#ef6c00"
+        border = "#ffcc80"
+        background = "#fff8e1"
         summary = "There is some separation by value, but not enough yet to call it a strong correlation."
     }
 
@@ -2914,6 +2924,8 @@ private Map assessCorrelation(Map aggregate) {
     [
             headline: headline,
             color: color,
+            border: border,
+            background: background,
             summary: summary,
             bestValueLine: bestValueLine,
             changeLine: changeLine
@@ -3006,8 +3018,6 @@ private String renderClusterDetails(Map cluster, Integer displayIndex, String de
             "Consecutive days": cluster.consecutiveSeen ?: 0,
             "Missing streak": cluster.absentStreak ?: 0,
             "Stability": "${round2(cluster.stabilityPct ?: calculateStabilityPercent(cluster))}%",
-            "Target area index": effectiveTargetIndex != null ? effectiveTargetIndex : "None",
-            "Target source": effectiveTargetSource ? describeTargetSource(effectiveTargetSource) : "None",
             "Targeting": describeGhostTargeting(devKey, cluster)
     ])
 
@@ -3032,11 +3042,13 @@ private String renderRecommendationSummary(def recommendation) {
         return renderNoteCard("Recommendation", recommendation.message as String)
     }
 
-    renderStatBlock("Recommended Exclusion Zone", [
+    def bounds = recommendation.bounds ?: [:]
+    renderStatBlock("Recommended Interference Area", [
             "Device": recommendation.deviceName,
-            "Center": "(${round2(recommendation.center.x)}, ${round2(recommendation.center.y)}, ${round2(recommendation.center.z)}) cm",
-            "Radius": "${round2(recommendation.radius)} cm",
-            "Stability": "${round2(recommendation.stabilityPct)}%"
+            "X bounds": "${round2(bounds.xmin)} to ${round2(bounds.xmax)} cm",
+            "Y bounds": "${round2(bounds.ymin)} to ${round2(bounds.ymax)} cm",
+            "Z bounds": "${round2(bounds.zmin)} to ${round2(bounds.zmax)} cm",
+            "Stability": "${round2(Math.min(100.0d, (recommendation.stabilityPct ?: 0.0d) as Double))}%"
     ])
 }
 
@@ -3101,14 +3113,13 @@ private String determineClusterState(Map cluster) {
 private String describeGhostTargeting(String devKey, Map cluster) {
     def rememberedArea = getRememberedAreaForGhost(devKey, cluster)
     def effectiveTargetIndex = cluster.targetAreaIndex != null ? cluster.targetAreaIndex : rememberedArea?.areaIndex
-    def effectiveTargetSource = cluster.targetSource ?: rememberedArea?.source
 
     if (isGhostBusted(devKey, cluster)) {
-        return "Area ${effectiveTargetIndex} (${describeTargetSource(effectiveTargetSource)}) eliminated this ghost for ${cluster.absentStreak ?: 0} active day(s)"
+        return "Area ${effectiveTargetIndex} eliminated this ghost for ${cluster.absentStreak ?: 0} active day(s)"
     }
 
     if (isGhostTargeted(devKey, cluster)) {
-        return "Area ${effectiveTargetIndex} (${describeTargetSource(effectiveTargetSource)}) is targeting this ghost"
+        return "Area ${effectiveTargetIndex} is targeting this ghost"
     }
 
     if (isClusterPersistent(cluster)) {
@@ -3224,6 +3235,16 @@ private Map getMainPageHeadlineSummary() {
             "Processed days": state.totalDays ?: 0,
             "Last processed ghosts": lastProcessedGhosts
     ]
+}
+
+private String renderHomeHeroCard() {
+    """<div style='text-align:center;'>
+<div style='display:flex; flex-direction:column; align-items:center; gap:0px;'>
+<img src='https://github.com/lnjustin/App-Images/blob/master/ghostBuster/Gemini_Generated_Image_jly61ajly61ajly6.png?raw=true' alt='Ghost Buster logo' style='display:block; width:115px; max-width:100%; height:auto; border-radius:10px;' />
+</div>
+<div style='font-weight:bold; color:#223043; font-size:16px; line-height:1.0;'>Spot ghosts. Bust them. Nobody to call.</div>
+</div>
+</div>"""
 }
 
 private List getSortedMmwaveDevices() {
