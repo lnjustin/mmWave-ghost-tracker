@@ -19,6 +19,7 @@ preferences {
 }
 
 def mainPage() {
+    refreshRecommendation()
     dynamicPage(name: "mainPage", install: true, uninstall: true) {
         section() {
             paragraph renderHomeHeroCard()
@@ -28,12 +29,7 @@ def mainPage() {
             paragraph renderMetricDashboard([
                     [title: "Summary", stats: getMainPageHeadlineSummary()]
             ], 1)
-            href "statsPage", title: "View Device Analysis And Interference Controls", description: "Per-device graphs, ghost states, and interference area controls"
-        }
-
-        section(getInterface("header", "Quick Actions")) {
-            input "recommendNow", "button", title: "Generate Recommendation"
-
+            href "statsPage", title: "View Analysis And Interference Controls", description: "Per-device graphs, ghost states, and interference area controls"
             if (state.recommendation) {
                 paragraph renderRecommendationSummary(state.recommendation)
             }
@@ -235,6 +231,11 @@ def settingsPage() {
                     "number",
                     title: "Recommendation threshold (%)",
                     defaultValue: 70
+
+            input "recommendOnlyPersistentGhosts",
+                    "bool",
+                    title: "Only recommend interference areas for persistent ghosts",
+                    defaultValue: true
         }
 
         section(getInterface("header", "Automatic Ghost Busting")) {
@@ -342,6 +343,31 @@ def settingsPage() {
                         "bool",
                         title: "Notify on daily summary",
                         defaultValue: true
+
+                input "notifyOnAnyGhostDetected",
+                        "bool",
+                        title: "Notify when any ghost is detected",
+                        defaultValue: false
+
+                input "notifyOnPersistentGhostDetected",
+                        "bool",
+                        title: "Notify when a persistent ghost is detected",
+                        defaultValue: true
+
+                input "notifyOnRecommendation",
+                        "bool",
+                        title: "Notify when a ghost is recommended to target",
+                        defaultValue: true
+
+                input "notifyOnGhostBusted",
+                        "bool",
+                        title: "Notify when a ghost is busted",
+                        defaultValue: true
+
+                input "notifyOnTargetedPersistentGhost",
+                        "bool",
+                        title: "Notify when a targeted ghost is still persistent",
+                        defaultValue: true
             }
         }
 
@@ -356,6 +382,7 @@ def settingsPage() {
 
 def statsPage() {
     initializeState()
+    refreshRecommendation()
     def sortedDevices = getSortedMmwaveDevices()
 
     def shouldAutoRefresh = (state.statsPageRefreshUntil ?: 0L) > now()
@@ -912,9 +939,11 @@ def endOfDay() {
     state.totalDays = Math.min((state.totalDays ?: 0) + 1, safeHistoryDays())
 
     def summaries = [:]
+    def previousRecommendationKey = recommendationKey(state.recommendation)
 
     mmwaveDevices?.each { dev ->
         def devKey = deviceKey(dev.id)
+        def previousStableClusters = ((state.stabilityData[devKey] ?: []) as List).collect { cloneCluster(it) }
         recordActiveTrackingDay(devKey, state.dayIndex as Integer, (state.deviceActiveToday[devKey] ?: false) || isDeviceActive(dev))
         def points = getEffectivePointsForDevice(dev.id)
         def outOfBoundsPoints = getOutOfBoundsPointsForDevice(dev.id)
@@ -937,9 +966,11 @@ def endOfDay() {
         state.correlationGhostPresence[devKey] = false
 
         debugLog("Processed ${dev.displayName}: points=${points.size()}, out-of-bounds=${outOfBoundsPoints.size()}, unclustered=${unclusteredPointCount}, clusters=${clustersToday.size()}, persistent=${counts.persistentGhosts}, busted=${counts.bustedGhosts}")
+        sendGhostLifecycleNotifications(dev, previousStableClusters)
     }
 
     state.dailySummary = summaries
+    refreshRecommendation(true, previousRecommendationKey)
     state.dailyPoints = [:]
     state.dailyOutOfBoundsPoints = [:]
     state.deviceActiveToday = [:]
@@ -1519,23 +1550,32 @@ def generateRecommendation() {
     def totalDays = state.totalDays ?: 0
     if (totalDays <= 0) {
         state.recommendation = [message: "Insufficient data to generate a recommendation."]
-        return
+        return state.recommendation
     }
 
     def best = null
     def bestScore = -1.0d
 
+    def blockedByCapacity = false
+
     (state.stabilityData ?: [:]).each { devKey, clusters ->
+        def dev = mmwaveDevices?.find { deviceKey(it.id) == devKey }
         (clusters ?: []).each { cluster ->
             def stabilityPct = calculateStabilityPercent(cluster)
-            if (stabilityPct >= safeStableThreshold() && stabilityPct > bestScore) {
+            def plan = buildRecommendationPlan(dev, cluster, stabilityPct)
+            if (plan?.blockedByCapacity) {
+                blockedByCapacity = true
+            }
+            if (plan && !plan.blockedByCapacity && stabilityPct >= safeStableThreshold() && stabilityPct > bestScore) {
                 best = [
                         deviceId: devKey,
                         center: clonePoint(cluster.center),
-                        bounds: cloneBounds(cluster.bounds),
+                        bounds: cloneBounds(plan.bounds),
                         radius: cluster.radius,
                         density: cluster.density,
-                        stabilityPct: Math.min(100.0d, stabilityPct as Double)
+                        stabilityPct: Math.min(100.0d, stabilityPct as Double),
+                        action: plan.action,
+                        areaIndex: plan.areaIndex
                 ]
                 bestScore = stabilityPct
             }
@@ -1543,13 +1583,14 @@ def generateRecommendation() {
     }
 
     if (!best) {
-        state.recommendation = [message: "No stable ghost currently meets the threshold."]
-        return
+        state.recommendation = [message: blockedByCapacity ? "Recommendation available for a persistent ghost, but there is no free interference area and no overlapping area that can be expanded automatically." : "No recommendation available right now because no persistent ghost currently qualifies for targeting."]
+        return state.recommendation
     }
 
     def dev = mmwaveDevices?.find { deviceKey(it.id) == best.deviceId }
     best.deviceName = dev?.displayName ?: best.deviceId
     state.recommendation = best
+    best
 }
 
 private void applySelectedZones(String devKey) {
@@ -1573,7 +1614,13 @@ private void applySelectedZones(String devKey) {
         return
     }
 
-    def zoneSpec = [cluster: selectedCluster, bounds: cloneBounds(selectedCluster.bounds), areaIndex: areaIndex]
+    def clampedBounds = clampBoundsToDevice(selectedCluster.bounds, dev)
+    if (!isValidBounds(clampedBounds)) {
+        warnLog("Selected ghost bounds are outside the device boundary for ${dev.displayName}.")
+        return
+    }
+
+    def zoneSpec = [cluster: selectedCluster, bounds: cloneBounds(clampedBounds), areaIndex: areaIndex]
     def appliedZoneSpecs = applyZonesToDevice(dev, [zoneSpec], "manual cluster selection")
     rememberAppliedZones(devKey, appliedZoneSpecs, "manual")
     updateClusterBustMode(dev.id, [selectedCluster], appliedZoneSpecs, "manual")
@@ -1653,9 +1700,10 @@ private void applyAutomaticGhostBusting(dev) {
 
 private List applyZonesToDevice(dev, List zoneSpecs, String sourceLabel) {
     def appliedZoneSpecs = []
+    def deviceBounds = clampReferenceBounds(dev)
 
     (zoneSpecs ?: []).each { zoneSpec ->
-        def zoneBounds = zoneSpec.bounds
+        def zoneBounds = clampBoundsToReference(zoneSpec.bounds, deviceBounds)
         def areaIndex = safeInterferenceAreaIndex(zoneSpec.areaIndex)
         if (!isValidBounds(zoneBounds)) {
             warnLog("Skipped invalid interference bounds for ${dev.displayName} from ${sourceLabel}")
@@ -1685,6 +1733,60 @@ private List applyZonesToDevice(dev, List zoneSpecs, String sourceLabel) {
     }
 
     appliedZoneSpecs
+}
+
+private Map buildRecommendationPlan(dev, Map cluster, BigDecimal stabilityPct) {
+    if (!dev || !cluster?.bounds) {
+        return null
+    }
+    if ((recommendOnlyPersistentGhosts == null ? true : recommendOnlyPersistentGhosts) && !isClusterPersistent(cluster)) {
+        return null
+    }
+
+    def devKey = deviceKey(dev.id)
+    def deviceBounds = clampReferenceBounds(dev)
+    def clampedClusterBounds = clampBoundsToReference(cluster.bounds, deviceBounds)
+    if (!isValidBounds(clampedClusterBounds)) {
+        return null
+    }
+
+    def rememberedAreas = getRememberedInterferenceAreas(devKey)
+    def containingArea = rememberedAreas.find { area ->
+        isBoundsWithinBounds(clampedClusterBounds, area.bounds)
+    }
+    if (containingArea) {
+        return null
+    }
+
+    def overlappingArea = rememberedAreas.find { area ->
+        boundsOverlap(clampedClusterBounds, area.bounds)
+    }
+    if (overlappingArea) {
+        def expandedBounds = clampBoundsToReference(unionBounds(overlappingArea.bounds, clampedClusterBounds), deviceBounds)
+        if (!isValidBounds(expandedBounds) || sameBounds(expandedBounds, overlappingArea.bounds)) {
+            return null
+        }
+        return [
+                action: "expand",
+                areaIndex: overlappingArea.areaIndex,
+                bounds: expandedBounds,
+                stabilityPct: stabilityPct
+        ]
+    }
+
+    def availableIndexes = (0..3).findAll { idx ->
+        !rememberedAreas.any { it.areaIndex == idx }
+    }
+    if (!availableIndexes) {
+        return [blockedByCapacity: true]
+    }
+
+    [
+            action: "set",
+            areaIndex: availableIndexes[0],
+            bounds: clampedClusterBounds,
+            stabilityPct: stabilityPct
+    ]
 }
 
 private void clearManagedZones(dev, String managedType) {
@@ -2271,6 +2373,53 @@ private Map intersectBounds(Map a, Map b) {
     ]
 
     isValidBounds(intersection) ? intersection : null
+}
+
+private Map unionBounds(Map a, Map b) {
+    if (!isValidBounds(a) || !isValidBounds(b)) {
+        return null
+    }
+    [
+            xmin: Math.min(a.xmin ?: 0.0d, b.xmin ?: 0.0d),
+            xmax: Math.max(a.xmax ?: 0.0d, b.xmax ?: 0.0d),
+            ymin: Math.min(a.ymin ?: 0.0d, b.ymin ?: 0.0d),
+            ymax: Math.max(a.ymax ?: 0.0d, b.ymax ?: 0.0d),
+            zmin: Math.min(a.zmin ?: 0.0d, b.zmin ?: 0.0d),
+            zmax: Math.max(a.zmax ?: 0.0d, b.zmax ?: 0.0d)
+    ]
+}
+
+private Map clampReferenceBounds(dev) {
+    def bounds = dev ? getDeviceBounds(dev) : null
+    isValidBounds(bounds) ? bounds : null
+}
+
+private Map clampBoundsToDevice(Map bounds, dev) {
+    clampBoundsToReference(bounds, clampReferenceBounds(dev))
+}
+
+private Map clampBoundsToReference(Map bounds, Map referenceBounds) {
+    if (!isValidBounds(bounds)) {
+        return null
+    }
+    if (!isValidBounds(referenceBounds)) {
+        return cloneBounds(bounds)
+    }
+    intersectBounds(bounds, referenceBounds)
+}
+
+private boolean sameBounds(Map a, Map b) {
+    if (!isValidBounds(a) || !isValidBounds(b)) {
+        return false
+    }
+    def left = integerBounds(a)
+    def right = integerBounds(b)
+    left.xmin == right.xmin &&
+            left.xmax == right.xmax &&
+            left.ymin == right.ymin &&
+            left.ymax == right.ymax &&
+            left.zmin == right.zmin &&
+            left.zmax == right.zmax
 }
 
 private boolean isBoundsWithinBounds(Map inner, Map outer) {
@@ -3045,11 +3194,54 @@ private String renderRecommendationSummary(def recommendation) {
     def bounds = recommendation.bounds ?: [:]
     renderStatBlock("Recommended Interference Area", [
             "Device": recommendation.deviceName,
+            "Action": describeRecommendationAction(recommendation),
             "X bounds": "${round2(bounds.xmin)} to ${round2(bounds.xmax)} cm",
             "Y bounds": "${round2(bounds.ymin)} to ${round2(bounds.ymax)} cm",
             "Z bounds": "${round2(bounds.zmin)} to ${round2(bounds.zmax)} cm",
             "Stability": "${round2(Math.min(100.0d, (recommendation.stabilityPct ?: 0.0d) as Double))}%"
     ])
+}
+
+private String describeRecommendationAction(def recommendation) {
+    if (!recommendation) {
+        return "Set a new interference area"
+    }
+    if (recommendation.action == "expand" && recommendation.areaIndex != null) {
+        return "Expand interference area ${recommendation.areaIndex}"
+    }
+    if (recommendation.areaIndex != null) {
+        return "Set interference area ${recommendation.areaIndex}"
+    }
+    "Set a new interference area"
+}
+
+private void refreshRecommendation(boolean notifyIfChanged = false, String previousRecommendationKey = null) {
+    def priorKey = previousRecommendationKey != null ? previousRecommendationKey : recommendationKey(state.recommendation)
+    generateRecommendation()
+    def newKey = recommendationKey(state.recommendation)
+    if (notifyIfChanged && sendPush && notifyOnRecommendation && newKey && newKey != priorKey) {
+        sendNotification(buildRecommendationNotification(state.recommendation))
+    }
+}
+
+private String recommendationKey(def recommendation) {
+    if (!recommendation || recommendation.message || !recommendation.deviceId || !recommendation.bounds) {
+        return null
+    }
+    def bounds = recommendation.bounds ?: [:]
+    "${recommendation.deviceId}:${round2(bounds.xmin)}:${round2(bounds.xmax)}:${round2(bounds.ymin)}:${round2(bounds.ymax)}:${round2(bounds.zmin)}:${round2(bounds.zmax)}"
+}
+
+private String buildRecommendationNotification(def recommendation) {
+    if (!recommendation || recommendation.message) {
+        return recommendation?.message ?: "A new ghost recommendation is available."
+    }
+    def bounds = recommendation.bounds ?: [:]
+    """Recommendation: ${describeRecommendationAction(recommendation)} on ${recommendation.deviceName}
+X ${round2(bounds.xmin)}..${round2(bounds.xmax)} cm
+Y ${round2(bounds.ymin)}..${round2(bounds.ymax)} cm
+Z ${round2(bounds.zmin)}..${round2(bounds.zmax)} cm
+Stability ${round2(recommendation.stabilityPct ?: 0)}%"""
 }
 
 private Map getMainPageOverviewStats() {
@@ -3108,6 +3300,57 @@ private String determineClusterState(Map cluster) {
         return "Persistent"
     }
     "Detected"
+}
+
+private void sendGhostLifecycleNotifications(dev, List previousStableClusters) {
+    if (!sendPush || !dev) {
+        return
+    }
+
+    def devKey = deviceKey(dev.id)
+    def currentStableClusters = ((state.stabilityData[devKey] ?: []) as List).collect { cloneCluster(it) }
+    def newDetectedGhosts = countNewGhostState(previousStableClusters, currentStableClusters) { ghost ->
+        !isGhostBusted(devKey, ghost) && ((ghost.daysSeen ?: 0) > 0)
+    }
+    def newPersistentGhosts = countNewGhostState(previousStableClusters, currentStableClusters) { ghost ->
+        isClusterPersistent(ghost) && !isGhostBusted(devKey, ghost)
+    }
+    def newBustedGhosts = countNewGhostState(previousStableClusters, currentStableClusters, { ghost ->
+        isGhostBusted(devKey, ghost)
+    }, { ghost ->
+        isGhostBusted(devKey, ghost)
+    })
+    def newTargetedPersistentGhosts = countNewGhostState(previousStableClusters, currentStableClusters) { ghost ->
+        isClusterPersistent(ghost) && isGhostTargeted(devKey, ghost) && !isGhostBusted(devKey, ghost)
+    }
+
+    if (notifyOnAnyGhostDetected && newDetectedGhosts > 0) {
+        sendNotification("${dev.displayName}: detected ${newDetectedGhosts} new ghost${newDetectedGhosts == 1 ? '' : 's'}.")
+    }
+    if (notifyOnPersistentGhostDetected && newPersistentGhosts > 0) {
+        sendNotification("${dev.displayName}: detected ${newPersistentGhosts} persistent ghost${newPersistentGhosts == 1 ? '' : 's'}.")
+    }
+    if (notifyOnGhostBusted && newBustedGhosts > 0) {
+        sendNotification("${dev.displayName}: ${newBustedGhosts} ghost${newBustedGhosts == 1 ? '' : 's'} ${newBustedGhosts == 1 ? 'was' : 'were'} busted.")
+    }
+    if (notifyOnTargetedPersistentGhost && newTargetedPersistentGhosts > 0) {
+        sendNotification("${dev.displayName}: ${newTargetedPersistentGhosts} targeted persistent ghost${newTargetedPersistentGhosts == 1 ? ' is' : 's are'} still active, so the interference area may not be working.")
+    }
+}
+
+private Integer countNewGhostState(List previousStableClusters, List currentStableClusters, Closure currentPredicate, Closure previousPredicate = null) {
+    def priorPredicate = previousPredicate ?: currentPredicate
+    def remainingPrevious = ((previousStableClusters ?: []).findAll { priorPredicate(it) }).collect { cloneCluster(it) }
+    def count = 0
+    (currentStableClusters ?: []).findAll { currentPredicate(it) }.each { currentGhost ->
+        def match = findBestMatch(currentGhost, remainingPrevious)
+        if (match) {
+            remainingPrevious.remove(match)
+        } else {
+            count += 1
+        }
+    }
+    count
 }
 
 private String describeGhostTargeting(String devKey, Map cluster) {
@@ -3242,7 +3485,7 @@ private String renderHomeHeroCard() {
 <div style='display:flex; flex-direction:column; align-items:center; gap:0px;'>
 <img src='https://github.com/lnjustin/App-Images/blob/master/ghostBuster/Gemini_Generated_Image_jly61ajly61ajly6.png?raw=true' alt='Ghost Buster logo' style='display:block; width:115px; max-width:100%; height:auto; border-radius:10px;' />
 </div>
-<div style='font-weight:bold; color:#223043; font-size:16px; line-height:1.0;'>Spot ghosts. Bust them. Nobody to call.</div>
+<div style='font-weight:bold; color:#223043; font-size:16px; line-height:1.0;'>Bust ghosts. No calls needed.</div>
 </div>
 </div>"""
 }
@@ -3591,7 +3834,7 @@ private String renderStatBlock(String title, Map stats) {
 
     stats.each { label, value ->
         rows << "<tr>"
-        rows << "<td style='padding:3px 0; color:#666666; width:58%;'>${label}</td>"
+        rows << "<td style='padding:3px 0; color:#666666; width:40%;'>${label}</td>"
         rows << "<td style='padding:3px 0; color:#111111; font-weight:bold; text-align:right;'>${value}</td>"
         rows << "</tr>"
     }
