@@ -25,10 +25,13 @@ def mainPage() {
             paragraph renderHomeHeroCard()
         }
         section(getInterface("header", "Ghost Detection")) {
-
+            def landingSummary = getMainPageHeadlineSummary()
             paragraph renderMetricDashboard([
-                    [title: "Summary", stats: getMainPageHeadlineSummary()]
+                    [title: "Summary", stats: ((landingSummary ?: [:]) as Map).findAll { key, value -> key != "_html" }]
             ], 1)
+            if (landingSummary._html) {
+                paragraph landingSummary._html as String
+            }
             href "statsPage", title: "View Analysis And Interference Controls", description: "Per-device graphs, ghost states, and interference area controls"
             if (state.recommendation) {
                 paragraph renderRecommendationSummary(state.recommendation)
@@ -229,7 +232,7 @@ def settingsPage() {
 
             input "leakRecoveryDays",
                     "number",
-                    title: "Consecutive non-leaking days before a leaking ghost becomes busted again",
+                    title: "Consecutive clear days before a leaking or escaping ghost becomes busted again",
                     defaultValue: 2
 
             input "stableThreshold",
@@ -241,6 +244,27 @@ def settingsPage() {
                     "bool",
                     title: "Only recommend interference areas for persistent ghosts",
                     defaultValue: true
+
+            input "enableAutoExpandTargetedAreas",
+                    "bool",
+                    title: "Automatically expand targeted interference areas when a ghost leaks beyond them",
+                    defaultValue: false,
+                    submitOnChange: true
+
+            if (enableAutoExpandTargetedAreas) {
+                input "maxLeakExpandX",
+                        "decimal",
+                        title: "Maximum total X expansion from the current area (cm)",
+                        defaultValue: 12
+                input "maxLeakExpandY",
+                        "decimal",
+                        title: "Maximum total Y expansion from the current area (cm)",
+                        defaultValue: 12
+                input "maxLeakExpandZ",
+                        "decimal",
+                        title: "Maximum total Z expansion from the current area (cm)",
+                        defaultValue: 12
+            }
         }
 
         section(getInterface("header", "Automatic Ghost Busting")) {
@@ -295,22 +319,12 @@ def settingsPage() {
             if (!sortedDevices) {
                 paragraph "Select mmWave switches first to manage remembered interference areas."
             } else {
-                paragraph getInterface("note", "Record interference areas already set on the device so the app can track targeted and busted ghosts against those remembered areas. Dynamic activation controls are also below each area row: enable it, choose a device and attribute, then enter the value that should turn that area on.")
+                paragraph getInterface("note", "Capture all configured switches' current interference areas into the app. The stats/controls page also refreshes them automatically when opened, and after the app applies new areas.")
+                input "captureAllInterferenceAreas", "button", title: "Capture Interference Areas For All Devices"
 
                 sortedDevices.each { dev ->
-                    def devKey = deviceKey(dev.id)
                     paragraph getInterface("subHeader", dev.displayName)
                     paragraph renderInterferenceAreasCard(dev.id)
-                    (0..3).each { areaIndex ->
-                        input "manualAreaXMin_${devKey}_${areaIndex}", "decimal", title: "A${areaIndex} X min", required: false, width: 2
-                        input "manualAreaXMax_${devKey}_${areaIndex}", "decimal", title: "A${areaIndex} X max", required: false, width: 2
-                        input "manualAreaYMin_${devKey}_${areaIndex}", "decimal", title: "A${areaIndex} Y min", required: false, width: 2
-                        input "manualAreaYMax_${devKey}_${areaIndex}", "decimal", title: "A${areaIndex} Y max", required: false, width: 2
-                        input "manualAreaZMin_${devKey}_${areaIndex}", "decimal", title: "A${areaIndex} Z min", required: false, width: 2
-                        input "manualAreaZMax_${devKey}_${areaIndex}", "decimal", title: "A${areaIndex} Z max", required: false, width: 2
-                        input "saveManualArea_${devKey}_${areaIndex}", "button", title: "Save A${areaIndex}"
-                        input "clearRememberedArea_${devKey}_${areaIndex}", "button", title: "Clear A${areaIndex}"
-                    }
                 }
             }
         }
@@ -368,6 +382,11 @@ def settingsPage() {
                         "bool",
                         title: "Notify when a targeted ghost is still persistent",
                         defaultValue: true
+
+                input "notifyOnEscapingGhost",
+                        "bool",
+                        title: "Notify when a targeted ghost is escaping from inside its interference area",
+                        defaultValue: true
             }
         }
 
@@ -383,6 +402,7 @@ def settingsPage() {
 def statsPage() {
     initializeState()
     refreshRecommendation()
+    requestAllRememberedAreaRefresh()
     def sortedDevices = getSortedMmwaveDevices()
 
     def shouldAutoRefresh = (state.statsPageRefreshUntil ?: 0L) > now()
@@ -409,16 +429,13 @@ def statsPage() {
         }
 
             section(getInterface("header", "All Devices Summary")) {
+                def networkSummary = getNetworkSummaryStats(sortedDevices, aggregatePersistent, aggregateBusted)
                 paragraph renderMetricDashboard([
-                        [title: "Network Summary", stats: [
-                                "Detected": sortedDevices.collect { getDisplayCounts(it.id).detectedGhosts ?: 0 }.sum() ?: 0,
-                                "Persistent": aggregatePersistent,
-                                "Targeted": "${sortedDevices.collect { getDisplayCounts(it.id).targetedGhosts ?: 0 }.sum() ?: 0} (${aggregateBustSources.autoBusted ?: 0} auto)",
-                                "Busted": aggregateBusted,
-                                "Processed days": state.totalDays ?: 0,
-                                "Last processed ghosts": aggregateToday
-                        ]]
+                        [title: "Network Summary", stats: ((networkSummary ?: [:]) as Map).findAll { key, value -> key != "_html" }]
                 ], 1)
+                if (networkSummary._html) {
+                    paragraph networkSummary._html as String
+                }
 
             if (state.recommendation) {
                 paragraph renderRecommendationSummary(state.recommendation)
@@ -427,6 +444,7 @@ def statsPage() {
 
         sortedDevices.each { dev ->
             def devKey = deviceKey(dev.id)
+            refreshStoredGhostSnapshotsForDevice(dev.id)
             def todayPoints = getPointsForDevice(dev.id)
             def todayOutOfBounds = getOutOfBoundsPointsForDevice(dev.id)
             def todayClusters = getTodayClusters(dev.id)
@@ -436,7 +454,7 @@ def statsPage() {
             def displayData = getDisplayData(dev.id)
             def lastSummary = getSummaryForDevice(dev.id)
             def pointBuckets = classifyPlotPoints(displayData.points, displayData.outOfBoundsPoints, dev)
-            def leakPointCount = (pointBuckets.occupancyAssociatedInterferencePoints ?: []).size()
+            def escapingPointCount = (pointBuckets.occupancyAssociatedInterferencePoints ?: []).size()
             def xyScale = calculatePlotScale(
                     displayData.points,
                     displayData.outOfBoundsPoints,
@@ -460,11 +478,8 @@ def statsPage() {
                         renderClusterPlot(displayData.points, displayData.outOfBoundsPoints, displayData.currentClusters, displayData.historicalClusters, dev, "x", "z", xyScale)
                 )
 
-                if ((displayCounts.leakingGhosts ?: 0) > 0 || leakPointCount > 0) {
-                    paragraph renderNoteCard(
-                            "Interference Leakage",
-                            "${leakPointCount} point(s) inside configured interference areas may still be contributing to occupancy. ${displayCounts.leakingGhosts ?: 0} targeted ghost(s) are currently flagged as leaking through their configured areas."
-                    )
+                if ((displayCounts.leakingGhosts ?: 0) > 0 || (displayCounts.escapingGhosts ?: 0) > 0 || escapingPointCount > 0) {
+                    paragraph(buildGhostAlertsHtml(displayCounts.leakingGhosts as Integer, escapingPointCount as Integer))
                 }
 
                 def correlationSummary = renderCorrelationSummary(dev.id)
@@ -499,7 +514,7 @@ def statsPage() {
                             width: 4
                     input "dynamicActivation_${devKey}_0",
                             "enum",
-                            title: "A0 dynamic",
+                            title: "Dynamic Activation",
                             multiple: false,
                             required: false,
                             options: getDynamicActivationOptions(dev.id),
@@ -515,7 +530,7 @@ def statsPage() {
                             width: 4
                     input "dynamicActivation_${devKey}_1",
                             "enum",
-                            title: "A1 dynamic",
+                            title: "Dynamic Activation",
                             multiple: false,
                             required: false,
                             options: getDynamicActivationOptions(dev.id),
@@ -531,7 +546,7 @@ def statsPage() {
                             width: 4
                     input "dynamicActivation_${devKey}_2",
                             "enum",
-                            title: "A2 dynamic",
+                            title: "Dynamic Activation",
                             multiple: false,
                             required: false,
                             options: getDynamicActivationOptions(dev.id),
@@ -547,13 +562,17 @@ def statsPage() {
                             width: 4
                     input "dynamicActivation_${devKey}_3",
                             "enum",
-                            title: "A3 dynamic",
+                            title: "Dynamic Activation",
                             multiple: false,
                             required: false,
                             options: getDynamicActivationOptions(dev.id),
                             defaultValue: getDynamicActivationSelection(dev.id, 3),
                             width: 2
                     input "applyAllAreas_${devKey}", "button", title: "Apply Selected Area Assignments"
+                    def areaControlNotes = buildInterferenceAreaControlNotes(dev.id, displayData.selectableClusters)
+                    if (areaControlNotes) {
+                        paragraph renderNoteCard("Area Assignment Notes", areaControlNotes)
+                    }
                 } else {
                     paragraph "No ghosts are available for interference area targeting."
                 }
@@ -578,6 +597,12 @@ def appButtonHandler(btn) {
         return
     }
 
+    if (btn == "captureAllInterferenceAreas") {
+        requestAllRememberedAreaRefresh(true)
+        scheduleStatsPageRefresh()
+        return
+    }
+
     if (btn.startsWith("clearDeviceStats_")) {
         def devKey = btn.substring("clearDeviceStats_".length())
         clearDeviceStats(devKey)
@@ -588,6 +613,7 @@ def appButtonHandler(btn) {
     if (btn.startsWith("applyZones_")) {
         def devKey = btn.substring("applyZones_".length())
         applySelectedZones(devKey)
+        requestRememberedAreaRefresh(devKey, true)
         scheduleStatsPageRefresh()
         return
     }
@@ -597,6 +623,7 @@ def appButtonHandler(btn) {
         if (parts.size() >= 2) {
             applySelectedZoneForArea(parts[0], safeInterferenceAreaIndex(parts[1]))
             updateDynamicInterferenceAreas()
+            requestRememberedAreaRefresh(parts[0], true)
         }
         scheduleStatsPageRefresh()
         return
@@ -606,6 +633,7 @@ def appButtonHandler(btn) {
         def devKey = btn.substring("applyAllAreas_".length())
         applyAllSelectedZones(devKey)
         updateDynamicInterferenceAreas()
+        requestRememberedAreaRefresh(devKey, true)
         scheduleStatsPageRefresh()
         return
     }
@@ -1126,6 +1154,8 @@ def endOfDay() {
 
         updateStabilityForDay(dev.id, clustersToday)
         applyAutomaticGhostBusting(dev)
+        applyAutomaticTargetedAreaExpansion(dev)
+        refreshStoredGhostSnapshotsForDevice(dev.id, clustersToday, rawPoints, outOfBoundsPoints)
 
         def counts = getGhostCounts(devKey, clustersToday)
         summaries[devKey] = counts + [
@@ -1255,6 +1285,7 @@ private void mergeDailyCluster(Map stableCluster, Map dailyCluster, Integer curr
     stableCluster.consecutiveSeen = ((stableCluster.lastMatchedDay ?: 0) == currentDay - 1) ?
             ((stableCluster.consecutiveSeen ?: 0) + 1) : 1
     stableCluster.lastMatchedDay = currentDay
+    copyGhostSnapshotFields(stableCluster, dailyCluster)
 }
 
 private Map buildStableCluster(Map dailyCluster, Integer currentDay) {
@@ -1275,7 +1306,7 @@ private Map buildStableCluster(Map dailyCluster, Integer currentDay) {
             targetSource: null,
             targetAreaIndex: null,
             appliedBounds: null
-    ]
+    ] + ghostSnapshotFields(dailyCluster)
 }
 
 private void pruneSeenHistory(Map stableCluster, Integer historyCutoff) {
@@ -1302,6 +1333,7 @@ private String buildDailySummary() {
         lines << "Persistent ghosts: ${summary.persistentGhosts}"
         lines << "Targeted ghosts: ${summary.targetedGhosts ?: 0}"
         lines << "Leaking targeted ghosts: ${summary.leakingGhosts ?: 0}"
+        lines << "Escaping targeted ghosts: ${summary.escapingGhosts ?: 0}"
         lines << "Busted ghosts: ${summary.bustedGhosts}"
         lines << "Auto-targeted persistent: ${summary.autoBusted ?: 0}"
         lines << "Manual-targeted persistent: ${summary.manualBusted ?: 0}"
@@ -1616,7 +1648,7 @@ private List detectClusters(List points) {
         }
     }
 
-    clusters
+    mergeOverlappingClusters(clusters)
 }
 
 def detectClustersKMeans(List points, Integer k, Integer maxIterations) {
@@ -1777,19 +1809,77 @@ private Map buildCluster(List points) {
     ]
 }
 
+private List mergeOverlappingClusters(List clusters) {
+    def remaining = (clusters ?: []).collect { snapshotCluster(it) }
+    def merged = []
+
+    while (remaining) {
+        def seed = remaining.remove(0)
+        def combinedPoints = (seed.points ?: []).collect { clonePoint(it) }
+        def changed = true
+
+        while (changed) {
+            changed = false
+            def matches = remaining.findAll { candidate ->
+                shouldMergeClusters(buildCluster(combinedPoints), candidate)
+            }
+            if (matches) {
+                matches.each { match ->
+                    combinedPoints.addAll((match.points ?: []).collect { clonePoint(it) })
+                    remaining.remove(match)
+                }
+                changed = true
+            }
+        }
+
+        merged << buildCluster(combinedPoints.unique { point -> "${point.x}:${point.y}:${point.z}:${point.ts}" })
+    }
+
+    merged
+}
+
+private boolean shouldMergeClusters(Map left, Map right) {
+    if (!left?.bounds || !right?.bounds) {
+        return false
+    }
+
+    def intersection = intersectBounds(left.bounds, right.bounds)
+    if (!isValidBounds(intersection)) {
+        return false
+    }
+
+    def leftVolume = boundsVolume(left.bounds)
+    def rightVolume = boundsVolume(right.bounds)
+    def intersectionVolume = boundsVolume(intersection)
+    def smallerVolume = Math.max(1.0d, Math.min(leftVolume, rightVolume))
+    def overlapRatio = intersectionVolume / smallerVolume
+
+    overlapRatio >= 0.55d || (overlapRatio >= 0.30d && distance3D(left.center, right.center) <= safeClusterRadius() * 0.75d)
+}
+
+private Double boundsVolume(Map bounds) {
+    if (!isValidBounds(bounds)) {
+        return 0.0d
+    }
+    Math.max(0.0d, ((bounds.xmax ?: 0.0d) - (bounds.xmin ?: 0.0d)) *
+            ((bounds.ymax ?: 0.0d) - (bounds.ymin ?: 0.0d)) *
+            ((bounds.zmax ?: 0.0d) - (bounds.zmin ?: 0.0d)))
+}
+
 private Map getGhostCounts(String devKey, List todayClusters) {
     def stableClusters = (state.stabilityData[devKey] ?: []) as List
     def bustCounts = getPersistentBustSourceCountsForDevice(devKey)
-    def activeGhosts = stableClusters.findAll { !isGhostBusted(devKey, it) && ((it.daysSeen ?: 0) > 0) }
-    def leakingTargets = getLeakingTargetCountForDeviceKey(devKey)
+    def activeGhosts = stableClusters.findAll { !isGhostHistoricallyBusted(devKey, it) && ((it.daysSeen ?: 0) > 0) }
+    def displayStates = activeGhosts.collect { determineGhostState(devKey, it) }
 
     [
             ghostsToday: todayClusters?.size() ?: 0,
-            detectedGhosts: activeGhosts.size(),
-            persistentGhosts: activeGhosts.count { isClusterPersistent(it) },
-            targetedGhosts: activeGhosts.count { isGhostTargeted(devKey, it) },
-            leakingGhosts: leakingTargets,
-            bustedGhosts: stableClusters.count { isGhostBusted(devKey, it) },
+            detectedGhosts: displayStates.count { it == "Detected" },
+            persistentGhosts: displayStates.count { it == "Persistent" },
+            targetedGhosts: displayStates.count { it == "Targeted" },
+            leakingGhosts: activeGhosts.count { getEscapingGhostMode(devKey, it) in ["adjacent", "both"] },
+            escapingGhosts: displayStates.count { it == "Escaping" },
+            bustedGhosts: stableClusters.count { determineGhostState(devKey, it) == "Busted" || isGhostHistoricallyBusted(devKey, it) },
             autoBusted: bustCounts.autoBusted,
             manualBusted: bustCounts.manualBusted,
             unbusted: bustCounts.unbusted
@@ -2080,6 +2170,20 @@ private Map buildRecommendationPlan(dev, Map cluster, BigDecimal stabilityPct) {
     }
 
     def rememberedAreas = getRememberedInterferenceAreas(devKey)
+    def targetedArea = getRememberedAreaForGhost(devKey, cluster)
+    if (targetedArea && isGhostLeaking(devKey, cluster)) {
+        def expandedBounds = clampBoundsToReference(unionBounds(targetedArea.bounds, clampedClusterBounds), deviceBounds)
+        if (isValidBounds(expandedBounds) && !sameBounds(expandedBounds, targetedArea.bounds)) {
+            return [
+                    action: "expand",
+                    areaIndex: targetedArea.areaIndex,
+                    bounds: expandedBounds,
+                    stabilityPct: stabilityPct,
+                    reason: "leaking"
+            ]
+        }
+    }
+
     def containingArea = rememberedAreas.find { area ->
         isBoundsWithinBounds(clampedClusterBounds, area.bounds)
     }
@@ -2099,7 +2203,8 @@ private Map buildRecommendationPlan(dev, Map cluster, BigDecimal stabilityPct) {
                 action: "expand",
                 areaIndex: overlappingArea.areaIndex,
                 bounds: expandedBounds,
-                stabilityPct: stabilityPct
+                stabilityPct: stabilityPct,
+                reason: "overlap"
         ]
     }
 
@@ -2116,6 +2221,63 @@ private Map buildRecommendationPlan(dev, Map cluster, BigDecimal stabilityPct) {
             bounds: clampedClusterBounds,
             stabilityPct: stabilityPct
     ]
+}
+
+private void applyAutomaticTargetedAreaExpansion(dev) {
+    if (!dev || !enableAutoExpandTargetedAreas) {
+        return
+    }
+
+    def devKey = deviceKey(dev.id)
+    def stableClusters = getStableClusters(dev.id)
+    def deviceBounds = clampReferenceBounds(dev)
+    if (!deviceBounds) {
+        return
+    }
+
+    stableClusters.findAll { cluster ->
+        !isGhostBusted(devKey, cluster) && isGhostLeaking(devKey, cluster)
+    }.each { cluster ->
+        def rememberedArea = getRememberedAreaForGhost(devKey, cluster)
+        if (!rememberedArea?.bounds) {
+            return
+        }
+
+        def expandedBounds = getAllowedExpansionForLeakingGhost(dev, rememberedArea.bounds, cluster.bounds)
+        if (!isValidBounds(expandedBounds) || sameBounds(expandedBounds, rememberedArea.bounds)) {
+            return
+        }
+
+        def appliedZoneSpecs = applyZonesToDevice(dev, [[areaIndex: rememberedArea.areaIndex, bounds: expandedBounds, cluster: cluster]], "targeted ghost expansion")
+        if (appliedZoneSpecs) {
+            rememberInterferenceArea(devKey, rememberedArea.areaIndex as Integer, expandedBounds, rememberedArea.source ?: "manual", rememberedArea.dynamic as Map)
+        }
+    }
+
+    syncClusterTargetsForDevice(devKey)
+}
+
+private Map getAllowedExpansionForLeakingGhost(dev, Map areaBounds, Map clusterBounds) {
+    if (!isValidBounds(areaBounds) || !isValidBounds(clusterBounds)) {
+        return null
+    }
+
+    def deviceBounds = clampReferenceBounds(dev)
+    def union = unionBounds(areaBounds, clusterBounds)
+    if (!isValidBounds(union)) {
+        return null
+    }
+
+    def expansionCap = [
+            xmin: (areaBounds.xmin ?: 0.0d) - safeMaxLeakExpandX(),
+            xmax: (areaBounds.xmax ?: 0.0d) + safeMaxLeakExpandX(),
+            ymin: (areaBounds.ymin ?: 0.0d) - safeMaxLeakExpandY(),
+            ymax: (areaBounds.ymax ?: 0.0d) + safeMaxLeakExpandY(),
+            zmin: (areaBounds.zmin ?: 0.0d) - safeMaxLeakExpandZ(),
+            zmax: (areaBounds.zmax ?: 0.0d) + safeMaxLeakExpandZ()
+    ]
+
+    clampBoundsToReference(intersectBounds(union, expansionCap), deviceBounds)
 }
 
 private void clearManagedZones(dev, String managedType) {
@@ -2167,6 +2329,99 @@ private List getRememberedInterferenceAreas(String devKey) {
                 dynamicActive: area.dynamicActive == true
         ]
     }.sort { a, b -> (a.areaIndex as Integer) <=> (b.areaIndex as Integer) }
+}
+
+private void requestAllRememberedAreaRefresh(boolean force = false) {
+    mmwaveDevices?.each { dev ->
+        requestRememberedAreaRefresh(deviceKey(dev.id), force)
+    }
+}
+
+private void requestRememberedAreaRefresh(String devKey, boolean force = false) {
+    def dev = mmwaveDevices?.find { deviceKey(it.id) == devKey }
+    if (!dev) {
+        return
+    }
+
+    def nowTs = now()
+    def lastRefreshByDevice = (state.interferenceAreaRefreshAt ?: [:]) as Map
+    def lastRefresh = (lastRefreshByDevice[devKey] ?: 0L) as Long
+    if (!force && (nowTs - lastRefresh) < 15000L) {
+        return
+    }
+
+    try {
+        def report = dev.getInterferenceAreaReport()
+        syncRememberedAreasFromReport(dev, report)
+        runIn(2, "syncRememberedAreasFromQueriedDevice", [overwrite: true, data: [devKey: devKey]])
+        lastRefreshByDevice[devKey] = nowTs
+        state.interferenceAreaRefreshAt = lastRefreshByDevice
+    } catch (Exception ex) {
+        warnLog("Unable to query interference areas from ${dev.displayName}: ${ex.message}")
+    }
+}
+
+def syncRememberedAreasFromQueriedDevice(Map data = [:]) {
+    def devKey = data?.devKey
+    def dev = mmwaveDevices?.find { deviceKey(it.id) == devKey }
+    if (!dev) {
+        return
+    }
+    refreshRememberedAreasFromDevice(dev)
+}
+
+private void refreshRememberedAreasFromDevice(dev) {
+    def report = null
+    try {
+        report = dev.getInterferenceAreaReport()
+    } catch (Exception ex) {
+        warnLog("Unable to fetch interference area report from ${dev.displayName}: ${ex.message}")
+    }
+    syncRememberedAreasFromReport(dev, report)
+}
+
+private void syncRememberedAreasFromReport(dev, def report) {
+    if (!dev || !(report instanceof Map)) {
+        return
+    }
+
+    def devKey = deviceKey(dev.id)
+    (0..3).each { areaIndex ->
+        def bounds = normalizeInterferenceAreaBounds((report["interferenceZone${areaIndex}"] ?: [:]) as Map)
+        if (isInactiveInterferenceAreaBounds(bounds)) {
+            clearRememberedInterferenceArea(devKey, areaIndex, false)
+            return
+        }
+        if (isValidBounds(bounds)) {
+            def existingArea = getRememberedInterferenceAreas(devKey).find { (it.areaIndex as Integer) == areaIndex }
+            rememberInterferenceArea(devKey, areaIndex, bounds, existingArea?.source ?: "device-sync", existingArea?.dynamic as Map)
+        }
+    }
+    syncClusterTargetsForDevice(devKey)
+}
+
+private Map normalizeInterferenceAreaBounds(Map rawBounds) {
+    if (!rawBounds) {
+        return null
+    }
+    [
+            xmin: toDouble(rawBounds.xmin),
+            xmax: toDouble(rawBounds.xmax),
+            ymin: toDouble(rawBounds.ymin),
+            ymax: toDouble(rawBounds.ymax),
+            zmin: toDouble(rawBounds.zmin),
+            zmax: toDouble(rawBounds.zmax)
+    ]
+}
+
+private boolean isInactiveInterferenceAreaBounds(Map bounds) {
+    bounds &&
+            (bounds.xmin ?: 0.0d) == 0.0d &&
+            (bounds.xmax ?: 0.0d) == 0.0d &&
+            (bounds.ymin ?: 0.0d) == 0.0d &&
+            (bounds.ymax ?: 0.0d) == 0.0d &&
+            (bounds.zmin ?: 0.0d) == -600.0d &&
+            (bounds.zmax ?: 0.0d) == 600.0d
 }
 
 private void rememberInterferenceArea(String devKey, Integer areaIndex, Map bounds, String source, Map dynamicConfig = null) {
@@ -2584,14 +2839,13 @@ private Map getClusterSummary(deviceId) {
 }
 
 private Map getGhostSummaryStats(deviceId, String summaryView) {
-    def leakPoints = getLeakingPointCount(deviceId)
     if (summaryView == "Last Processed Day") {
         def summary = getSummaryForDevice(deviceId)
         return [
                 "Detected": summary.detectedGhosts ?: 0,
                 "Persistent": summary.persistentGhosts ?: 0,
-                "Targeted": "${summary.targetedGhosts ?: 0} (${summary.autoBusted ?: 0} auto)",
-                "Leaking": "${summary.leakingGhosts ?: 0} ghost / ${leakPoints} pt",
+                "Targeted": summary.targetedGhosts ?: 0,
+                "Escaping": summary.escapingGhosts ?: 0,
                 "Busted": summary.bustedGhosts ?: 0
         ]
     }
@@ -2600,8 +2854,8 @@ private Map getGhostSummaryStats(deviceId, String summaryView) {
     [
             "Detected": counts.detectedGhosts ?: 0,
             "Persistent": counts.persistentGhosts ?: 0,
-            "Targeted": "${counts.targetedGhosts ?: 0} (${counts.autoBusted ?: 0} auto)",
-            "Leaking": "${counts.leakingGhosts ?: 0} ghost / ${leakPoints} pt",
+            "Targeted": counts.targetedGhosts ?: 0,
+            "Escaping": counts.escapingGhosts ?: 0,
             "Busted": counts.bustedGhosts ?: 0
     ]
 }
@@ -2610,12 +2864,20 @@ private Map getTrackingStats(deviceId, Map displayCounts, Map lastSummary) {
     def dev = mmwaveDevices?.find { deviceKey(it.id) == deviceKey(deviceId) }
     def outOfBounds = lastSummary.outOfBoundsPointCount ?: 0
     def leaking = displayCounts.leakingGhosts ?: 0
-    def leakPoints = getLeakingPointCount(deviceId)
+    def escapingPoints = getEscapingPointCount(deviceId)
+    def alertText = "None"
+    if (leaking > 0 && escapingPoints > 0) {
+        alertText = "${leaking} ghost(s) need area expansion and ${escapingPoints} in-area occupancy point(s) remain."
+    } else if (leaking > 0) {
+        alertText = "${leaking} ghost(s) may need targeted area expansion."
+    } else if (escapingPoints > 0) {
+        alertText = "${escapingPoints} occupancy-contributing point(s) remain inside targeted areas."
+    }
     [
             "Detection": getDeviceStatus(dev),
             "Tracking days": getActiveTrackingDaysForDevice(deviceId),
             "Points processed": "${lastSummary.pointCount ?: 0} (${outOfBounds} OOB)",
-            "Leak alerts": (leaking > 0 || leakPoints > 0) ? "${leaking} ghost / ${leakPoints} pt" : "None"
+            "Ghost alerts": alertText
     ]
 }
 
@@ -2636,14 +2898,38 @@ private Map getDisplayData(deviceId) {
     ]
 }
 
-private Integer getLeakingPointCount(deviceId) {
+private void refreshStoredGhostSnapshotsForDevice(deviceId, List currentClustersOverride = null, List pointsOverride = null, List outOfBoundsOverride = null) {
+    def dev = mmwaveDevices?.find { deviceKey(it.id) == deviceKey(deviceId) }
+    if (!dev) {
+        return
+    }
+
+    def devKey = deviceKey(deviceId)
+    def currentClusters = currentClustersOverride ?: getTodayClusters(deviceId)
+    def rawPoints = pointsOverride ?: getPointsForDevice(deviceId)
+    def rawOutOfBoundsPoints = outOfBoundsOverride ?: getOutOfBoundsPointsForDevice(deviceId)
+    def stableClusters = ((state.stabilityData[devKey] ?: []) as List).collect { cloneCluster(it) }
+
+    stableClusters.each { stableCluster ->
+        def liveCluster = findBestMatch(stableCluster, currentClusters ?: [])
+        def snapshotData = buildGhostSnapshotData(devKey, stableCluster, dev, liveCluster, rawPoints, rawOutOfBoundsPoints)
+        copyGhostSnapshotFields(stableCluster, snapshotData)
+    }
+    state.stabilityData[devKey] = stableClusters
+
+    state.lastClustersSnapshot[devKey] = ((currentClusters ?: []) as List).collect { cluster ->
+        snapshotCluster(enrichClusterWithGhostSnapshotData(devKey, cluster, dev, cluster, rawPoints, rawOutOfBoundsPoints))
+    }
+}
+
+private Integer getEscapingPointCount(deviceId) {
     def displayData = getDisplayData(deviceId)
     def dev = mmwaveDevices?.find { deviceKey(it.id) == deviceKey(deviceId) }
     def pointBuckets = classifyPlotPoints(displayData.points, displayData.outOfBoundsPoints, dev)
     ((pointBuckets.occupancyAssociatedInterferencePoints ?: []) as List).size()
 }
 
-private Integer getLeakingTargetCountForDeviceKey(String devKey) {
+private Integer getEscapingTargetCountForDeviceKey(String devKey) {
     def dev = mmwaveDevices?.find { deviceKey(it.id) == devKey }
     if (!dev) {
         return 0
@@ -2651,13 +2937,13 @@ private Integer getLeakingTargetCountForDeviceKey(String devKey) {
 
     def displayData = getDisplayData(dev.id)
     def pointBuckets = classifyPlotPoints(displayData.points, displayData.outOfBoundsPoints, dev)
-    def leakingPoints = (pointBuckets.occupancyAssociatedInterferencePoints ?: []) as List
-    if (!leakingPoints) {
+    def escapingPoints = (pointBuckets.occupancyAssociatedInterferencePoints ?: []) as List
+    if (!escapingPoints) {
         return 0
     }
 
     getRememberedInterferenceAreas(devKey).findAll { area ->
-        leakingPoints.any { point ->
+        escapingPoints.any { point ->
             isPointWithinBounds(point.x as Double, point.y as Double, point.z as Double, area.bounds)
         }
     }.size()
@@ -2670,6 +2956,7 @@ private Map getSummaryForDevice(deviceId) {
             persistentGhosts: 0,
             targetedGhosts: 0,
             leakingGhosts: 0,
+            escapingGhosts: 0,
             bustedGhosts: 0,
             autoBusted: 0,
             manualBusted: 0,
@@ -2694,6 +2981,72 @@ private Map getDisplayCounts(deviceId) {
     def currentCounts = getGhostCounts(devKey, liveClusters)
     currentCounts.ghostsToday = (getPointsForDevice(deviceId) || liveClusters) ? (liveClusters?.size() ?: 0) : (summary.ghostsToday ?: 0)
     currentCounts
+}
+
+private Map getNetworkSummaryStats(List sortedDevices, Integer aggregatePersistent, Integer aggregateBusted) {
+    def detected = sortedDevices.collect { getDisplayCounts(it.id).detectedGhosts ?: 0 }.sum() ?: 0
+    def targeted = sortedDevices.collect { getDisplayCounts(it.id).targetedGhosts ?: 0 }.sum() ?: 0
+    def escaping = sortedDevices.collect { getDisplayCounts(it.id).escapingGhosts ?: 0 }.sum() ?: 0
+    def leaking = sortedDevices.collect { getDisplayCounts(it.id).leakingGhosts ?: 0 }.sum() ?: 0
+    def escapingPoints = (sortedDevices ?: []).collect { getEscapingPointCount(it.id) ?: 0 }.sum() ?: 0
+
+    def stats = [
+            "Detected": detected,
+            "Persistent": aggregatePersistent,
+            "Targeted": targeted,
+            "Escaping": escaping,
+            "Busted": aggregateBusted
+    ]
+
+    def alertHtml = buildGhostAlertsHtml(leaking as Integer, escapingPoints as Integer)
+    if (alertHtml) {
+        stats._html = alertHtml
+    }
+    stats
+}
+
+private String buildGhostAlertsHtml(Integer escapingBeyondAreaCount, Integer escapingInsidePointCount) {
+    def alertParts = []
+    if ((escapingBeyondAreaCount ?: 0) > 0) {
+        alertParts << "${escapingBeyondAreaCount} ghost(s) escaping beyond their targeted interference areas and may require interference area expansion."
+    }
+    if ((escapingInsidePointCount ?: 0) > 0) {
+        alertParts << "${escapingInsidePointCount} occupancy-contributing point(s) are still appearing inside targeted interference areas."
+    }
+    alertParts ? renderNoteCard("Ghost Alerts", alertParts.join(" ")) : null
+}
+
+private String buildInterferenceAreaControlNotes(deviceId, List selectableClusters) {
+    def devKey = deviceKey(deviceId)
+    def notes = []
+    getRememberedInterferenceAreas(devKey).each { area ->
+        def targetedCluster = (selectableClusters ?: []).find { cluster ->
+            (cluster?.targetAreaIndex as Integer) == (area.areaIndex as Integer)
+        }
+        if (targetedCluster?.bounds && !sameBounds(targetedCluster.bounds, area.bounds)) {
+            def idx = selectableClusters.indexOf(targetedCluster) + 1
+            notes << "Area ${area.areaIndex} is using older bounds than Ghost ${idx}. Reapply area assignments to configure Area ${area.areaIndex} with the expanded bounds of Ghost ${idx}."
+            return
+        }
+
+        def exactMatch = (selectableClusters ?: []).find { cluster ->
+            cluster?.bounds && sameBounds(cluster.bounds, area.bounds)
+        }
+        if (exactMatch) {
+            return
+        }
+
+        def overlappingCluster = (selectableClusters ?: []).find { cluster ->
+            cluster?.bounds && boundsOverlap(cluster.bounds, area.bounds)
+        }
+        if (overlappingCluster) {
+            def idx = selectableClusters.indexOf(overlappingCluster) + 1
+            notes << "Area ${area.areaIndex} may be using older bounds than Ghost ${idx}. Reapply area assignments if you want Area ${area.areaIndex} updated to the current bounds of Ghost ${idx}."
+        } else {
+            notes << "Area ${area.areaIndex} is remembered, but no current ghost exactly matches its saved bounds."
+        }
+    }
+    notes ? notes.join("<br>") : null
 }
 
 private List getSnapshotPoints(deviceId) {
@@ -2725,14 +3078,8 @@ private Map buildSelectableClusterOptions(List selectableClusters) {
 }
 
 private String getAssignedClusterOption(deviceId, Integer areaIndex, List selectableClusters) {
-    def devKey = deviceKey(deviceId)
-    def rememberedArea = getRememberedInterferenceAreas(devKey).find { (it.areaIndex as Integer) == areaIndex }
-    if (!rememberedArea?.bounds) {
-        return "__none__"
-    }
-
     def matchedCluster = (selectableClusters ?: []).find { cluster ->
-        boundsOverlap(cluster.bounds, rememberedArea.bounds)
+        (cluster?.targetAreaIndex as Integer) == areaIndex
     }
     matchedCluster != null ? selectableClusters.indexOf(matchedCluster).toString() : "__none__"
 }
@@ -2756,6 +3103,12 @@ private List dedupeClusters(List clusters) {
         }
         if (!duplicate) {
             deduped << snapshotCluster(cluster)
+        } else {
+            if (duplicate.targetAreaIndex == null && cluster.targetAreaIndex != null) {
+                duplicate.targetAreaIndex = cluster.targetAreaIndex
+                duplicate.targetSource = cluster.targetSource ?: duplicate.targetSource
+                duplicate.appliedBounds = cloneBounds(cluster.appliedBounds)
+            }
         }
     }
     deduped
@@ -3032,10 +3385,32 @@ private boolean isClusterBusted(Map cluster) {
 }
 
 private Map getRememberedAreaForGhost(String devKey, Map cluster) {
-    if (!devKey || !cluster?.bounds) {
+    if (!devKey || !cluster) {
         return null
     }
-    getRememberedInterferenceAreas(devKey).find { area ->
+    def rememberedAreas = getRememberedInterferenceAreas(devKey)
+    def explicitIndex = cluster.targetAreaIndex != null ? (cluster.targetAreaIndex as Integer) : null
+    if (explicitIndex != null) {
+        def indexedArea = rememberedAreas.find { (it.areaIndex as Integer) == explicitIndex }
+        if (indexedArea) {
+            return indexedArea
+        }
+    }
+
+    if (cluster?.appliedBounds && isValidBounds(cluster.appliedBounds as Map)) {
+        def appliedMatch = rememberedAreas.find { area ->
+            sameBounds(cluster.appliedBounds as Map, area.bounds)
+        }
+        if (appliedMatch) {
+            return appliedMatch
+        }
+    }
+
+    if (!cluster?.bounds) {
+        return null
+    }
+
+    rememberedAreas.find { area ->
         boundsOverlap(cluster.bounds, area.bounds)
     }
 }
@@ -3044,55 +3419,230 @@ private boolean isGhostTargeted(String devKey, Map cluster) {
     isClusterTargeted(cluster) || getRememberedAreaForGhost(devKey, cluster) != null
 }
 
+private boolean isGhostHistoricallyBusted(String devKey, Map cluster) {
+    if (!isGhostTargeted(devKey, cluster)) {
+        return false
+    }
+
+    def activeIssue = isGhostLeaking(devKey, cluster) || isGhostEscaping(devKey, cluster)
+    def requiredAbsentDays = activeIssue ? Integer.MAX_VALUE : safeLeakRecoveryDays()
+    ((cluster?.absentStreak ?: 0) >= requiredAbsentDays)
+}
+
 private boolean isGhostBusted(String devKey, Map cluster) {
     if (!isGhostTargeted(devKey, cluster)) {
         return false
     }
 
-    def leakActive = hasProblemInterferencePointsForGhost(devKey, cluster)
-    def requiredAbsentDays = leakActive ? Integer.MAX_VALUE : safeLeakRecoveryDays()
-    ((cluster?.absentStreak ?: 0) >= requiredAbsentDays)
+    if (isGhostHistoricallyBusted(devKey, cluster)) {
+        return true
+    }
+
+    def targetArea = getRememberedAreaForGhost(devKey, cluster)
+    def currentCluster = getCurrentClusterForGhost(devKey, cluster)
+    if (!targetArea?.bounds || !currentCluster?.bounds || !currentCluster?.points) {
+        return false
+    }
+
+    if (!isBoundsWithinBounds(currentCluster.bounds, targetArea.bounds)) {
+        return false
+    }
+
+    currentCluster.points.every { point ->
+        isPointWithinBounds(point.x as Double, point.y as Double, point.z as Double, targetArea.bounds) &&
+                !pointContributesToOccupancyInsideInterferenceArea(devKey, point)
+    }
 }
 
-private boolean hasProblemInterferencePointsForGhost(String devKey, Map cluster) {
+private boolean isGhostEscaping(String devKey, Map cluster) {
+    getEscapingGhostMode(devKey, cluster) != null
+}
+
+private String getEscapingGhostMode(String devKey, Map cluster) {
+    if (cluster?.escapingModeSnapshot && !hasLiveGhostEvidence(devKey)) {
+        return cluster.escapingModeSnapshot as String
+    }
     if (!devKey || !cluster) {
-        return false
+        return null
     }
 
     def dev = mmwaveDevices?.find { deviceKey(it?.id) == devKey }
     def targetArea = getRememberedAreaForGhost(devKey, cluster)
     if (!dev || !targetArea?.bounds) {
-        return false
+        return null
     }
 
     def displayData = getDisplayData(dev.id)
     def pointBuckets = classifyPlotPoints(displayData.points, displayData.outOfBoundsPoints, dev)
-    ((pointBuckets.occupancyAssociatedInterferencePoints ?: []) as List).any { point ->
+    def escapingInside = ((pointBuckets.occupancyAssociatedInterferencePoints ?: []) as List).any { point ->
         isPointWithinBounds(point.x as Double, point.y as Double, point.z as Double, targetArea.bounds)
     }
+    def leakingAdjacent = isGhostLeaking(devKey, cluster)
+    if (escapingInside && leakingAdjacent) {
+        return "both"
+    }
+    if (escapingInside) {
+        return "inside-area"
+    }
+    if (leakingAdjacent) {
+        return "adjacent"
+    }
+    null
 }
 
-private Map plotStateStyle(Map cluster, List historicalClusters, List currentClusters = [], List rememberedAreas = [], boolean historicalOnly = false) {
+private boolean isGhostLeaking(String devKey, Map cluster) {
+    if (!devKey || !cluster || !isGhostTargeted(devKey, cluster)) {
+        return false
+    }
+
+    def targetArea = getRememberedAreaForGhost(devKey, cluster)
+    def activeCluster = getCurrentClusterForGhost(devKey, cluster)
+    def clusterBounds = activeCluster?.bounds
+    if (!targetArea?.bounds || !isValidBounds(clusterBounds)) {
+        return false
+    }
+
+    boundsOverlap(clusterBounds, targetArea.bounds) && !isBoundsWithinBounds(clusterBounds, targetArea.bounds)
+}
+
+private boolean hasLiveGhostEvidence(String devKey) {
+    def dev = mmwaveDevices?.find { deviceKey(it?.id) == devKey }
+    if (!dev) {
+        return false
+    }
+    ((getPointsForDevice(dev.id) ?: []) as List) || ((getTodayClusters(dev.id) ?: []) as List)
+}
+
+private boolean pointContributesToOccupancyInsideInterferenceArea(String devKey, Map point) {
+    if (!devKey || !point) {
+        return false
+    }
+
+    def dev = mmwaveDevices?.find { deviceKey(it?.id) == devKey }
+    if (!dev) {
+        return false
+    }
+
+    def displayData = getDisplayData(dev.id)
+    def rememberedAreas = getRememberedInterferenceAreas(devKey)
+    def deviceBounds = getDeviceBounds(dev)
+    def validDeviceBounds = isValidBounds(deviceBounds)
+    def allDisplayPoints = []
+    allDisplayPoints.addAll(displayData.points ?: [])
+    allDisplayPoints.addAll(displayData.outOfBoundsPoints ?: [])
+    shouldPlotInterferenceAreaPointAsRed(point, allDisplayPoints, rememberedAreas, deviceBounds, validDeviceBounds, getOccupancyAssociationWindowMs(dev))
+}
+
+private Map getCurrentClusterForGhost(String devKey, Map cluster) {
+    def dev = mmwaveDevices?.find { deviceKey(it?.id) == devKey }
+    if (!dev || !cluster) {
+        return null
+    }
+
+    def displayData = getDisplayData(dev.id)
+    def currentClusters = ((displayData.currentClusters ?: []) as List)
+    def fallbackClusters = currentClusters ?: ((displayData.historicalClusters ?: []) as List)
+    def targetArea = getRememberedAreaForGhost(devKey, cluster)
+
+    if (targetArea?.bounds) {
+        def targetedCandidates = fallbackClusters.findAll { currentCluster ->
+            currentCluster?.bounds && boundsOverlap(currentCluster.bounds, targetArea.bounds)
+        }
+        def targetedMatch = targetedCandidates ? targetedCandidates.min { candidate ->
+            distance3D((candidate.center ?: [:]) as Map, (cluster.center ?: [:]) as Map)
+        } : null
+        if (targetedMatch) {
+            return targetedMatch
+        }
+    }
+
+    def bestCurrent = findBestMatch(cluster, fallbackClusters as List)
+    if (bestCurrent) {
+        return bestCurrent
+    }
+
+    if (cluster?.bounds) {
+        return [
+                bounds: cloneBounds(cluster.bounds),
+                center: clonePoint(cluster.center),
+                points: ((cluster.points ?: []) as List).collect { clonePoint(it) },
+                escapingBounds: cloneBounds(cluster.escapingBounds),
+                targetedAreaBounds: cloneBounds(cluster.targetedAreaBounds)
+        ]
+    }
+    targetArea?.bounds ? [bounds: cloneBounds(targetArea.bounds), center: clonePoint(cluster.center), points: []] : null
+}
+
+private boolean hasProblemInterferencePointsForGhost(String devKey, Map cluster) {
+    isGhostEscaping(devKey, cluster) || isGhostLeaking(devKey, cluster)
+}
+
+private Map getGhostAreaExpansion(String devKey, Map cluster) {
+    def targetArea = getRememberedAreaForGhost(devKey, cluster)
+    def clusterBounds = getCurrentClusterForGhost(devKey, cluster)?.bounds ?: cluster?.bounds
+    if (!targetArea?.bounds || !isValidBounds(clusterBounds)) {
+        return [:]
+    }
+
+    [
+            xmin: Math.max(0.0d, (targetArea.bounds.xmin ?: 0.0d) - (clusterBounds.xmin ?: 0.0d)),
+            xmax: Math.max(0.0d, (clusterBounds.xmax ?: 0.0d) - (targetArea.bounds.xmax ?: 0.0d)),
+            ymin: Math.max(0.0d, (targetArea.bounds.ymin ?: 0.0d) - (clusterBounds.ymin ?: 0.0d)),
+            ymax: Math.max(0.0d, (clusterBounds.ymax ?: 0.0d) - (targetArea.bounds.ymax ?: 0.0d)),
+            zmin: Math.max(0.0d, (targetArea.bounds.zmin ?: 0.0d) - (clusterBounds.zmin ?: 0.0d)),
+            zmax: Math.max(0.0d, (clusterBounds.zmax ?: 0.0d) - (targetArea.bounds.zmax ?: 0.0d))
+    ]
+}
+
+private String describeGhostAreaExpansion(String devKey, Map cluster) {
+    def expansion = getGhostAreaExpansion(devKey, cluster)
+    if (!expansion || expansion.values().every { (it ?: 0.0d) <= 0.0d }) {
+        return "Within target area"
+    }
+
+    def parts = []
+    if ((expansion.xmin ?: 0.0d) > 0.0d) {
+        parts << "X min -${round2(expansion.xmin)}"
+    }
+    if ((expansion.xmax ?: 0.0d) > 0.0d) {
+        parts << "X max +${round2(expansion.xmax)}"
+    }
+    if ((expansion.ymin ?: 0.0d) > 0.0d) {
+        parts << "Y min -${round2(expansion.ymin)}"
+    }
+    if ((expansion.ymax ?: 0.0d) > 0.0d) {
+        parts << "Y max +${round2(expansion.ymax)}"
+    }
+    if ((expansion.zmin ?: 0.0d) > 0.0d) {
+        parts << "Z min -${round2(expansion.zmin)}"
+    }
+    if ((expansion.zmax ?: 0.0d) > 0.0d) {
+        parts << "Z max +${round2(expansion.zmax)}"
+    }
+    parts.join(", ")
+}
+
+private Map plotStateStyle(Map cluster, String devKey, List historicalClusters, List currentClusters = [], List rememberedAreas = [], boolean historicalOnly = false) {
     def matched = (historicalClusters ?: []).find { existing ->
         distance3D(existing.center, cluster.center) <= safeClusterRadius()
     } ?: cluster
-    def matchedRememberedArea = (rememberedAreas ?: []).find { area ->
-        boundsOverlap(matched.bounds ?: cluster.bounds, area.bounds)
-    }
+    def stateName = devKey ? determineGhostState(devKey, matched) : (matched?.ghostStateSnapshot ?: null)
 
-    if (isClusterBusted(matched)) {
-        return [stroke: "#2e7d32", fill: "rgba(46,125,50,0.14)", dash: null]
+    switch (stateName) {
+        case "Busted":
+            return [stroke: "#2e7d32", fill: "rgba(46,125,50,0.14)", dash: null]
+        case "Escaping":
+            return [stroke: "#c62828", fill: "rgba(198,40,40,0.14)", dash: null]
+        case "Targeted":
+            return [stroke: "#ef6c00", fill: "rgba(239,108,0,0.14)", dash: null]
+        case "Persistent":
+            return [stroke: "#f9a825", fill: historicalOnly ? "rgba(249,168,37,0.14)" : "none", dash: "3,2"]
+        default:
+            return [stroke: "#1565c0", fill: historicalOnly ? "rgba(21,101,192,0.14)" : "none", dash: "3,2"]
     }
-    if (isClusterTargeted(matched) || matchedRememberedArea) {
-        return [stroke: "#c62828", fill: "rgba(198,40,40,0.14)", dash: null]
-    }
-    if (isClusterPersistent(matched)) {
-        return [stroke: "#ef6c00", fill: historicalOnly ? "rgba(239,108,0,0.14)" : "none", dash: "3,2"]
-    }
-    return [stroke: "#1565c0", fill: historicalOnly ? "rgba(21,101,192,0.14)" : "none", dash: "3,2"]
 }
 
-private Map classifyPlotPoints(List points, List outOfBoundsPoints, dev) {
+private Map classifyPlotPoints(List points, List outOfBoundsPoints, dev, String horizontalAxis = "x", String verticalAxis = "y") {
     def deviceBounds = dev ? getDeviceBounds(dev) : null
     def validDeviceBounds = isValidBounds(deviceBounds)
     def rememberedAreas = dev ? getRememberedInterferenceAreas(deviceKey(dev.id)) : []
@@ -3107,8 +3657,20 @@ private Map classifyPlotPoints(List points, List outOfBoundsPoints, dev) {
     allDisplayPoints.addAll(outOfBoundsPoints ?: [])
 
     allDisplayPoints.each { point ->
-        if (shouldPlotInterferenceAreaPointAsRed(point, allDisplayPoints, rememberedAreas, deviceBounds, validDeviceBounds, occupancyAssociationWindowMs)) {
-            occupancyAssociatedInterferencePoints << point
+        def insideActiveArea = isPointInsideActiveRememberedInterferenceArea(point, rememberedAreas)
+        def insideProjectedAreaOnly = !insideActiveArea && isPointInsideProjectedRememberedArea(point, rememberedAreas, horizontalAxis, verticalAxis)
+
+        if (insideActiveArea) {
+            if (shouldPlotInterferenceAreaPointAsRed(point, allDisplayPoints, rememberedAreas, deviceBounds, validDeviceBounds, occupancyAssociationWindowMs)) {
+                occupancyAssociatedInterferencePoints << point
+            } else {
+                ignoredPoints << point
+            }
+            return
+        }
+
+        if (insideProjectedAreaOnly) {
+            ignoredPoints << point
             return
         }
 
@@ -3137,7 +3699,31 @@ private Map classifyPlotPoints(List points, List outOfBoundsPoints, dev) {
             deviceBounds: deviceBounds,
             validDeviceBounds: validDeviceBounds,
             rememberedAreas: rememberedAreas
-    ]
+        ]
+}
+
+private boolean isPointInsideProjectedRememberedArea(Map point, List rememberedAreas, String horizontalAxis, String verticalAxis) {
+    if (!point || !rememberedAreas) {
+        return false
+    }
+
+    def pointTs = point.ts instanceof Number ? (point.ts as Long) : null
+    if (pointTs == null) {
+        return false
+    }
+
+    def hMinField = "${horizontalAxis}min"
+    def hMaxField = "${horizontalAxis}max"
+    def vMinField = "${verticalAxis}min"
+    def vMaxField = "${verticalAxis}max"
+
+    rememberedAreas.any { area ->
+        pointTs >= ((area.updatedAt ?: 0L) as Long) &&
+                point[horizontalAxis] >= area.bounds[hMinField] &&
+                point[horizontalAxis] <= area.bounds[hMaxField] &&
+                point[verticalAxis] >= area.bounds[vMinField] &&
+                point[verticalAxis] <= area.bounds[vMaxField]
+    }
 }
 
 private boolean shouldPlotInterferenceAreaPointAsRed(Map point, List allDisplayPoints, List rememberedAreas, Map deviceBounds, boolean validDeviceBounds, Long windowMs) {
@@ -3146,10 +3732,6 @@ private boolean shouldPlotInterferenceAreaPointAsRed(Map point, List allDisplayP
     }
 
     if (point?.ghostIgnoreReason in ["switch-inactive", "device-inactive"]) {
-        return false
-    }
-
-    if (point?.ghostIgnoreReason != "interference-area") {
         return false
     }
 
@@ -3223,7 +3805,7 @@ private Long getOccupancyAssociationWindowMs(dev) {
 }
 
 private Map calculatePlotScale(List points, List outOfBoundsPoints, List currentClusters, List historicalClusters, dev = null, String horizontalAxis = "x", String verticalAxis = "y", Map preferredScale = null) {
-    def pointBuckets = classifyPlotPoints(points, outOfBoundsPoints, dev)
+    def pointBuckets = classifyPlotPoints(points, outOfBoundsPoints, dev, horizontalAxis, verticalAxis)
     def deviceBounds = pointBuckets.deviceBounds
     def validDeviceBounds = pointBuckets.validDeviceBounds
     def hMinField = "${horizontalAxis}min"
@@ -3238,7 +3820,6 @@ private Map calculatePlotScale(List points, List outOfBoundsPoints, List current
     def displayInBoundsPoints = pointBuckets.inBoundsPoints
     def ignoredPoints = pointBuckets.ignoredPoints
     def occupancyAssociatedInterferencePoints = pointBuckets.occupancyAssociatedInterferencePoints
-
     def allPointsForScale = []
     allPointsForScale.addAll(displayInBoundsPoints.collect { [(horizontalAxis): it[horizontalAxis], (verticalAxis): it[verticalAxis]] })
     allPointsForScale.addAll(ignoredPoints.collect { [(horizontalAxis): it[horizontalAxis], (verticalAxis): it[verticalAxis]] })
@@ -3338,7 +3919,7 @@ private String renderClusterPlot(List points, List outOfBoundsPoints, List curre
         return "No points or cluster history available."
     }
 
-    def pointBuckets = classifyPlotPoints(points, outOfBoundsPoints, dev)
+    def pointBuckets = classifyPlotPoints(points, outOfBoundsPoints, dev, horizontalAxis, verticalAxis)
     def deviceBounds = pointBuckets.deviceBounds
     def validDeviceBounds = pointBuckets.validDeviceBounds
     def displayInBoundsPoints = pointBuckets.inBoundsPoints
@@ -3356,14 +3937,18 @@ private String renderClusterPlot(List points, List outOfBoundsPoints, List curre
         legendItems << "<tspan fill='#888888'>Gray</tspan><tspan fill='#333333'> = ignored</tspan>"
     }
     if (occupancyAssociatedInterferencePoints) {
-        legendItems << "<tspan fill='#d32f2f'>Red</tspan><tspan fill='#333333'> = leaking</tspan>"
+        legendItems << "<tspan fill='#d32f2f'>Red</tspan><tspan fill='#333333'> = escaping</tspan>"
+    }
+    if (rememberedAreas) {
+        legendItems << "<tspan fill='#c5ccd3'>Light gray box</tspan><tspan fill='#333333'> = interference area</tspan>"
     }
     if (validDeviceBounds) {
         legendItems << "<tspan fill='#888888'>Gray box</tspan><tspan fill='#333333'> = device bounds</tspan>"
     }
     legendItems << "<tspan fill='#1565c0'>Blue box</tspan><tspan fill='#333333'> = detected ghost</tspan>"
-    legendItems << "<tspan fill='#ef6c00'>Orange box</tspan><tspan fill='#333333'> = persistent ghost</tspan>"
-    legendItems << "<tspan fill='#c62828'>Red box</tspan><tspan fill='#333333'> = targeted ghost</tspan>"
+    legendItems << "<tspan fill='#f9a825'>Yellow box</tspan><tspan fill='#333333'> = persistent ghost</tspan>"
+    legendItems << "<tspan fill='#ef6c00'>Orange box</tspan><tspan fill='#333333'> = targeted ghost</tspan>"
+    legendItems << "<tspan fill='#c62828'>Red box</tspan><tspan fill='#333333'> = escaping ghost</tspan>"
     legendItems << "<tspan fill='#2e7d32'>Green box</tspan><tspan fill='#333333'> = busted ghost</tspan>"
     def legendRows = legendItems.collate(2)
     def legendRowHeight = 12
@@ -3427,9 +4012,22 @@ private String renderClusterPlot(List points, List outOfBoundsPoints, List curre
         svg << "<rect x='${x1}' y='${y1}' width='${x2 - x1}' height='${y2 - y1}' fill='none' stroke='#888888' stroke-width='1' stroke-dasharray='4,2' />"
     }
 
+    // Draw remembered interference area boxes separately from ghost boxes.
+    (rememberedAreas ?: []).each { area ->
+        if (area?.bounds) {
+            def x1 = normalizeX(area.bounds[hMinField])
+            def x2 = normalizeX(area.bounds[hMaxField])
+            def y1 = normalizeY(area.bounds[vMaxField])
+            def y2 = normalizeY(area.bounds[vMinField])
+            svg << "<rect x='${x1}' y='${y1}' width='${x2 - x1}' height='${y2 - y1}' fill='rgba(197,204,211,0.18)' stroke='#c5ccd3' stroke-width='1.2' />"
+        }
+    }
+
     // Draw current ghost boxes plus unmatched historical ghosts behind points.
     def drawClusters = []
-    drawClusters.addAll((currentClusters ?: []).collect { [cluster: it, historicalOnly: false] })
+    drawClusters.addAll((currentClusters ?: []).collect { currentCluster ->
+        [cluster: getPreferredRenderCluster(currentCluster, historicalClusters, dev ? deviceKey(dev.id) : null), historicalOnly: false]
+    })
     (historicalClusters ?: []).each { historicalCluster ->
         def hasCurrentMatch = (currentClusters ?: []).any { currentCluster ->
             distance3D(currentCluster.center, historicalCluster.center) <= safeClusterRadius()
@@ -3446,9 +4044,18 @@ private String renderClusterPlot(List points, List outOfBoundsPoints, List curre
             def x2 = normalizeX(cluster.bounds[hMaxField])
             def y1 = normalizeY(cluster.bounds[vMaxField])
             def y2 = normalizeY(cluster.bounds[vMinField])
-            def style = plotStateStyle(cluster, historicalClusters, currentClusters, rememberedAreas, entry.historicalOnly as boolean)
+            def style = plotStateStyle(cluster, dev ? deviceKey(dev.id) : null, historicalClusters, currentClusters, rememberedAreas, entry.historicalOnly as boolean)
             def dashAttr = style.dash ? " stroke-dasharray='${style.dash}'" : ""
             svg << "<rect x='${x1}' y='${y1}' width='${x2 - x1}' height='${y2 - y1}' fill='${style.fill}' stroke='${style.stroke}' stroke-width='1.6'${dashAttr} />"
+
+            def escapingBounds = cluster.escapingBounds
+            if (escapingBounds && isValidBounds(escapingBounds) && ((occupancyAssociatedInterferencePoints ?: []).isEmpty() || (entry.historicalOnly as boolean))) {
+                def ex1 = normalizeX(escapingBounds[hMinField])
+                def ex2 = normalizeX(escapingBounds[hMaxField])
+                def ey1 = normalizeY(escapingBounds[vMaxField])
+                def ey2 = normalizeY(escapingBounds[vMinField])
+                svg << "<rect x='${ex1}' y='${ey1}' width='${ex2 - ex1}' height='${ey2 - ey1}' fill='rgba(198,40,40,0.08)' stroke='#c62828' stroke-width='1.1' stroke-dasharray='2,2' />"
+            }
         }
     }
 
@@ -3505,6 +4112,64 @@ private String renderClusterPlot(List points, List outOfBoundsPoints, List curre
 
     svg << "</svg>"
     svg.toString()
+}
+
+private Map getPreferredRenderCluster(Map currentCluster, List historicalClusters, String devKey) {
+    def matchedHistorical = findPreferredHistoricalRenderMatch(currentCluster, historicalClusters, devKey)
+    if (!matchedHistorical) {
+        return currentCluster
+    }
+
+    def currentState = devKey ? determineGhostState(devKey, matchedHistorical) : matchedHistorical?.ghostStateSnapshot
+    if (!(currentState in ["Targeted", "Escaping", "Busted"])) {
+        return currentCluster
+    }
+
+    def historicalBounds = matchedHistorical?.bounds
+    def currentBounds = currentCluster?.bounds
+    if (!isValidBounds(historicalBounds) || !isValidBounds(currentBounds)) {
+        return matchedHistorical
+    }
+
+    if (boundsVolume(historicalBounds) >= boundsVolume(currentBounds) && boundsOverlap(historicalBounds, currentBounds)) {
+        def renderCluster = snapshotCluster(matchedHistorical)
+        renderCluster.center = clonePoint(currentCluster.center ?: matchedHistorical.center)
+        renderCluster.points = ((currentCluster.points ?: matchedHistorical.points ?: []) as List).collect { clonePoint(it) }
+        return renderCluster
+    }
+
+    currentCluster
+}
+
+private Map findPreferredHistoricalRenderMatch(Map currentCluster, List historicalClusters, String devKey) {
+    if (!currentCluster) {
+        return null
+    }
+
+    def directCandidates = (historicalClusters ?: []).findAll { historicalCluster ->
+        distance3D((historicalCluster.center ?: [:]) as Map, (currentCluster.center ?: [:]) as Map) <= safeClusterRadius()
+    }
+    if (directCandidates) {
+        return directCandidates.min { candidate ->
+            distance3D((candidate.center ?: [:]) as Map, (currentCluster.center ?: [:]) as Map)
+        }
+    }
+
+    def targetArea = devKey ? getRememberedAreaForGhost(devKey, currentCluster) : null
+    if (targetArea?.bounds) {
+        def areaCandidates = (historicalClusters ?: []).findAll { historicalCluster ->
+            historicalCluster?.bounds &&
+                    boundsOverlap(historicalCluster.bounds, targetArea.bounds) &&
+                    boundsOverlap(currentCluster.bounds, targetArea.bounds)
+        }
+        if (areaCandidates) {
+            return areaCandidates.max { candidate ->
+                boundsVolume(candidate?.bounds)
+            }
+        }
+    }
+
+    null
 }
 
 private String renderCorrelationSummary(deviceId) {
@@ -3698,11 +4363,13 @@ private String renderClusterDetails(Map cluster, Integer displayIndex, String de
     def rememberedArea = getRememberedAreaForGhost(devKey, cluster)
     def effectiveTargetIndex = cluster.targetAreaIndex != null ? cluster.targetAreaIndex : rememberedArea?.areaIndex
     def effectiveTargetSource = cluster.targetSource ?: rememberedArea?.source
+    def leaking = isGhostLeaking(devKey, cluster)
+    def escaping = isGhostEscaping(devKey, cluster)
 
     def hasPoints = cluster.points && cluster.points.size() > 0
     def clusterKey = "${devKey}_cluster_${displayIndex}"
 
-    def html = renderStatBlock("Ghost ${displayIndex}: ${status}", [
+    def stats = [
             "X range": "${round2(bounds.xmin)} to ${round2(bounds.xmax)} cm",
             "Y range": "${round2(bounds.ymin)} to ${round2(bounds.ymax)} cm",
             "Z range": "${round2(bounds.zmin)} to ${round2(bounds.zmax)} cm",
@@ -3710,24 +4377,55 @@ private String renderClusterDetails(Map cluster, Integer displayIndex, String de
             "Days in window": cluster.daysSeen ?: 0,
             "Consecutive days": cluster.consecutiveSeen ?: 0,
             "Missing streak": cluster.absentStreak ?: 0,
-            "Stability": "${round2(cluster.stabilityPct ?: calculateStabilityPercent(cluster))}%",
-            "Targeting": describeGhostTargeting(devKey, cluster)
-    ])
+            "Stability": "${round2(cluster.stabilityPct ?: calculateStabilityPercent(cluster))}%"
+    ]
+
+    def detailNotes = []
+    detailNotes << "<div style='margin-bottom:6px;'><span style='color:#64748b; font-size:11px; text-transform:uppercase; letter-spacing:0.04em;'>Targeting</span><div style='margin-top:2px; color:#111827; line-height:1.35;'>${describeGhostTargeting(devKey, cluster)}</div></div>"
+
+    if (rememberedArea?.bounds) {
+        detailNotes << "<div style='margin-bottom:6px;'><span style='color:#64748b; font-size:11px; text-transform:uppercase; letter-spacing:0.04em;'>Area ${effectiveTargetIndex}</span><div style='margin-top:2px; color:#111827; line-height:1.35;'>X ${round2(rememberedArea.bounds.xmin)}..${round2(rememberedArea.bounds.xmax)}, Y ${round2(rememberedArea.bounds.ymin)}..${round2(rememberedArea.bounds.ymax)}, Z ${round2(rememberedArea.bounds.zmin)}..${round2(rememberedArea.bounds.zmax)} cm</div></div>"
+        detailNotes << "<div style='margin-bottom:6px;'><span style='color:#64748b; font-size:11px; text-transform:uppercase; letter-spacing:0.04em;'>Area fit</span><div style='margin-top:2px; color:#111827; line-height:1.35;'>${leaking ? "Ghost exceeds area: ${describeGhostAreaExpansion(devKey, cluster)}" : "Ghost does not currently exceed the targeted area"}</div></div>"
+    }
+    if (escaping) {
+        def escapingMode = getEscapingGhostMode(devKey, cluster)
+        def escapingMessage = escapingMode == "inside-area" ?
+                "Occupancy-contributing points are still appearing inside Area ${effectiveTargetIndex}" :
+                escapingMode == "adjacent" ?
+                        "Occupancy-contributing points adjacent to Area ${effectiveTargetIndex} suggest the area should be expanded" :
+                        "Occupancy-contributing points are appearing both inside and just outside Area ${effectiveTargetIndex}"
+        detailNotes << "<div style='margin-bottom:0;'><span style='color:#b91c1c; font-size:11px; text-transform:uppercase; letter-spacing:0.04em;'>Escaping alert</span><div style='margin-top:2px; color:#111827; line-height:1.35;'>${escapingMessage}</div></div>"
+    }
+
+    def html = new StringBuilder()
+    html << "<div style='border:1px solid #d7d7d7; background:#fbfbfb; padding:8px 10px; margin:4px 0;'>"
+    html << "<div style='font-weight:bold; color:#333333; margin-bottom:6px;'>Ghost ${displayIndex}: ${status}</div>"
+    html << "<table style='width:100%; border-collapse:collapse;'>"
+    stats.each { label, value ->
+        html << "<tr>"
+        html << "<td style='padding:3px 0; color:#666666; width:40%;'>${label}</td>"
+        html << "<td style='padding:3px 0; color:#111111; font-weight:bold; text-align:right;'>${value}</td>"
+        html << "</tr>"
+    }
+    html << "</table>"
+    if (detailNotes) {
+        html << "<div style='border:1px solid #e5e7eb; background:#ffffff; padding:10px; margin:8px 0 4px 0;'>${detailNotes.join('')}</div>"
+    }
 
     // Add cluster splitting controls if the cluster has points
     if (hasPoints && cluster.density >= safeMinClusterEvents() * 2) {
-        html += "<div style='margin-top:8px;'>"
-        html += "<input name='splitClusterRadius_${clusterKey}' type='decimal' title='Split radius (cm)' value='${round2(cluster.radius * 0.5)}' style='width:80px;'/> "
-        html += "<input name='splitCluster_${clusterKey}' type='button' value='Split Cluster ${displayIndex}' style='margin-left:4px;'/>"
-        html += "</div>"
+        html << "<div style='margin-top:8px;'>"
+        html << "<input name='splitClusterRadius_${clusterKey}' type='decimal' title='Split radius (cm)' value='${round2(cluster.radius * 0.5)}' style='width:80px;'/> "
+        html << "<input name='splitCluster_${clusterKey}' type='button' value='Split Cluster ${displayIndex}' style='margin-left:4px;'/>"
+        html << "</div>"
     }
 
-    html
+    html << "</div>"
+    html.toString()
 }
 
 private String describeClusterOption(Map cluster, Integer idx) {
-    def bounds = cluster.bounds ?: [:]
-    "Ghost ${idx + 1}: X ${round2(bounds.xmin)}..${round2(bounds.xmax)} cm, Y ${round2(bounds.ymin)}..${round2(bounds.ymax)} cm, Z ${round2(bounds.zmin)}..${round2(bounds.zmax)} cm"
+    "Ghost ${idx + 1}"
 }
 
 private String describeInterferenceAreaAssignment(deviceId, Integer areaIndex) {
@@ -3757,6 +4455,7 @@ private String renderRecommendationSummary(def recommendation) {
     renderStatBlock("Recommended Interference Area", [
             "Device": recommendation.deviceName,
             "Action": describeRecommendationAction(recommendation),
+            "Reason": recommendation.reason == "leaking" ? "Targeted ghost is leaking beyond its current area" : "Persistent ghost should be targeted",
             "X bounds": "${round2(bounds.xmin)} to ${round2(bounds.xmax)} cm",
             "Y bounds": "${round2(bounds.ymin)} to ${round2(bounds.ymax)} cm",
             "Z bounds": "${round2(bounds.zmin)} to ${round2(bounds.zmax)} cm",
@@ -3769,6 +4468,9 @@ private String describeRecommendationAction(def recommendation) {
         return "Set a new interference area"
     }
     if (recommendation.action == "expand" && recommendation.areaIndex != null) {
+        if (recommendation.reason == "leaking") {
+            return "Expand interference area ${recommendation.areaIndex} to cover a leaking ghost"
+        }
         return "Expand interference area ${recommendation.areaIndex}"
     }
     if (recommendation.areaIndex != null) {
@@ -3885,6 +4587,9 @@ private void sendGhostLifecycleNotifications(dev, List previousStableClusters) {
     def newTargetedPersistentGhosts = countNewGhostState(previousStableClusters, currentStableClusters) { ghost ->
         isClusterPersistent(ghost) && isGhostTargeted(devKey, ghost) && !isGhostBusted(devKey, ghost)
     }
+    def newEscapingGhosts = countNewGhostState(previousStableClusters, currentStableClusters) { ghost ->
+        isGhostEscaping(devKey, ghost) && !isGhostBusted(devKey, ghost)
+    }
 
     if (notifyOnAnyGhostDetected && newDetectedGhosts > 0) {
         sendNotification("${dev.displayName}: detected ${newDetectedGhosts} new ghost${newDetectedGhosts == 1 ? '' : 's'}.")
@@ -3897,6 +4602,9 @@ private void sendGhostLifecycleNotifications(dev, List previousStableClusters) {
     }
     if (notifyOnTargetedPersistentGhost && newTargetedPersistentGhosts > 0) {
         sendNotification("${dev.displayName}: ${newTargetedPersistentGhosts} targeted persistent ghost${newTargetedPersistentGhosts == 1 ? ' is' : 's are'} still active, so the interference area may not be working.")
+    }
+    if (notifyOnEscapingGhost && newEscapingGhosts > 0) {
+        sendNotification("${dev.displayName}: ${newEscapingGhosts} targeted ghost${newEscapingGhosts == 1 ? '' : 's'} ${newEscapingGhosts == 1 ? 'is' : 'are'} escaping from inside the configured interference area.")
     }
 }
 
@@ -3918,13 +4626,20 @@ private Integer countNewGhostState(List previousStableClusters, List currentStab
 private String describeGhostTargeting(String devKey, Map cluster) {
     def rememberedArea = getRememberedAreaForGhost(devKey, cluster)
     def effectiveTargetIndex = cluster.targetAreaIndex != null ? cluster.targetAreaIndex : rememberedArea?.areaIndex
+    def escapingMode = getEscapingGhostMode(devKey, cluster)
 
     if (isGhostBusted(devKey, cluster)) {
-        return "Area ${effectiveTargetIndex} eliminated this ghost for ${cluster.absentStreak ?: 0} active day(s)"
+        return "Area ${effectiveTargetIndex} is containing this ghost; current points are fully ignored inside the target area"
     }
 
-    if (isGhostLeakProblem(devKey, cluster)) {
-        return "Area ${effectiveTargetIndex} is configured, but this ghost is still being detected from interference-area leakage"
+    if (escapingMode == "both") {
+        return "Area ${effectiveTargetIndex} is being escaped from both inside the area and just beyond its boundary; review the area settings and consider expansion"
+    }
+    if (escapingMode == "inside-area") {
+        return "Area ${effectiveTargetIndex} is being escaped from inside the area; review the interference area settings"
+    }
+    if (escapingMode == "adjacent") {
+        return "Area ${effectiveTargetIndex} is targeting this ghost, but the ghost extends beyond the area; expansion is recommended"
     }
 
     if (isGhostTargeted(devKey, cluster)) {
@@ -3939,11 +4654,19 @@ private String describeGhostTargeting(String devKey, Map cluster) {
 }
 
 private String determineGhostState(String devKey, Map cluster) {
+    if (!hasLiveGhostEvidence(devKey)) {
+        if (cluster?.escapingModeSnapshot) {
+            return "Escaping"
+        }
+        if (cluster?.ghostStateSnapshot) {
+            return cluster.ghostStateSnapshot as String
+        }
+    }
     if (isGhostBusted(devKey, cluster)) {
         return "Busted"
     }
-    if (isGhostLeakProblem(devKey, cluster)) {
-        return isClusterPersistent(cluster) ? "Problem Persistent" : "Problem Detected"
+    if (isGhostEscaping(devKey, cluster)) {
+        return "Escaping"
     }
     if (isGhostTargeted(devKey, cluster)) {
         return "Targeted"
@@ -3968,6 +4691,8 @@ private String describeTargetSource(String source) {
             return "App-applied"
         case "manual-entry":
             return "Remembered manually"
+        case "device-sync":
+            return "Device-synced"
         default:
             return source ?: "Unknown"
     }
@@ -4029,30 +4754,37 @@ private Map getMainPageStatsSummary() {
 }
 
 private Map getMainPageHeadlineSummary() {
-    def aggregateBustSources = getAggregateBustSourceCounts()
     def detected = 0
     def persistent = 0
     def targeted = 0
+    def escaping = 0
     def busted = 0
-    def lastProcessedGhosts = 0
+    def leaking = 0
+    def escapingPoints = 0
 
     mmwaveDevices?.each { dev ->
         def displayCounts = getDisplayCounts(dev.id)
         detected += displayCounts.detectedGhosts ?: 0
         persistent += displayCounts.persistentGhosts ?: 0
         targeted += displayCounts.targetedGhosts ?: 0
+        escaping += displayCounts.escapingGhosts ?: 0
         busted += displayCounts.bustedGhosts ?: 0
-        lastProcessedGhosts += displayCounts.ghostsToday ?: 0
+        leaking += displayCounts.leakingGhosts ?: 0
+        escapingPoints += getEscapingPointCount(dev.id) ?: 0
     }
 
-    [
+    def stats = [
             "Detected": detected,
             "Persistent": persistent,
-            "Targeted": "${targeted} (${aggregateBustSources.autoBusted ?: 0} auto)",
-            "Busted": busted,
-            "Processed days": state.totalDays ?: 0,
-            "Last processed ghosts": lastProcessedGhosts
+            "Targeted": targeted,
+            "Escaping": escaping,
+            "Busted": busted
     ]
+    def alertHtml = buildGhostAlertsHtml(leaking as Integer, escapingPoints as Integer)
+    if (alertHtml) {
+        stats._html = alertHtml
+    }
+    stats
 }
 
 private String renderHomeHeroCard() {
@@ -4060,7 +4792,7 @@ private String renderHomeHeroCard() {
 <div style='display:flex; flex-direction:column; align-items:center; gap:0px;'>
 <img src='https://github.com/lnjustin/App-Images/blob/master/ghostBuster/Gemini_Generated_Image_jly61ajly61ajly6.png?raw=true' alt='Ghost Buster logo' style='display:block; width:115px; max-width:100%; height:auto; border-radius:10px;' />
 </div>
-<div style='font-weight:bold; color:#223043; font-size:16px; line-height:1.0;'>Bust ghosts. No calls needed.</div>
+<div style='font-weight:bold; color:#223043; font-size:16px; line-height:1.0;'>Bust ghosts without the calls</div>
 </div>
 </div>"""
 }
@@ -4179,7 +4911,7 @@ private Map cloneCluster(Map cluster) {
             targetSource: cluster.targetSource ?: cluster.bustMode,
             targetAreaIndex: cluster.targetAreaIndex,
             appliedBounds: cloneBounds(cluster.appliedBounds)
-    ]
+    ] + ghostSnapshotFields(cluster)
 }
 
 private Map snapshotCluster(Map cluster) {
@@ -4200,6 +4932,93 @@ private Map snapshotCluster(Map cluster) {
             targetSource: cluster.targetSource ?: cluster.bustMode,
             targetAreaIndex: cluster.targetAreaIndex,
             appliedBounds: cloneBounds(cluster.appliedBounds)
+    ] + ghostSnapshotFields(cluster)
+}
+
+private Map ghostSnapshotFields(Map cluster) {
+    [
+            ghostStateSnapshot: cluster?.ghostStateSnapshot,
+            escapingModeSnapshot: cluster?.escapingModeSnapshot,
+            escapingBounds: cloneBounds(cluster?.escapingBounds),
+            escapingPointCount: cluster?.escapingPointCount ?: 0,
+            targetedAreaBounds: cloneBounds(cluster?.targetedAreaBounds)
+    ]
+}
+
+private void copyGhostSnapshotFields(Map target, Map source) {
+    if (!target) {
+        return
+    }
+    target.ghostStateSnapshot = source?.ghostStateSnapshot
+    target.escapingModeSnapshot = source?.escapingModeSnapshot
+    target.escapingBounds = cloneBounds(source?.escapingBounds)
+    target.escapingPointCount = source?.escapingPointCount ?: 0
+    target.targetedAreaBounds = cloneBounds(source?.targetedAreaBounds)
+}
+
+private Map enrichClusterWithGhostSnapshotData(String devKey, Map cluster, dev, Map liveCluster = null, List rawPoints = null, List rawOutOfBoundsPoints = null) {
+    def enriched = snapshotCluster(cluster)
+    copyGhostSnapshotFields(enriched, buildGhostSnapshotData(devKey, cluster, dev, liveCluster, rawPoints, rawOutOfBoundsPoints))
+    enriched
+}
+
+private Map buildGhostSnapshotData(String devKey, Map cluster, dev, Map liveCluster = null, List rawPoints = null, List rawOutOfBoundsPoints = null) {
+    def effectiveCluster = liveCluster ?: cluster
+    def targetArea = getRememberedAreaForGhost(devKey, cluster)
+    def allPoints = []
+    allPoints.addAll(rawPoints ?: [])
+    allPoints.addAll(rawOutOfBoundsPoints ?: [])
+    def pointBuckets = classifyPlotPoints(rawPoints ?: [], rawOutOfBoundsPoints ?: [], dev)
+    def escapingInsidePoints = ((pointBuckets.occupancyAssociatedInterferencePoints ?: []) as List).findAll { point ->
+        targetArea?.bounds &&
+                isPointWithinBounds(point.x as Double, point.y as Double, point.z as Double, targetArea.bounds) &&
+                effectiveCluster?.bounds &&
+                isPointWithinBounds(point.x as Double, point.y as Double, point.z as Double, effectiveCluster.bounds)
+    }
+    def escapingAdjacentPoints = ((effectiveCluster?.points ?: []) as List).findAll { point ->
+        point?.ghostEligible != false &&
+                targetArea?.bounds &&
+                !isPointWithinBounds(point.x as Double, point.y as Double, point.z as Double, targetArea.bounds)
+    }.collect { clonePoint(it) }
+    def escapingAdjacentByBounds = targetArea?.bounds &&
+            effectiveCluster?.bounds &&
+            boundsOverlap(effectiveCluster.bounds, targetArea.bounds) &&
+            !isBoundsWithinBounds(effectiveCluster.bounds, targetArea.bounds)
+
+    def escapingPoints = []
+    escapingPoints.addAll(escapingInsidePoints.collect { clonePoint(it) })
+    escapingPoints.addAll(escapingAdjacentPoints)
+
+    def escapingMode = escapingInsidePoints && (escapingAdjacentPoints || escapingAdjacentByBounds) ? "both" :
+            escapingInsidePoints ? "inside-area" :
+                    (escapingAdjacentPoints || escapingAdjacentByBounds) ? "adjacent" :
+                            cluster?.escapingModeSnapshot
+
+    def computedState = targetArea?.bounds ?
+            (escapingMode ? "Escaping" : (isGhostTargeted(devKey, cluster) ? "Targeted" : (isClusterPersistent(cluster) ? "Persistent" : "Detected"))) :
+            (isClusterPersistent(cluster) ? "Persistent" : "Detected")
+
+    [
+            ghostStateSnapshot: computedState,
+            escapingModeSnapshot: escapingMode,
+            escapingBounds: escapingPoints ? boundsForPoints(escapingPoints) :
+                    (escapingAdjacentByBounds ? cloneBounds(effectiveCluster?.bounds) : cloneBounds(cluster?.escapingBounds)),
+            escapingPointCount: escapingPoints ? escapingPoints.size() : (escapingAdjacentByBounds ? Math.max(1, cluster?.escapingPointCount ?: 0) : (cluster?.escapingPointCount ?: 0)),
+            targetedAreaBounds: cloneBounds(targetArea?.bounds ?: cluster?.targetedAreaBounds)
+    ]
+}
+
+private Map boundsForPoints(List points) {
+    if (!(points ?: [])) {
+        return null
+    }
+    [
+            xmin: points.collect { it.x }.min(),
+            xmax: points.collect { it.x }.max(),
+            ymin: points.collect { it.y }.min(),
+            ymax: points.collect { it.y }.max(),
+            zmin: points.collect { it.z }.min(),
+            zmax: points.collect { it.z }.max()
     ]
 }
 
@@ -4404,6 +5223,18 @@ private Integer safeLeakRecoveryDays() {
     Math.max(1, (leakRecoveryDays ?: bustedGhostDays ?: 2) as Integer)
 }
 
+private Double safeMaxLeakExpandX() {
+    Math.max(0.0d, (maxLeakExpandX ?: 0.0d) as Double)
+}
+
+private Double safeMaxLeakExpandY() {
+    Math.max(0.0d, (maxLeakExpandY ?: 0.0d) as Double)
+}
+
+private Double safeMaxLeakExpandZ() {
+    Math.max(0.0d, (maxLeakExpandZ ?: 0.0d) as Double)
+}
+
 private BigDecimal safeStableThreshold() {
     Math.max(0, (stableThreshold ?: 70) as Integer) as BigDecimal
 }
@@ -4474,9 +5305,11 @@ private Map metricTileStyle(String label) {
         case "detected":
             return [border: "#90caf9", background: "#e3f2fd"]
         case "persistent":
-            return [border: "#ffcc80", background: "#fff3e0"]
+            return [border: "#d4af37", background: "#fffbea"]
         case "targeted":
-            return [border: "#ef9a9a", background: "#ffebee"]
+            return [border: "#d84315", background: "#ffe9dd"]
+        case "escaping":
+            return [border: "#e57373", background: "#ffebee"]
         case "busted":
             return [border: "#a5d6a7", background: "#e8f5e9"]
         case "detection":
@@ -4490,12 +5323,12 @@ private String renderTrackingPanel(Map stats) {
     def detectionValue = stats["Detection"]
     def trackingDays = stats["Tracking days"]
     def pointsProcessed = stats["Points processed"]
-    def leakAlerts = stats["Leak alerts"]
+    def ghostAlerts = stats["Ghost alerts"]
     """<div class='gt-metric-grid'>
 <div class='gt-metric-full'>${renderMetricTile("Detection", detectionValue)}</div>
 <div class='gt-metric-half'>${renderMetricTile("Tracking days", trackingDays)}</div>
 <div class='gt-metric-half'>${renderMetricTile("Points processed", pointsProcessed)}</div>
-<div class='gt-metric-full'>${renderMetricTile("Leak alerts", leakAlerts)}</div>
+<div class='gt-metric-full'>${renderMetricTile("Ghost alerts", ghostAlerts)}</div>
 </div>"""
 }
 
