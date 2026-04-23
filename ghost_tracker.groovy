@@ -20,12 +20,11 @@ preferences {
 
 def mainPage() {
     try {
-        refreshRecommendation()
         return dynamicPage(name: "mainPage", install: true, uninstall: true) {
             section() {
                 paragraph renderHomeHeroCard()
             }
-            section(getInterface("header", "Ghost Detection")) {
+            section(getInterface("headerWithRightLink", "Ghost Detection", buttonLink("recommendNow", "<div style='float:right;vertical-align:middle; margin:4px;'><b><font size=3>Refresh</font></b></div>", "#dbeafe", 14))) {
                 def landingSummary = getMainPageHeadlineSummary()
                 paragraph renderMetricDashboard([
                         [title: "Summary", stats: ((landingSummary ?: [:]) as Map).findAll { key, value -> key != "_html" }]
@@ -123,6 +122,24 @@ def settingsPage() {
                         options: ["Mode Boundary", "Time Boundary"],
                         required: true,
                         submitOnChange: true
+
+                input "pointProcessingMode",
+                        "enum",
+                        title: "When to process pending points",
+                        options: [
+                                "Only At Daily Boundary",
+                                "On Detection Active To Inactive Transition"
+                        ],
+                        defaultValue: "Only At Daily Boundary",
+                        required: true,
+                        submitOnChange: true
+
+                paragraph getInterface(
+                        "note",
+                        pointProcessingMode == "On Detection Active To Inactive Transition" ?
+                                "Pending points are processed only on actual ghost-detection deactivation events and at the daily boundary. Page loads do not trigger processing." :
+                                "Pending points are processed only at the daily boundary."
+                )
 
                 if (boundaryType == "Mode Boundary") {
                     input "resetModeEnterExit",
@@ -292,6 +309,16 @@ def settingsPage() {
                         "bool",
                         title: "Show historical ghost overlays on stats graphs",
                         defaultValue: true
+
+                input "maxLivePendingRenderPoints",
+                        "number",
+                        title: "Maximum pending points to render live on stats pages",
+                        defaultValue: 500
+
+                input "maxProcessedRenderPoints",
+                        "number",
+                        title: "Maximum processed points to render on stats pages",
+                        defaultValue: 1000
             }
 
             section(getInterface("header", "Automatic Ghost Busting")) {
@@ -349,7 +376,11 @@ def settingsPage() {
                     paragraph getInterface("note", "These interference areas are read directly from each device's interferenceArea0..3 attributes.")
 
                     sortedDevices.each { dev ->
-                        paragraph getInterface("subHeader", dev.displayName)
+                        paragraph getInterface(
+                                "subHeaderWithRightLink",
+                                dev.displayName,
+                                buttonLink("refreshDeviceAreas_${deviceKey(dev.id)}", "<div style='float:right;vertical-align:middle; margin:4px;'><b><font size=3>Refresh Areas</font></b></div>", "#1A77C9", 14)
+                        )
                         paragraph renderInterferenceAreasCard(dev.id)
                     }
                 }
@@ -432,7 +463,6 @@ def settingsPage() {
 def statsPage() {
     try {
         initializeState()
-        refreshRecommendation()
         def sortedDevices = getSortedMmwaveDevices()
 
         def refreshStartAt = (state.statsPageRefreshStartAt ?: 0L) as Long
@@ -456,7 +486,6 @@ def statsPage() {
             def aggregateBusted = 0
 
             sortedDevices.each { dev ->
-                refreshStoredGhostSnapshotsForDevice(dev.id)
                 def displayCounts = getDisplayCounts(dev.id)
                 aggregatePersistent += displayCounts.persistentGhosts
                 aggregateBusted += displayCounts.bustedGhosts
@@ -477,9 +506,6 @@ def statsPage() {
 
             sortedDevices.each { dev ->
                 def devKey = deviceKey(dev.id)
-                refreshStoredGhostSnapshotsForDevice(dev.id)
-                def todayClusters = getTodayClusters(dev.id)
-                def stableClusters = getStableClusters(dev.id)
                 def trackedGhosts = getTrackedGhostsForDisplay(dev.id)
                 def displayCounts = getDisplayCounts(dev.id)
                 def displayData = getDisplayData(dev.id)
@@ -513,10 +539,22 @@ def statsPage() {
 
                     paragraph renderSideBySidePlots(
                             "X / Y View",
-                            renderClusterPlot(displayData.points, displayData.outOfBoundsPoints, displayData.currentClusters, displayData.historicalClusters, dev, "x", "y", xyScale, displayData.pointsPendingProcessing as boolean),
+                            renderClusterPlot(displayData.points, displayData.outOfBoundsPoints, displayData.currentClusters, displayData.historicalClusters, dev, "x", "y", xyScale, displayData.renderingLivePending as boolean),
                             "X / Z View",
-                            renderClusterPlot(displayData.points, displayData.outOfBoundsPoints, displayData.currentClusters, displayData.historicalClusters, dev, "x", "z", xyScale, displayData.pointsPendingProcessing as boolean)
+                            renderClusterPlot(displayData.points, displayData.outOfBoundsPoints, displayData.currentClusters, displayData.historicalClusters, dev, "x", "z", xyScale, displayData.renderingLivePending as boolean)
                     )
+                    if ((displayData.pointsPendingProcessing as boolean) && !(displayData.renderingLivePending as boolean) && ((displayData.pendingPointCount ?: 0) as Integer) > safeMaxLivePendingRenderPoints()) {
+                        paragraph renderNoteCard(
+                                "Pending Points Not Shown",
+                                "${displayData.pendingPointCount} pending point(s) were not plotted because they exceed the live graph limit of ${safeMaxLivePendingRenderPoints()}. The graphs are showing the last processed snapshot instead."
+                        )
+                    }
+                    if (!(displayData.renderingProcessedPoints as boolean) && ((displayData.processedPointCount ?: 0) as Integer) > safeMaxProcessedRenderPoints()) {
+                        paragraph renderNoteCard(
+                                "Processed Points Not Shown",
+                                "${displayData.processedPointCount} processed point(s) were not plotted because they exceed the processed graph limit of ${safeMaxProcessedRenderPoints()}. Ghost boxes and summaries remain available."
+                        )
+                    }
 
                     if ((displayCounts.leakingGhosts ?: 0) > 0 || (displayCounts.escapingGhosts ?: 0) > 0 || escapingPointCount > 0) {
                         paragraph(buildGhostAlertsHtml(displayCounts.leakingGhosts as Integer, escapingPointCount as Integer))
@@ -668,7 +706,8 @@ def appButtonHandler(btn) {
     debugLog("appButtonHandler(): btn=${btn}")
 
     if (btn == "recommendNow") {
-        generateRecommendation()
+        refreshRecommendation()
+        scheduleStatsPageRefresh(4000L, 0L, 1)
         return
     }
 
@@ -733,6 +772,8 @@ def appButtonHandler(btn) {
     if (btn.startsWith("applyZones_")) {
         def devKey = btn.substring("applyZones_".length())
         applySelectedZones(devKey)
+        updateDynamicInterferenceAreas()
+        scheduleStatsPageRefresh(12000L, 3000L, 3)
         return
     }
 
@@ -780,6 +821,12 @@ def appButtonHandler(btn) {
     if (btn.startsWith("reclusterDevice_")) {
         def devKey = btn.substring("reclusterDevice_".length())
         reclusterDevice(devKey)
+        return
+    }
+
+    if (btn.startsWith("refreshDeviceAreas_")) {
+        def devKey = btn.substring("refreshDeviceAreas_".length())
+        refreshDeviceInterferenceAreas(devKey)
         return
     }
 }
@@ -839,7 +886,7 @@ private initialize() {
         }
     }
 
-    updateDetectionState()
+    updateDetectionState(false)
     updateDynamicInterferenceAreas()
 }
 
@@ -966,7 +1013,7 @@ private List getRetainedPointsForEpisodeRecompute(deviceId) {
     ((snapshotPoints ?: []).size() > (currentPoints ?: []).size()) ? snapshotPoints : currentPoints
 }
 
-private updateDetectionState() {
+private updateDetectionState(boolean processOnDeactivate = true) {
     mmwaveDevices?.each { dev ->
         def devKey = deviceKey(dev.id)
         def shouldBeActive = isDeviceActive(dev)
@@ -979,7 +1026,7 @@ private updateDetectionState() {
         }
 
         if (!shouldBeActive && wasActive) {
-            deactivateDetection(dev)
+            deactivateDetection(dev, processOnDeactivate)
         }
 
         state.activeDevices[devKey] = shouldBeActive
@@ -1029,13 +1076,21 @@ private activateDetection(dev) {
     }
 }
 
-private deactivateDetection(dev) {
+private deactivateDetection(dev, boolean processOnDeactivate = true) {
+    def devKey = deviceKey(dev?.id)
+    if (!devKey) {
+        return
+    }
+
+    state.activeDevices[devKey] = false
+    if (processOnDeactivate && shouldProcessPointsOnDetectionInactive()) {
+        processPendingPointsNow(devKey)
+    }
     sendMmWaveUnBind(dev)
-    state.activeDevices[deviceKey(dev.id)] = false
     infoLog("Ghost detection deactivated for ${dev.displayName}")
 
     if (notifyOnDeactivate) {
-        def counts = getGhostCounts(deviceKey(dev.id), getTodayClusters(dev.id))
+        def counts = getGhostCounts(devKey, getTodayClusters(dev.id))
         sendNotification("""Ghost detection deactivated for ${dev.displayName}
 Ghosts today: ${counts.ghostsToday}
 Persistent ghosts: ${counts.persistentGhosts}
@@ -1503,6 +1558,10 @@ private void processPendingPointsNow(String devKey) {
     } finally {
         state.dayIndex = previousDayIndex
     }
+}
+
+private boolean shouldProcessPointsOnDetectionInactive() {
+    (pointProcessingMode ?: "Only At Daily Boundary") == "On Detection Active To Inactive Transition"
 }
 
 private updateStabilityForDay(deviceId, List clustersToday) {
@@ -2520,6 +2579,9 @@ private void applySelectedZones(String devKey) {
     rememberAppliedZones(devKey, appliedZoneSpecs, "manual")
     updateClusterBustMode(dev.id, [selectedCluster], appliedZoneSpecs, "manual")
     syncClusterTargetsForDevice(devKey)
+    refreshStoredGhostSnapshotsForDevice(dev.id)
+    refreshRecommendation()
+    refreshDeviceInterferenceAreas(devKey, false)
 }
 
 private void applySelectedZoneForArea(String devKey, Integer areaIndex) {
@@ -2552,6 +2614,9 @@ private void applySelectedZoneForArea(String devKey, Integer areaIndex) {
     rememberAppliedZones(devKey, appliedZoneSpecs, "manual")
     updateClusterBustMode(dev.id, [selectedCluster], appliedZoneSpecs, "manual")
     syncClusterTargetsForDevice(devKey)
+    refreshStoredGhostSnapshotsForDevice(dev.id)
+    refreshRecommendation()
+    refreshDeviceInterferenceAreas(devKey, false)
 }
 
 private void applyAllSelectedZones(String devKey) {
@@ -2607,6 +2672,9 @@ private void applyAllSelectedZones(String devKey) {
     }
     debugLog("applyAllSelectedZones(${dev.displayName}): applied=${appliedZoneSpecs.size()}, cleared=${clearedAreaIndexes}")
     syncClusterTargetsForDevice(devKey)
+    refreshStoredGhostSnapshotsForDevice(dev.id)
+    refreshRecommendation()
+    refreshDeviceInterferenceAreas(devKey, false)
 }
 
 private void applyAutomaticGhostBusting(dev) {
@@ -2895,9 +2963,6 @@ private List getRememberedInterferenceAreas(String devKey) {
 
     if (dev) {
         def areas = readDeviceInterferenceAreas(dev)
-        if (!areas && !hasAnyDeviceInterferenceAreaAttribute(dev)) {
-            requestDeviceInterferenceAreaPopulate(dev)
-        }
         if (areas) {
             return mergeRememberedAreaMetadata(areas, metadata)
         }
@@ -2983,6 +3048,18 @@ private void requestDeviceInterferenceAreaPopulate(dev) {
         state.interferenceAreaPopulateAt = (state.interferenceAreaPopulateAt ?: [:]) + [(devKey): nowMs]
     } catch (Exception ex) {
         warnLog("Unable to request interference area attributes from ${dev.displayName}: ${ex.message}")
+    }
+}
+
+private void refreshDeviceInterferenceAreas(String devKey, boolean scheduleRefresh = true) {
+    def dev = mmwaveDevices?.find { deviceKey(it?.id) == devKey }
+    if (!dev) {
+        return
+    }
+    requestDeviceInterferenceAreaPopulate(dev)
+    if (scheduleRefresh) {
+        scheduleStatsPageRefresh(12000L, 3000L, 3)
+        state.settingsPageRefreshUntil = now() + 12000L
     }
 }
 
@@ -3317,6 +3394,8 @@ private void reclusterDevice(String devKey) {
     syncClusterTargetsForDevice(devKey)
     state.lastClustersSnapshot[devKey] = newClusters.collect { snapshotCluster(it) }
     state.lastPointsSnapshot[devKey] = filteredPoints.collect { clonePoint(it) }
+    refreshStoredGhostSnapshotsForDevice(dev.id, newClusters, filteredPoints, getOutOfBoundsPointsForDevice(dev.id))
+    refreshRecommendation()
 
     infoLog("Reclustering complete: ${newClusters.size()} new clusters created from ${filteredPoints.size()} points")
 }
@@ -3464,6 +3543,8 @@ private void expandTrackedGhost(String devKey, Integer displayIndex) {
         rememberInterferenceArea(devKey, rememberedArea.areaIndex as Integer, expandedBounds, rememberedArea.source ?: "manual", rememberedArea.dynamic as Map)
         syncClusterTargetsForDevice(devKey)
         refreshStoredGhostSnapshotsForDevice(dev.id)
+        refreshRecommendation()
+        refreshDeviceInterferenceAreas(devKey, false)
     }
 }
 
@@ -3751,7 +3832,7 @@ private Map getTrackingStats(deviceId, Map displayCounts, Map lastSummary, Map d
     def outOfBounds = lastSummary.outOfBoundsPointCount ?: 0
     def leaking = displayCounts.leakingGhosts ?: 0
     def escapingPoints = getEscapingPointCount(deviceId)
-    def pendingPointCount = (displayData?.pointsPendingProcessing ? (((displayData?.points ?: []) as List).size() + ((displayData?.outOfBoundsPoints ?: []) as List).size()) : 0) as Integer
+    def pendingPointCount = ((displayData?.pendingPointCount ?: 0) as Integer)
     def alertText = "None"
     if (leaking > 0 && escapingPoints > 0) {
         alertText = "${leaking} ghost(s) need area expansion and ${escapingPoints} in-area occupancy point(s) remain."
@@ -3814,6 +3895,10 @@ private Map getDisplayData(deviceId) {
                 outOfBoundsPoints: preferredPointSet.outOfBoundsPoints,
                 pointSource: preferredPointSet.source,
                 pointsPendingProcessing: preferredPointSet.pendingProcessing,
+                pendingPointCount: preferredPointSet.pendingPointCount ?: 0,
+                renderingLivePending: preferredPointSet.renderingLivePending == true,
+                processedPointCount: preferredPointSet.processedPointCount ?: 0,
+                renderingProcessedPoints: preferredPointSet.renderingProcessedPoints != false,
                 currentClusters: [],
                 historicalClusters: [],
                 selectableClusters: [],
@@ -3825,7 +3910,7 @@ private Map getDisplayData(deviceId) {
 
     try {
         state.displayDataLocks = displayLocks + [(devKey): true]
-        def currentClusters = getTodayClusters(deviceId)
+        def currentClusters = shouldRenderLivePendingPoints(preferredPointSet) ? getTodayClusters(deviceId) : []
         def historicalClusters = []
         if (showHistoricalGhostOverlaysEnabled()) {
             historicalClusters.addAll(getHistoricalClustersForDisplay(deviceId))
@@ -3841,6 +3926,10 @@ private Map getDisplayData(deviceId) {
                 outOfBoundsPoints: preferredPointSet.outOfBoundsPoints,
                 pointSource: preferredPointSet.source,
                 pointsPendingProcessing: preferredPointSet.pendingProcessing,
+                pendingPointCount: preferredPointSet.pendingPointCount ?: 0,
+                renderingLivePending: preferredPointSet.renderingLivePending == true,
+                processedPointCount: preferredPointSet.processedPointCount ?: 0,
+                renderingProcessedPoints: preferredPointSet.renderingProcessedPoints != false,
                 currentClusters: currentClusters,
                 historicalClusters: historicalClusters,
                 selectableClusters: buildSelectableClusters(currentClusters, selectableHistoricalClusters),
@@ -3859,20 +3948,66 @@ private Map getDisplayData(deviceId) {
 private Map preferDisplayPointSet(List currentPoints, List lastPoints, List currentOutOfBounds, List lastOutOfBounds) {
     def currentTotal = ((currentPoints ?: []) as List).size() + ((currentOutOfBounds ?: []) as List).size()
     def snapshotTotal = ((lastPoints ?: []) as List).size() + ((lastOutOfBounds ?: []) as List).size()
+    def renderLivePending = currentTotal > 0 && currentTotal <= safeMaxLivePendingRenderPoints()
+    def renderProcessed = snapshotTotal <= safeMaxProcessedRenderPoints()
+    if (currentTotal > 0 && snapshotTotal > 0) {
+        return [
+                points: renderLivePending ? (currentPoints ?: []) as List : (renderProcessed ? (lastPoints ?: []) as List : []),
+                outOfBoundsPoints: renderLivePending ? (currentOutOfBounds ?: []) as List : (renderProcessed ? (lastOutOfBounds ?: []) as List : []),
+                source: renderLivePending ? "live" : (renderProcessed ? "processed-snapshot" : "processed-hidden"),
+                pendingProcessing: true,
+                pendingPointCount: currentTotal,
+                renderingLivePending: renderLivePending,
+                processedPointCount: snapshotTotal,
+                renderingProcessedPoints: renderProcessed
+        ]
+    }
+    if (currentTotal > 0) {
+        return [
+                points: renderLivePending ? (currentPoints ?: []) as List : [],
+                outOfBoundsPoints: renderLivePending ? (currentOutOfBounds ?: []) as List : [],
+                source: renderLivePending ? "live" : "pending-hidden",
+                pendingProcessing: true,
+                pendingPointCount: currentTotal,
+                renderingLivePending: renderLivePending,
+                processedPointCount: snapshotTotal,
+                renderingProcessedPoints: renderProcessed
+        ]
+    }
     if (snapshotTotal > currentTotal) {
         return [
-                points: (lastPoints ?: []) as List,
-                outOfBoundsPoints: (lastOutOfBounds ?: []) as List,
-                source: "processed-snapshot",
-                pendingProcessing: false
+                points: renderProcessed ? (lastPoints ?: []) as List : [],
+                outOfBoundsPoints: renderProcessed ? (lastOutOfBounds ?: []) as List : [],
+                source: renderProcessed ? "processed-snapshot" : "processed-hidden",
+                pendingProcessing: false,
+                pendingPointCount: 0,
+                renderingLivePending: false,
+                processedPointCount: snapshotTotal,
+                renderingProcessedPoints: renderProcessed
         ]
     }
     [
-            points: (currentPoints ?: lastPoints ?: []) as List,
-            outOfBoundsPoints: (currentOutOfBounds ?: lastOutOfBounds ?: []) as List,
-            source: currentTotal > 0 ? "live" : "processed-snapshot",
-            pendingProcessing: currentTotal > 0
+            points: currentTotal > 0 ? (currentPoints ?: []) as List : (renderProcessed ? (lastPoints ?: []) as List : []),
+            outOfBoundsPoints: currentTotal > 0 ? (currentOutOfBounds ?: []) as List : (renderProcessed ? (lastOutOfBounds ?: []) as List : []),
+            source: currentTotal > 0 ? "live" : (renderProcessed ? "processed-snapshot" : "processed-hidden"),
+            pendingProcessing: currentTotal > 0,
+            pendingPointCount: currentTotal,
+            renderingLivePending: currentTotal > 0,
+            processedPointCount: snapshotTotal,
+            renderingProcessedPoints: renderProcessed
     ]
+}
+
+private boolean shouldRenderLivePendingPoints(Map preferredPointSet) {
+    ((preferredPointSet?.pendingProcessing ?: false) as boolean) && ((preferredPointSet?.renderingLivePending ?: false) as boolean)
+}
+
+private Integer safeMaxLivePendingRenderPoints() {
+    Math.max(0, (maxLivePendingRenderPoints ?: 500) as Integer)
+}
+
+private Integer safeMaxProcessedRenderPoints() {
+    Math.max(0, (maxProcessedRenderPoints ?: 1000) as Integer)
 }
 
 private void refreshStoredGhostSnapshotsForDevice(deviceId, List currentClustersOverride = null, List pointsOverride = null, List outOfBoundsOverride = null) {
@@ -3953,10 +4088,11 @@ private Map getSummaryForDevice(deviceId) {
 
 private Map getDisplayCounts(deviceId) {
     def devKey = deviceKey(deviceId)
-    def liveClusters = getTodayClusters(deviceId)
+    def displayData = getDisplayData(deviceId)
+    def liveClusters = (displayData.currentClusters ?: []) as List
     def summary = getSummaryForDevice(deviceId)
     def currentCounts = getDisplayGhostCounts(devKey, liveClusters)
-    currentCounts.ghostsToday = (getPointsForDevice(deviceId) || liveClusters) ? (liveClusters?.size() ?: 0) : (summary.ghostsToday ?: 0)
+    currentCounts.ghostsToday = (liveClusters || ((displayData.pointsPendingProcessing ?: false) as boolean)) ? (liveClusters?.size() ?: 0) : (summary.ghostsToday ?: 0)
     currentCounts
 }
 
@@ -5645,12 +5781,19 @@ private String describeInterferenceAreaAssignment(deviceId, Integer areaIndex) {
 }
 
 private String renderRecommendationSummary(def recommendation) {
+    def refreshAction = buttonLink("recommendNow", "<div style='float:right;vertical-align:middle; margin:2px 4px;'><b><font size=3>Refresh</font></b></div>", "#1A77C9", 13)
     if (recommendation?.message) {
-        return renderNoteCard("Recommendation", recommendation.message as String)
+        return "<div style='border-left:4px solid #c28b00; background:#fff8e1; padding:8px 10px; margin:4px 0;'>" +
+                "<div style='font-weight:bold; margin-bottom:4px; overflow:auto;'><div style='display:inline-block;'>Recommendation</div><div style='float:right; display:inline-block; text-align:center;'>${refreshAction}</div></div>" +
+                "<div>${recommendation.message as String}</div></div>"
     }
 
     def bounds = recommendation.bounds ?: [:]
-    renderStatBlock("Recommended Interference Area", [
+    def html = new StringBuilder()
+    html << "<div style='border:1px solid #d7d7d7; background:#fbfbfb; padding:8px 10px; margin:4px 0;'>"
+    html << "<div style='font-weight:bold; color:#333333; margin-bottom:6px; overflow:auto;'><div style='display:inline-block;'>Recommended Interference Area</div><div style='float:right; display:inline-block; text-align:center;'>${refreshAction}</div></div>"
+    html << "<table style='width:100%; border-collapse:collapse;'>"
+    [
             "Device": recommendation.deviceName,
             "Action": describeRecommendationAction(recommendation),
             "Reason": recommendation.reason == "leaking" ? "Targeted ghost is leaking beyond its current area" : "Persistent ghost should be targeted",
@@ -5658,7 +5801,14 @@ private String renderRecommendationSummary(def recommendation) {
             "Y bounds": "${round2(bounds.ymin)} to ${round2(bounds.ymax)} cm",
             "Z bounds": "${round2(bounds.zmin)} to ${round2(bounds.zmax)} cm",
             "Stability": "${round2(Math.min(100.0d, (recommendation.stabilityPct ?: 0.0d) as Double))}%"
-    ])
+    ].each { label, value ->
+        html << "<tr>"
+        html << "<td style='padding:3px 0; color:#666666; width:40%;'>${label}</td>"
+        html << "<td style='padding:3px 0; color:#111111; font-weight:bold; text-align:right;'>${value}</td>"
+        html << "</tr>"
+    }
+    html << "</table></div>"
+    html.toString()
 }
 
 private String describeRecommendationAction(def recommendation) {
@@ -5915,6 +6065,7 @@ private Map getConfigurationSummaryStats() {
             "Devices": summarizeDeviceNames(mmwaveDevices),
             "Activation": activationSummary,
             "Boundary": boundarySummary,
+            "Processing": shouldProcessPointsOnDetectionInactive() ? "on detection deactivate + daily boundary" : "daily boundary only",
             "Positional clustering": "${clusteringAlgorithm ?: 'DBSCAN'} / r=${clusterRadius ?: 50}cm / min=${minClusterEvents ?: 5}",
             "Persistence": "history ${historyDays ?: 14}d / persistent ${persistentGhostDays ?: 2}d / busted ${bustedGhostDays ?: 2}d",
             "Display": "detected grace ${safeDisplayGraceDays()}d / historical overlays ${showHistoricalGhostOverlaysEnabled() ? 'on' : 'off'}",
@@ -5962,14 +6113,24 @@ private Map getMainPageHeadlineSummary() {
     def escapingPoints = 0
 
     mmwaveDevices?.each { dev ->
-        def displayCounts = getDisplayCounts(dev.id)
-        detected += displayCounts.detectedGhosts ?: 0
-        persistent += displayCounts.persistentGhosts ?: 0
-        targeted += displayCounts.targetedGhosts ?: 0
-        escaping += displayCounts.escapingGhosts ?: 0
-        busted += displayCounts.bustedGhosts ?: 0
-        leaking += displayCounts.leakingGhosts ?: 0
-        escapingPoints += getEscapingPointCount(dev.id) ?: 0
+        def displayData = getDisplayData(dev.id)
+        if (shouldUseLiveHeadlineMetrics(displayData)) {
+            def displayCounts = getDisplayCounts(dev.id)
+            detected += displayCounts.detectedGhosts ?: 0
+            persistent += displayCounts.persistentGhosts ?: 0
+            targeted += displayCounts.targetedGhosts ?: 0
+            escaping += displayCounts.escapingGhosts ?: 0
+            busted += displayCounts.bustedGhosts ?: 0
+            leaking += displayCounts.leakingGhosts ?: 0
+            escapingPoints += getEscapingPointCount(dev.id) ?: 0
+        } else {
+            def summary = getSummaryForDevice(dev.id)
+            detected += summary.detectedGhosts ?: 0
+            persistent += summary.persistentGhosts ?: 0
+            targeted += summary.targetedGhosts ?: 0
+            escaping += summary.escapingGhosts ?: 0
+            busted += summary.bustedGhosts ?: 0
+        }
     }
 
     def stats = [
@@ -5984,6 +6145,10 @@ private Map getMainPageHeadlineSummary() {
         stats._html = alertHtml
     }
     stats
+}
+
+private boolean shouldUseLiveHeadlineMetrics(Map displayData) {
+    ((displayData?.pendingPointCount ?: 0) as Integer) <= safeMaxLivePendingRenderPoints()
 }
 
 private String renderHomeHeroCard() {
