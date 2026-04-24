@@ -16,33 +16,46 @@ preferences {
     page(name: "mainPage")
     page(name: "settingsPage")
     page(name: "statsPage")
+    page(name: "deviceAreaDispatchPage")
+    page(name: "deviceAreaPage")
 }
 
 def mainPage() {
     try {
+        refreshRecommendation()
         return dynamicPage(name: "mainPage", install: true, uninstall: true) {
             section() {
                 paragraph renderHomeHeroCard()
             }
-            section(getInterface("headerWithRightLink", "Ghost Detection", buttonLink("recommendNow", "<div style='float:right;vertical-align:middle; margin:4px;'><b><font size=3>Refresh</font></b></div>", "#dbeafe", 14))) {
+            section() {
                 def landingSummary = getMainPageHeadlineSummary()
-                paragraph renderMetricDashboard([
+                def body = new StringBuilder()
+                body << renderMetricDashboard([
                         [title: "Summary", stats: ((landingSummary ?: [:]) as Map).findAll { key, value -> key != "_html" }]
                 ], 1)
                 if (landingSummary._html) {
-                    paragraph landingSummary._html as String
+                    body << (landingSummary._html as String)
                 }
-                href "statsPage", title: "View Analysis And Interference Controls", description: "Per-device graphs, ghost states, and interference area controls"
                 if (state.recommendation) {
-                    paragraph renderRecommendationSummary(state.recommendation)
+                    body << renderRecommendationSummary(state.recommendation)
                 }
+                body << renderActionHintCard(
+                        "Next Step",
+                        "Open the device analysis page for per-device graphs, ghost states, and interference area controls.<div style='margin-top:8px; text-align:right;'><a href='${buildInstalledAppPageUrl("statsPage")}' style='color:#1A77C9; font-weight:bold; text-decoration:none;'>View Analysis And Interference Controls</a></div>"
+                )
+                paragraph renderFramedPageCard("Ghost Detection", body.toString())
             }
 
-            section(getInterface("header", "Configuration")) {
-                href "settingsPage", title: "Configure Devices and Detection", description: "Choose devices, activation, clustering, persistence, and notifications"
-                paragraph renderMetricDashboard([
+            section() {
+                def body = new StringBuilder()
+                body << renderMetricDashboard([
                         [title: "Configuration Summary", stats: getConfigurationSummaryStats()]
                 ], 1)
+                body << renderActionHintCard(
+                        "Next Step",
+                        "Adjust device selection, activation, clustering, persistence, and notifications.<div style='margin-top:8px; text-align:right;'><a href='${buildInstalledAppPageUrl("settingsPage")}' style='color:#1A77C9; font-weight:bold; text-decoration:none;'>Configure Devices And Detection</a></div>"
+                )
+                paragraph renderFramedPageCard("Configuration", body.toString())
             }
         }
     } catch (Throwable t) {
@@ -58,6 +71,9 @@ def settingsPage() {
             state.settingsPageRefreshUntil = null
         }
         return dynamicPage(name: "settingsPage", install: false, uninstall: false, refreshInterval: shouldAutoRefresh ? 1 : null) {
+            section() {
+                paragraph renderHomeHeroCard()
+            }
             section(getInterface("header", "Devices")) {
                 input "mmwaveDevices",
                         "device.InovellimmWaveDimmerBlueSeriesVZM32-SN",
@@ -122,24 +138,6 @@ def settingsPage() {
                         options: ["Mode Boundary", "Time Boundary"],
                         required: true,
                         submitOnChange: true
-
-                input "pointProcessingMode",
-                        "enum",
-                        title: "When to process pending points",
-                        options: [
-                                "Only At Daily Boundary",
-                                "On Detection Active To Inactive Transition"
-                        ],
-                        defaultValue: "Only At Daily Boundary",
-                        required: true,
-                        submitOnChange: true
-
-                paragraph getInterface(
-                        "note",
-                        pointProcessingMode == "On Detection Active To Inactive Transition" ?
-                                "Pending points are processed only on actual ghost-detection deactivation events and at the daily boundary. Page loads do not trigger processing." :
-                                "Pending points are processed only at the daily boundary."
-                )
 
                 if (boundaryType == "Mode Boundary") {
                     input "resetModeEnterExit",
@@ -310,15 +308,10 @@ def settingsPage() {
                         title: "Show historical ghost overlays on stats graphs",
                         defaultValue: true
 
-                input "maxLivePendingRenderPoints",
+                input "maxGraphPointsPerDevice",
                         "number",
-                        title: "Maximum pending points to render live on stats pages",
+                        title: "Maximum total points to graph per device",
                         defaultValue: 500
-
-                input "maxProcessedRenderPoints",
-                        "number",
-                        title: "Maximum processed points to render on stats pages",
-                        defaultValue: 1000
             }
 
             section(getInterface("header", "Automatic Ghost Busting")) {
@@ -376,11 +369,7 @@ def settingsPage() {
                     paragraph getInterface("note", "These interference areas are read directly from each device's interferenceArea0..3 attributes.")
 
                     sortedDevices.each { dev ->
-                        paragraph getInterface(
-                                "subHeaderWithRightLink",
-                                dev.displayName,
-                                buttonLink("refreshDeviceAreas_${deviceKey(dev.id)}", "<div style='float:right;vertical-align:middle; margin:4px;'><b><font size=3>Refresh Areas</font></b></div>", "#1A77C9", 14)
-                        )
+                        paragraph getInterface("subHeader", dev.displayName)
                         paragraph renderInterferenceAreasCard(dev.id)
                     }
                 }
@@ -453,6 +442,10 @@ def settingsPage() {
                         title: "Enable debug logging",
                         defaultValue: false
             }
+
+            section(getInterface("header", "Done")) {
+                href "mainPage", title: "Return To Landing Page", description: "Back to the app home page"
+            }
         }
     } catch (Throwable t) {
         logThrowable("settingsPage()", t)
@@ -460,9 +453,166 @@ def settingsPage() {
     }
 }
 
+def deviceAreaPage(params = [:]) {
+    try {
+        initializeState()
+        def requestedDeviceId = params?.deviceId ?: state.deviceAreaPageDeviceId
+        if (requestedDeviceId) {
+            state.deviceAreaPageDeviceId = requestedDeviceId
+        }
+
+        def shouldAutoRefresh = (state.deviceAreaPageRefreshUntil ?: 0L) > now()
+        def refreshIntervalSeconds = Math.max(1, (state.deviceAreaPageRefreshIntervalSeconds ?: 1) as Integer)
+        if (!shouldAutoRefresh) {
+            state.deviceAreaPageRefreshUntil = null
+            state.deviceAreaPageRefreshIntervalSeconds = null
+        }
+
+        def dev = mmwaveDevices?.find { deviceKey(it?.id) == deviceKey(requestedDeviceId) }
+        return dynamicPage(name: "deviceAreaPage", install: false, uninstall: false, refreshInterval: shouldAutoRefresh ? refreshIntervalSeconds : null) {
+            section() {
+                paragraph renderHomeHeroCard()
+            }
+            if (!dev) {
+                section { paragraph "Device not found." }
+                return
+            }
+
+            def devKey = deviceKey(dev.id)
+            def displayData = getDisplayData(dev.id)
+            def trackedGhosts = getTrackedGhostsForDisplay(dev.id)
+            def recommendation = state.recommendation?.deviceId == devKey ? state.recommendation : null
+
+            section() {
+                def body = new StringBuilder()
+                body << renderInterferenceAreasControlCard(dev.id, displayData.selectableClusters)
+                if (recommendation) {
+                    body << renderRecommendationSummary(recommendation)
+                }
+                paragraph renderFramedPageCard(
+                        "Interference Areas: ${dev.displayName}",
+                        body.toString(),
+                        buttonLink("refreshDeviceAreas_${devKey}", "<div style='float:right;vertical-align:middle; margin:4px;'><b><font size=3>Refresh Areas</font></b></div>", "#1A77C9", 14)
+                )
+            }
+
+            section() {
+                if (!trackedGhosts) {
+                    paragraph renderFramedPageCard("Ghost Bounds For Assignment", renderActionHintCard("No Active Ghosts", "No active ghosts are currently available for interference area assignment."))
+                } else {
+                    def body = new StringBuilder()
+                    trackedGhosts.eachWithIndex { cluster, idx ->
+                        body << renderClusterDetails(cluster, idx + 1, devKey)
+                    }
+                    paragraph renderFramedPageCard("Ghost Bounds For Assignment", body.toString())
+                }
+            }
+
+            section(getInterface("subHeader", "Area Assignments")) {
+                if (displayData.selectableClusters) {
+                    def eventDefinitions = renderCorrelationEventDefinitions(dev.id)
+                    if (eventDefinitions) {
+                        paragraph eventDefinitions
+                    }
+                    input "targetCluster_${devKey}_0",
+                            "enum",
+                            title: buildAreaSelectorTitle(dev.id, 0, displayData.selectableClusters),
+                            multiple: false,
+                            required: false,
+                            options: buildSelectableClusterOptions(displayData.selectableClusters),
+                            defaultValue: getAssignedClusterOption(dev.id, 0, displayData.selectableClusters),
+                            width: 4
+                    input "dynamicActivation_${devKey}_0",
+                            "enum",
+                            title: "Dynamic Activation",
+                            multiple: false,
+                            required: false,
+                            options: getDynamicActivationOptions(dev.id),
+                            defaultValue: getDynamicActivationSelection(dev.id, 0),
+                            width: 2
+                    input "targetCluster_${devKey}_1",
+                            "enum",
+                            title: buildAreaSelectorTitle(dev.id, 1, displayData.selectableClusters),
+                            multiple: false,
+                            required: false,
+                            options: buildSelectableClusterOptions(displayData.selectableClusters),
+                            defaultValue: getAssignedClusterOption(dev.id, 1, displayData.selectableClusters),
+                            width: 4
+                    input "dynamicActivation_${devKey}_1",
+                            "enum",
+                            title: "Dynamic Activation",
+                            multiple: false,
+                            required: false,
+                            options: getDynamicActivationOptions(dev.id),
+                            defaultValue: getDynamicActivationSelection(dev.id, 1),
+                            width: 2
+                    input "targetCluster_${devKey}_2",
+                            "enum",
+                            title: buildAreaSelectorTitle(dev.id, 2, displayData.selectableClusters),
+                            multiple: false,
+                            required: false,
+                            options: buildSelectableClusterOptions(displayData.selectableClusters),
+                            defaultValue: getAssignedClusterOption(dev.id, 2, displayData.selectableClusters),
+                            width: 4
+                    input "dynamicActivation_${devKey}_2",
+                            "enum",
+                            title: "Dynamic Activation",
+                            multiple: false,
+                            required: false,
+                            options: getDynamicActivationOptions(dev.id),
+                            defaultValue: getDynamicActivationSelection(dev.id, 2),
+                            width: 2
+                    input "targetCluster_${devKey}_3",
+                            "enum",
+                            title: buildAreaSelectorTitle(dev.id, 3, displayData.selectableClusters),
+                            multiple: false,
+                            required: false,
+                            options: buildSelectableClusterOptions(displayData.selectableClusters),
+                            defaultValue: getAssignedClusterOption(dev.id, 3, displayData.selectableClusters),
+                            width: 4
+                    input "dynamicActivation_${devKey}_3",
+                            "enum",
+                            title: "Dynamic Activation",
+                            multiple: false,
+                            required: false,
+                            options: getDynamicActivationOptions(dev.id),
+                            defaultValue: getDynamicActivationSelection(dev.id, 3),
+                            width: 2
+                    input "applyAllAreas_${devKey}", "button", title: "Apply Selected Area Assignments"
+                } else {
+                    paragraph "No ghosts are available for interference area targeting."
+                }
+            }
+        }
+    } catch (Throwable t) {
+        logThrowable("deviceAreaPage()", t)
+        throw t
+    }
+}
+
+def deviceAreaDispatchPage(params = [:]) {
+    try {
+        def requestedDeviceId = params?.deviceId
+        if (requestedDeviceId) {
+            state.deviceAreaPageDeviceId = requestedDeviceId
+        }
+
+        return dynamicPage(name: "deviceAreaDispatchPage", install: false, uninstall: false, nextPage: "deviceAreaPage") {
+            section() {
+                paragraph renderHomeHeroCard()
+                paragraph "Loading interference area controls..."
+            }
+        }
+    } catch (Throwable t) {
+        logThrowable("deviceAreaDispatchPage()", t)
+        throw t
+    }
+}
+
 def statsPage() {
     try {
         initializeState()
+        refreshRecommendation()
         def sortedDevices = getSortedMmwaveDevices()
 
         def refreshStartAt = (state.statsPageRefreshStartAt ?: 0L) as Long
@@ -477,6 +627,9 @@ def statsPage() {
         }
 
         return dynamicPage(name: "statsPage", install: false, uninstall: false, refreshInterval: activeRefreshInterval) {
+            section() {
+                paragraph renderHomeHeroCard()
+            }
             if (!sortedDevices) {
                 section { paragraph "No mmWave devices configured." }
                 return
@@ -486,26 +639,22 @@ def statsPage() {
             def aggregateBusted = 0
 
             sortedDevices.each { dev ->
+                refreshStoredGhostSnapshotsForDevice(dev.id)
                 def displayCounts = getDisplayCounts(dev.id)
                 aggregatePersistent += displayCounts.persistentGhosts
                 aggregateBusted += displayCounts.bustedGhosts
             }
 
-            section(getInterface("header", "All Devices Summary")) {
+            section() {
                 def networkSummary = getNetworkSummaryStats(sortedDevices, aggregatePersistent, aggregateBusted)
-                paragraph renderMetricDashboard([
-                        [title: "Network Summary", stats: ((networkSummary ?: [:]) as Map).findAll { key, value -> key != "_html" }]
-                ], 1)
-                if (networkSummary._html) {
-                    paragraph networkSummary._html as String
-                }
-                if (state.recommendation) {
-                    paragraph renderRecommendationSummary(state.recommendation)
-                }
+                paragraph renderAllDevicesSummaryCard(networkSummary, state.recommendation)
             }
 
             sortedDevices.each { dev ->
                 def devKey = deviceKey(dev.id)
+                refreshStoredGhostSnapshotsForDevice(dev.id)
+                def todayClusters = getTodayClusters(dev.id)
+                def stableClusters = getStableClusters(dev.id)
                 def trackedGhosts = getTrackedGhostsForDisplay(dev.id)
                 def displayCounts = getDisplayCounts(dev.id)
                 def displayData = getDisplayData(dev.id)
@@ -523,168 +672,16 @@ def statsPage() {
                         "y"
                 )
 
-                section(getInterface(
-                        "headerWithRightLink",
-                        "Device: ${dev.displayName}",
-                        buttonLink("clearDeviceStats_${devKey}", "<div style='float:right;vertical-align:middle; margin:4px;'><b><font size=3>Clear Device Stats</font></b></div>", "#ffe2e2", 14)
-                )) {
-                    def ghostDetailActions = []
-                    ghostDetailActions << buttonLink("reclusterDevice_${devKey}", "<div style='float:right;vertical-align:middle; margin:4px;'><b><font size=3>Re-evaluate</font></b></div>", "#1A77C9", 14)
-                    paragraph renderMetricDashboard([
-                            [title: "Ghost Summary", stats: getGhostSummaryStats(dev.id, "Overall Summary")],
-                            [title: "Tracking", html: renderTrackingPanel(getTrackingStats(dev.id, displayCounts, lastSummary, displayData), devKey)]
-                    ], 2)
-
-                    paragraph getInterface("subHeaderWithRightLink", "Ghost Details", ghostDetailActions.join(""))
-
-                    paragraph renderSideBySidePlots(
-                            "X / Y View",
-                            renderClusterPlot(displayData.points, displayData.outOfBoundsPoints, displayData.currentClusters, displayData.historicalClusters, dev, "x", "y", xyScale, displayData.renderingLivePending as boolean),
-                            "X / Z View",
-                            renderClusterPlot(displayData.points, displayData.outOfBoundsPoints, displayData.currentClusters, displayData.historicalClusters, dev, "x", "z", xyScale, displayData.renderingLivePending as boolean)
+                section() {
+                    paragraph renderDeviceStatsCard(dev, devKey, displayCounts, displayData, lastSummary, trackedGhosts, archivedGhostCount, escapingPointCount, xyScale)
+                    href(
+                            name: "manageDeviceAreas_${devKey}",
+                            page: "deviceAreaPage",
+                            title: "Manage Interference Areas",
+                            description: "Review current device areas, compare ghost bounds, and update assignments",
+                            params: [deviceId: dev.id?.toString()],
+                            state: "complete"
                     )
-                    if ((displayData.pointsPendingProcessing as boolean) && !(displayData.renderingLivePending as boolean) && ((displayData.pendingPointCount ?: 0) as Integer) > safeMaxLivePendingRenderPoints()) {
-                        paragraph renderNoteCard(
-                                "Pending Points Not Shown",
-                                "${displayData.pendingPointCount} pending point(s) were not plotted because they exceed the live graph limit of ${safeMaxLivePendingRenderPoints()}. The graphs are showing the last processed snapshot instead."
-                        )
-                    }
-                    if (!(displayData.renderingProcessedPoints as boolean) && ((displayData.processedPointCount ?: 0) as Integer) > safeMaxProcessedRenderPoints()) {
-                        paragraph renderNoteCard(
-                                "Processed Points Not Shown",
-                                "${displayData.processedPointCount} processed point(s) were not plotted because they exceed the processed graph limit of ${safeMaxProcessedRenderPoints()}. Ghost boxes and summaries remain available."
-                        )
-                    }
-
-                    if ((displayCounts.leakingGhosts ?: 0) > 0 || (displayCounts.escapingGhosts ?: 0) > 0 || escapingPointCount > 0) {
-                        paragraph(buildGhostAlertsHtml(displayCounts.leakingGhosts as Integer, escapingPointCount as Integer))
-                    }
-
-                    if (!trackedGhosts && !(displayData.showArchivedGhosts && displayData.archivedGhosts)) {
-                        paragraph "No ghost details currently shown for this device."
-                    } else {
-                        if (trackedGhosts) {
-                            trackedGhosts.eachWithIndex { cluster, idx ->
-                                paragraph renderClusterDetails(cluster, idx + 1, devKey)
-                            }
-                        }
-                    }
-
-                    def correlationSummary = renderCorrelationSummary(dev.id)
-                    if (correlationSummary) {
-                        paragraph getInterface(
-                                "subHeaderWithRightLink",
-                                "Correlation Tracking",
-                                buttonLink("clearCorrelationEvents_${devKey}", "<div style='float:right;vertical-align:middle; margin:4px;'><b><font size=3>Clear</font></b></div>", "#b91c1c", 14)
-                        )
-                        paragraph correlationSummary
-                    }
-
-                    if ((lastSummary.unclusteredPointCount ?: 0) > 0) {
-                        paragraph renderNoteCard("Detection Note", "Last processed run had ${lastSummary.unclusteredPointCount} point(s) that did not form a ghost cluster.")
-                    }
-
-                    paragraph getInterface("subHeader", "Interference Area Controls")
-                    if (displayData.selectableClusters) {
-                        input "targetCluster_${devKey}_0",
-                                "enum",
-                                title: buildAreaSelectorTitle(dev.id, 0, displayData.selectableClusters),
-                                multiple: false,
-                                required: false,
-                                options: buildSelectableClusterOptions(displayData.selectableClusters),
-                                defaultValue: getAssignedClusterOption(dev.id, 0, displayData.selectableClusters),
-                                width: 4
-                        input "dynamicActivation_${devKey}_0",
-                                "enum",
-                                title: "Dynamic Activation",
-                                multiple: false,
-                                required: false,
-                                options: getDynamicActivationOptions(dev.id),
-                                defaultValue: getDynamicActivationSelection(dev.id, 0),
-                                width: 2
-                        input "targetCluster_${devKey}_1",
-                                "enum",
-                                title: buildAreaSelectorTitle(dev.id, 1, displayData.selectableClusters),
-                                multiple: false,
-                                required: false,
-                                options: buildSelectableClusterOptions(displayData.selectableClusters),
-                                defaultValue: getAssignedClusterOption(dev.id, 1, displayData.selectableClusters),
-                                width: 4
-                        input "dynamicActivation_${devKey}_1",
-                                "enum",
-                                title: "Dynamic Activation",
-                                multiple: false,
-                                required: false,
-                                options: getDynamicActivationOptions(dev.id),
-                                defaultValue: getDynamicActivationSelection(dev.id, 1),
-                                width: 2
-                        input "targetCluster_${devKey}_2",
-                                "enum",
-                                title: buildAreaSelectorTitle(dev.id, 2, displayData.selectableClusters),
-                                multiple: false,
-                                required: false,
-                                options: buildSelectableClusterOptions(displayData.selectableClusters),
-                                defaultValue: getAssignedClusterOption(dev.id, 2, displayData.selectableClusters),
-                                width: 4
-                        input "dynamicActivation_${devKey}_2",
-                                "enum",
-                                title: "Dynamic Activation",
-                                multiple: false,
-                                required: false,
-                                options: getDynamicActivationOptions(dev.id),
-                                defaultValue: getDynamicActivationSelection(dev.id, 2),
-                                width: 2
-                        input "targetCluster_${devKey}_3",
-                                "enum",
-                                title: buildAreaSelectorTitle(dev.id, 3, displayData.selectableClusters),
-                                multiple: false,
-                                required: false,
-                                options: buildSelectableClusterOptions(displayData.selectableClusters),
-                                defaultValue: getAssignedClusterOption(dev.id, 3, displayData.selectableClusters),
-                                width: 4
-                        input "dynamicActivation_${devKey}_3",
-                                "enum",
-                                title: "Dynamic Activation",
-                                multiple: false,
-                                required: false,
-                                options: getDynamicActivationOptions(dev.id),
-                                defaultValue: getDynamicActivationSelection(dev.id, 3),
-                                width: 2
-                        input "applyAllAreas_${devKey}", "button", title: "Apply Selected Area Assignments"
-                        def areaControlNotes = buildInterferenceAreaControlNotes(dev.id, displayData.selectableClusters)
-                        if (areaControlNotes) {
-                            paragraph renderNoteCard("Area Assignment Notes", areaControlNotes)
-                        }
-                    } else {
-                        paragraph "No ghosts are available for interference area targeting."
-                    }
-                }
-
-                section {
-                    paragraph getInterface(
-                            "subHeaderWithRightLink",
-                            "Archived Ghosts",
-                            archivedGhostCount > 0 ?
-                                    buttonLink(
-                                            "${displayData.showArchivedGhosts ? 'hideArchivedGhosts' : 'showArchivedGhosts'}_${devKey}",
-                                            "<div style='float:right;vertical-align:middle; margin:4px;'><b><font size=3>${displayData.showArchivedGhosts ? 'Hide Archived Ghosts' : 'Show Archived Ghosts'}</font></b></div>",
-                                            "#1A77C9",
-                                            14
-                                    ) :
-                                    ""
-                    )
-                    if (archivedGhostCount <= 0) {
-                        paragraph renderActionHintCard("No Archived Ghosts", "No ghosts have aged out of active tracking for this device yet.")
-                    } else {
-                        paragraph renderMetricDashboard([
-                                [title: "Summary", stats: getArchivedGhostSectionStats(dev.id, displayData.archivedGhosts, displayData.showArchivedGhosts as boolean)]
-                        ], 1)
-                    }
-                    if (displayData.showArchivedGhosts && displayData.archivedGhosts) {
-                        displayData.archivedGhosts.eachWithIndex { archivedGhost, idx ->
-                            paragraph renderArchivedGhostDetails(archivedGhost as Map, idx + 1)
-                        }
-                    }
                 }
             }
 
@@ -706,8 +703,7 @@ def appButtonHandler(btn) {
     debugLog("appButtonHandler(): btn=${btn}")
 
     if (btn == "recommendNow") {
-        refreshRecommendation()
-        scheduleStatsPageRefresh(4000L, 0L, 1)
+        generateRecommendation()
         return
     }
 
@@ -729,6 +725,12 @@ def appButtonHandler(btn) {
         return
     }
 
+    if (btn.startsWith("refreshDeviceAreas_")) {
+        def devKey = btn.substring("refreshDeviceAreas_".length())
+        refreshDeviceInterferenceAreas(devKey)
+        return
+    }
+
     if (btn.startsWith("clearGhost_")) {
         def remainder = btn.substring("clearGhost_".length())
         def splitIndex = remainder.lastIndexOf("_")
@@ -747,6 +749,7 @@ def appButtonHandler(btn) {
             def devKey = remainder.substring(0, splitIndex)
             def ghostIndex = remainder.substring(splitIndex + 1)
             expandTrackedGhost(devKey, ghostIndex?.isInteger() ? (ghostIndex as Integer) : null)
+            refreshDeviceInterferenceAreas(devKey)
         }
         return
     }
@@ -772,8 +775,6 @@ def appButtonHandler(btn) {
     if (btn.startsWith("applyZones_")) {
         def devKey = btn.substring("applyZones_".length())
         applySelectedZones(devKey)
-        updateDynamicInterferenceAreas()
-        scheduleStatsPageRefresh(12000L, 3000L, 3)
         return
     }
 
@@ -782,6 +783,7 @@ def appButtonHandler(btn) {
         if (parts.size() >= 2) {
             applySelectedZoneForArea(parts[0], safeInterferenceAreaIndex(parts[1]))
             updateDynamicInterferenceAreas()
+            refreshDeviceInterferenceAreas(parts[0])
         }
         return
     }
@@ -790,6 +792,7 @@ def appButtonHandler(btn) {
         def devKey = btn.substring("applyAllAreas_".length())
         applyAllSelectedZones(devKey)
         updateDynamicInterferenceAreas()
+        refreshDeviceInterferenceAreas(devKey)
         scheduleStatsPageRefresh(12000L, 3000L, 3)
         return
     }
@@ -799,6 +802,7 @@ def appButtonHandler(btn) {
         if (parts.size() >= 2) {
             saveManualInterferenceArea(parts[0], safeInterferenceAreaIndex(parts[1]))
             updateDynamicInterferenceAreas()
+            refreshDeviceInterferenceAreas(parts[0])
         }
         return
     }
@@ -808,6 +812,7 @@ def appButtonHandler(btn) {
         if (parts.size() >= 2) {
             clearRememberedInterferenceArea(parts[0], safeInterferenceAreaIndex(parts[1]), true)
             updateDynamicInterferenceAreas()
+            refreshDeviceInterferenceAreas(parts[0])
         }
         return
     }
@@ -823,12 +828,23 @@ def appButtonHandler(btn) {
         reclusterDevice(devKey)
         return
     }
+}
 
-    if (btn.startsWith("refreshDeviceAreas_")) {
-        def devKey = btn.substring("refreshDeviceAreas_".length())
-        refreshDeviceInterferenceAreas(devKey)
+private void refreshDeviceInterferenceAreas(String devKey, boolean scheduleRefresh = true) {
+    if (!devKey) {
         return
     }
+
+    def dev = mmwaveDevices?.find { deviceKey(it?.id) == devKey }
+    if (!dev) {
+        return
+    }
+
+    if (scheduleRefresh) {
+        scheduleDeviceAreaPageRefresh(dev.id?.toString(), 12000L, 1)
+    }
+
+    requestDeviceInterferenceAreaPopulate(dev)
 }
 
 def installed() {
@@ -886,7 +902,7 @@ private initialize() {
         }
     }
 
-    updateDetectionState(false)
+    updateDetectionState()
     updateDynamicInterferenceAreas()
 }
 
@@ -1013,7 +1029,7 @@ private List getRetainedPointsForEpisodeRecompute(deviceId) {
     ((snapshotPoints ?: []).size() > (currentPoints ?: []).size()) ? snapshotPoints : currentPoints
 }
 
-private updateDetectionState(boolean processOnDeactivate = true) {
+private updateDetectionState() {
     mmwaveDevices?.each { dev ->
         def devKey = deviceKey(dev.id)
         def shouldBeActive = isDeviceActive(dev)
@@ -1026,7 +1042,7 @@ private updateDetectionState(boolean processOnDeactivate = true) {
         }
 
         if (!shouldBeActive && wasActive) {
-            deactivateDetection(dev, processOnDeactivate)
+            deactivateDetection(dev)
         }
 
         state.activeDevices[devKey] = shouldBeActive
@@ -1076,21 +1092,13 @@ private activateDetection(dev) {
     }
 }
 
-private deactivateDetection(dev, boolean processOnDeactivate = true) {
-    def devKey = deviceKey(dev?.id)
-    if (!devKey) {
-        return
-    }
-
-    state.activeDevices[devKey] = false
-    if (processOnDeactivate && shouldProcessPointsOnDetectionInactive()) {
-        processPendingPointsNow(devKey)
-    }
+private deactivateDetection(dev) {
     sendMmWaveUnBind(dev)
+    state.activeDevices[deviceKey(dev.id)] = false
     infoLog("Ghost detection deactivated for ${dev.displayName}")
 
     if (notifyOnDeactivate) {
-        def counts = getGhostCounts(devKey, getTodayClusters(dev.id))
+        def counts = getGhostCounts(deviceKey(dev.id), getTodayClusters(dev.id))
         sendNotification("""Ghost detection deactivated for ${dev.displayName}
 Ghosts today: ${counts.ghostsToday}
 Persistent ghosts: ${counts.persistentGhosts}
@@ -1558,10 +1566,6 @@ private void processPendingPointsNow(String devKey) {
     } finally {
         state.dayIndex = previousDayIndex
     }
-}
-
-private boolean shouldProcessPointsOnDetectionInactive() {
-    (pointProcessingMode ?: "Only At Daily Boundary") == "On Detection Active To Inactive Transition"
 }
 
 private updateStabilityForDay(deviceId, List clustersToday) {
@@ -2579,9 +2583,6 @@ private void applySelectedZones(String devKey) {
     rememberAppliedZones(devKey, appliedZoneSpecs, "manual")
     updateClusterBustMode(dev.id, [selectedCluster], appliedZoneSpecs, "manual")
     syncClusterTargetsForDevice(devKey)
-    refreshStoredGhostSnapshotsForDevice(dev.id)
-    refreshRecommendation()
-    refreshDeviceInterferenceAreas(devKey, false)
 }
 
 private void applySelectedZoneForArea(String devKey, Integer areaIndex) {
@@ -2614,9 +2615,6 @@ private void applySelectedZoneForArea(String devKey, Integer areaIndex) {
     rememberAppliedZones(devKey, appliedZoneSpecs, "manual")
     updateClusterBustMode(dev.id, [selectedCluster], appliedZoneSpecs, "manual")
     syncClusterTargetsForDevice(devKey)
-    refreshStoredGhostSnapshotsForDevice(dev.id)
-    refreshRecommendation()
-    refreshDeviceInterferenceAreas(devKey, false)
 }
 
 private void applyAllSelectedZones(String devKey) {
@@ -2672,9 +2670,6 @@ private void applyAllSelectedZones(String devKey) {
     }
     debugLog("applyAllSelectedZones(${dev.displayName}): applied=${appliedZoneSpecs.size()}, cleared=${clearedAreaIndexes}")
     syncClusterTargetsForDevice(devKey)
-    refreshStoredGhostSnapshotsForDevice(dev.id)
-    refreshRecommendation()
-    refreshDeviceInterferenceAreas(devKey, false)
 }
 
 private void applyAutomaticGhostBusting(dev) {
@@ -2963,6 +2958,9 @@ private List getRememberedInterferenceAreas(String devKey) {
 
     if (dev) {
         def areas = readDeviceInterferenceAreas(dev)
+        if (!areas && !hasAnyDeviceInterferenceAreaAttribute(dev)) {
+            requestDeviceInterferenceAreaPopulate(dev)
+        }
         if (areas) {
             return mergeRememberedAreaMetadata(areas, metadata)
         }
@@ -3048,18 +3046,6 @@ private void requestDeviceInterferenceAreaPopulate(dev) {
         state.interferenceAreaPopulateAt = (state.interferenceAreaPopulateAt ?: [:]) + [(devKey): nowMs]
     } catch (Exception ex) {
         warnLog("Unable to request interference area attributes from ${dev.displayName}: ${ex.message}")
-    }
-}
-
-private void refreshDeviceInterferenceAreas(String devKey, boolean scheduleRefresh = true) {
-    def dev = mmwaveDevices?.find { deviceKey(it?.id) == devKey }
-    if (!dev) {
-        return
-    }
-    requestDeviceInterferenceAreaPopulate(dev)
-    if (scheduleRefresh) {
-        scheduleStatsPageRefresh(12000L, 3000L, 3)
-        state.settingsPageRefreshUntil = now() + 12000L
     }
 }
 
@@ -3394,8 +3380,6 @@ private void reclusterDevice(String devKey) {
     syncClusterTargetsForDevice(devKey)
     state.lastClustersSnapshot[devKey] = newClusters.collect { snapshotCluster(it) }
     state.lastPointsSnapshot[devKey] = filteredPoints.collect { clonePoint(it) }
-    refreshStoredGhostSnapshotsForDevice(dev.id, newClusters, filteredPoints, getOutOfBoundsPointsForDevice(dev.id))
-    refreshRecommendation()
 
     infoLog("Reclustering complete: ${newClusters.size()} new clusters created from ${filteredPoints.size()} points")
 }
@@ -3543,8 +3527,6 @@ private void expandTrackedGhost(String devKey, Integer displayIndex) {
         rememberInterferenceArea(devKey, rememberedArea.areaIndex as Integer, expandedBounds, rememberedArea.source ?: "manual", rememberedArea.dynamic as Map)
         syncClusterTargetsForDevice(devKey)
         refreshStoredGhostSnapshotsForDevice(dev.id)
-        refreshRecommendation()
-        refreshDeviceInterferenceAreas(devKey, false)
     }
 }
 
@@ -3832,7 +3814,7 @@ private Map getTrackingStats(deviceId, Map displayCounts, Map lastSummary, Map d
     def outOfBounds = lastSummary.outOfBoundsPointCount ?: 0
     def leaking = displayCounts.leakingGhosts ?: 0
     def escapingPoints = getEscapingPointCount(deviceId)
-    def pendingPointCount = ((displayData?.pendingPointCount ?: 0) as Integer)
+    def pendingPointCount = (displayData?.pointsPendingProcessing ? (((displayData?.points ?: []) as List).size() + ((displayData?.outOfBoundsPoints ?: []) as List).size()) : 0) as Integer
     def alertText = "None"
     if (leaking > 0 && escapingPoints > 0) {
         alertText = "${leaking} ghost(s) need area expansion and ${escapingPoints} in-area occupancy point(s) remain."
@@ -3895,10 +3877,6 @@ private Map getDisplayData(deviceId) {
                 outOfBoundsPoints: preferredPointSet.outOfBoundsPoints,
                 pointSource: preferredPointSet.source,
                 pointsPendingProcessing: preferredPointSet.pendingProcessing,
-                pendingPointCount: preferredPointSet.pendingPointCount ?: 0,
-                renderingLivePending: preferredPointSet.renderingLivePending == true,
-                processedPointCount: preferredPointSet.processedPointCount ?: 0,
-                renderingProcessedPoints: preferredPointSet.renderingProcessedPoints != false,
                 currentClusters: [],
                 historicalClusters: [],
                 selectableClusters: [],
@@ -3910,7 +3888,7 @@ private Map getDisplayData(deviceId) {
 
     try {
         state.displayDataLocks = displayLocks + [(devKey): true]
-        def currentClusters = shouldRenderLivePendingPoints(preferredPointSet) ? getTodayClusters(deviceId) : []
+        def currentClusters = getTodayClusters(deviceId)
         def historicalClusters = []
         if (showHistoricalGhostOverlaysEnabled()) {
             historicalClusters.addAll(getHistoricalClustersForDisplay(deviceId))
@@ -3926,10 +3904,6 @@ private Map getDisplayData(deviceId) {
                 outOfBoundsPoints: preferredPointSet.outOfBoundsPoints,
                 pointSource: preferredPointSet.source,
                 pointsPendingProcessing: preferredPointSet.pendingProcessing,
-                pendingPointCount: preferredPointSet.pendingPointCount ?: 0,
-                renderingLivePending: preferredPointSet.renderingLivePending == true,
-                processedPointCount: preferredPointSet.processedPointCount ?: 0,
-                renderingProcessedPoints: preferredPointSet.renderingProcessedPoints != false,
                 currentClusters: currentClusters,
                 historicalClusters: historicalClusters,
                 selectableClusters: buildSelectableClusters(currentClusters, selectableHistoricalClusters),
@@ -3948,66 +3922,20 @@ private Map getDisplayData(deviceId) {
 private Map preferDisplayPointSet(List currentPoints, List lastPoints, List currentOutOfBounds, List lastOutOfBounds) {
     def currentTotal = ((currentPoints ?: []) as List).size() + ((currentOutOfBounds ?: []) as List).size()
     def snapshotTotal = ((lastPoints ?: []) as List).size() + ((lastOutOfBounds ?: []) as List).size()
-    def renderLivePending = currentTotal > 0 && currentTotal <= safeMaxLivePendingRenderPoints()
-    def renderProcessed = snapshotTotal <= safeMaxProcessedRenderPoints()
-    if (currentTotal > 0 && snapshotTotal > 0) {
-        return [
-                points: renderLivePending ? (currentPoints ?: []) as List : (renderProcessed ? (lastPoints ?: []) as List : []),
-                outOfBoundsPoints: renderLivePending ? (currentOutOfBounds ?: []) as List : (renderProcessed ? (lastOutOfBounds ?: []) as List : []),
-                source: renderLivePending ? "live" : (renderProcessed ? "processed-snapshot" : "processed-hidden"),
-                pendingProcessing: true,
-                pendingPointCount: currentTotal,
-                renderingLivePending: renderLivePending,
-                processedPointCount: snapshotTotal,
-                renderingProcessedPoints: renderProcessed
-        ]
-    }
-    if (currentTotal > 0) {
-        return [
-                points: renderLivePending ? (currentPoints ?: []) as List : [],
-                outOfBoundsPoints: renderLivePending ? (currentOutOfBounds ?: []) as List : [],
-                source: renderLivePending ? "live" : "pending-hidden",
-                pendingProcessing: true,
-                pendingPointCount: currentTotal,
-                renderingLivePending: renderLivePending,
-                processedPointCount: snapshotTotal,
-                renderingProcessedPoints: renderProcessed
-        ]
-    }
     if (snapshotTotal > currentTotal) {
         return [
-                points: renderProcessed ? (lastPoints ?: []) as List : [],
-                outOfBoundsPoints: renderProcessed ? (lastOutOfBounds ?: []) as List : [],
-                source: renderProcessed ? "processed-snapshot" : "processed-hidden",
-                pendingProcessing: false,
-                pendingPointCount: 0,
-                renderingLivePending: false,
-                processedPointCount: snapshotTotal,
-                renderingProcessedPoints: renderProcessed
+                points: (lastPoints ?: []) as List,
+                outOfBoundsPoints: (lastOutOfBounds ?: []) as List,
+                source: "processed-snapshot",
+                pendingProcessing: false
         ]
     }
     [
-            points: currentTotal > 0 ? (currentPoints ?: []) as List : (renderProcessed ? (lastPoints ?: []) as List : []),
-            outOfBoundsPoints: currentTotal > 0 ? (currentOutOfBounds ?: []) as List : (renderProcessed ? (lastOutOfBounds ?: []) as List : []),
-            source: currentTotal > 0 ? "live" : (renderProcessed ? "processed-snapshot" : "processed-hidden"),
-            pendingProcessing: currentTotal > 0,
-            pendingPointCount: currentTotal,
-            renderingLivePending: currentTotal > 0,
-            processedPointCount: snapshotTotal,
-            renderingProcessedPoints: renderProcessed
+            points: (currentPoints ?: lastPoints ?: []) as List,
+            outOfBoundsPoints: (currentOutOfBounds ?: lastOutOfBounds ?: []) as List,
+            source: currentTotal > 0 ? "live" : "processed-snapshot",
+            pendingProcessing: currentTotal > 0
     ]
-}
-
-private boolean shouldRenderLivePendingPoints(Map preferredPointSet) {
-    ((preferredPointSet?.pendingProcessing ?: false) as boolean) && ((preferredPointSet?.renderingLivePending ?: false) as boolean)
-}
-
-private Integer safeMaxLivePendingRenderPoints() {
-    Math.max(0, (maxLivePendingRenderPoints ?: 500) as Integer)
-}
-
-private Integer safeMaxProcessedRenderPoints() {
-    Math.max(0, (maxProcessedRenderPoints ?: 1000) as Integer)
 }
 
 private void refreshStoredGhostSnapshotsForDevice(deviceId, List currentClustersOverride = null, List pointsOverride = null, List outOfBoundsOverride = null) {
@@ -4088,11 +4016,10 @@ private Map getSummaryForDevice(deviceId) {
 
 private Map getDisplayCounts(deviceId) {
     def devKey = deviceKey(deviceId)
-    def displayData = getDisplayData(deviceId)
-    def liveClusters = (displayData.currentClusters ?: []) as List
+    def liveClusters = getTodayClusters(deviceId)
     def summary = getSummaryForDevice(deviceId)
     def currentCounts = getDisplayGhostCounts(devKey, liveClusters)
-    currentCounts.ghostsToday = (liveClusters || ((displayData.pointsPendingProcessing ?: false) as boolean)) ? (liveClusters?.size() ?: 0) : (summary.ghostsToday ?: 0)
+    currentCounts.ghostsToday = (getPointsForDevice(deviceId) || liveClusters) ? (liveClusters?.size() ?: 0) : (summary.ghostsToday ?: 0)
     currentCounts
 }
 
@@ -5077,12 +5004,16 @@ private Map calculatePlotScale(List points, List outOfBoundsPoints, List current
 }
 
 private String renderClusterPlot(List points, List outOfBoundsPoints, List currentClusters, List historicalClusters, dev = null, String horizontalAxis = "x", String verticalAxis = "y", Map preferredScale = null, boolean pointsPendingProcessing = false) {
-    def scale = calculatePlotScale(points, outOfBoundsPoints, currentClusters, historicalClusters, dev, horizontalAxis, verticalAxis, preferredScale)
+    def limitedPointSet = limitPointsForGraph(points, outOfBoundsPoints)
+    def plotPoints = limitedPointSet.points
+    def plotOutOfBoundsPoints = limitedPointSet.outOfBoundsPoints
+
+    def scale = calculatePlotScale(plotPoints, plotOutOfBoundsPoints, currentClusters, historicalClusters, dev, horizontalAxis, verticalAxis, preferredScale)
     if (!scale) {
         return "No points or cluster history available."
     }
 
-    def pointBuckets = classifyPlotPoints(points, outOfBoundsPoints, dev, horizontalAxis, verticalAxis)
+    def pointBuckets = classifyPlotPoints(plotPoints, plotOutOfBoundsPoints, dev, horizontalAxis, verticalAxis)
     def deviceBounds = pointBuckets.deviceBounds
     def validDeviceBounds = pointBuckets.validDeviceBounds
     def displayInBoundsPoints = pointBuckets.inBoundsPoints
@@ -5231,6 +5162,60 @@ private String renderClusterPlot(List points, List outOfBoundsPoints, List curre
     svg.toString()
 }
 
+private Map limitPointsForGraph(List points, List outOfBoundsPoints) {
+    def inBounds = (points ?: []) as List
+    def outOfBounds = (outOfBoundsPoints ?: []) as List
+    def total = inBounds.size() + outOfBounds.size()
+    def maxPoints = safeMaxGraphPointsPerDevice()
+
+    if (total <= maxPoints) {
+        return [
+                points: inBounds,
+                outOfBoundsPoints: outOfBounds
+        ]
+    }
+
+    def inBoundsLimit = Math.round((inBounds.size() as Double) * maxPoints / Math.max(1, total)) as Integer
+    inBoundsLimit = Math.max(0, Math.min(inBounds.size(), inBoundsLimit))
+    def outOfBoundsLimit = Math.max(0, Math.min(outOfBounds.size(), maxPoints - inBoundsLimit))
+
+    if (outOfBoundsLimit == 0 && outOfBounds && (inBoundsLimit < maxPoints)) {
+        outOfBoundsLimit = 1
+        inBoundsLimit = Math.max(0, maxPoints - outOfBoundsLimit)
+    }
+    if (inBoundsLimit == 0 && inBounds && (outOfBoundsLimit < maxPoints)) {
+        inBoundsLimit = 1
+        outOfBoundsLimit = Math.max(0, maxPoints - inBoundsLimit)
+    }
+
+    [
+            points: evenlySamplePoints(inBounds, inBoundsLimit),
+            outOfBoundsPoints: evenlySamplePoints(outOfBounds, outOfBoundsLimit)
+    ]
+}
+
+private Integer safeMaxGraphPointsPerDevice() {
+    Math.max(1, (maxGraphPointsPerDevice ?: 500) as Integer)
+}
+
+private List evenlySamplePoints(List points, Integer limit) {
+    def source = (points ?: []) as List
+    def sampleLimit = Math.max(0, limit ?: 0)
+    if (sampleLimit <= 0 || !source) {
+        return []
+    }
+    if (source.size() <= sampleLimit) {
+        return source
+    }
+
+    def sampled = []
+    (0..<sampleLimit).each { idx ->
+        def sourceIndex = Math.floor(idx * source.size() / sampleLimit) as Integer
+        sampled << source[Math.min(source.size() - 1, sourceIndex)]
+    }
+    sampled
+}
+
 private void drawPlotPoints(StringBuilder svg, List points, String horizontalAxis, String verticalAxis, Closure normalizeX, Closure normalizeY, String fill, String stroke, boolean pendingProcessing = false) {
     (points ?: []).each { point ->
         def effectiveFill = pendingProcessing ? pendingPointFill(fill) : fill
@@ -5303,7 +5288,7 @@ private Map findPreferredHistoricalRenderMatch(Map currentCluster, List historic
 
     def directCandidates = (historicalClusters ?: []).findAll { historicalCluster ->
         historicalCluster?.archivedGhost != true &&
-        distance3D((historicalCluster.center ?: [:]) as Map, (currentCluster.center ?: [:]) as Map) <= safeClusterRadius()
+                distance3D((historicalCluster.center ?: [:]) as Map, (currentCluster.center ?: [:]) as Map) <= safeClusterRadius()
     }
     if (directCandidates) {
         return directCandidates.min { candidate ->
@@ -5315,7 +5300,7 @@ private Map findPreferredHistoricalRenderMatch(Map currentCluster, List historic
     if (targetArea?.bounds) {
         def areaCandidates = (historicalClusters ?: []).findAll { historicalCluster ->
             historicalCluster?.archivedGhost != true &&
-            historicalCluster?.bounds &&
+                    historicalCluster?.bounds &&
                     boundsOverlap(historicalCluster.bounds, targetArea.bounds) &&
                     boundsOverlap(currentCluster.bounds, targetArea.bounds)
         }
@@ -5541,6 +5526,278 @@ private String renderInterferenceAreasCard(deviceId) {
     }
     def header = updatedAt > 0L ? "Last updated: ${formatTimestamp(updatedAt)}<br>" : ""
     renderNoteCard("Device Interference Areas", header + rows.join("<br>"))
+}
+
+private String renderInterferenceAreasControlCard(deviceId, List selectableClusters) {
+    def devKey = deviceKey(deviceId)
+    def activeGhosts = (getTrackedGhostsForDisplay(deviceId) ?: []) as List
+    def rememberedAreas = getRememberedInterferenceAreas(devKey)
+    if (!rememberedAreas) {
+        return renderNoteCard("Interference Areas And Assignments", "No interference area data is currently available for this device.")
+    }
+
+    def updatedAt = (rememberedAreas.collect { it.updatedAt ?: 0L }.max() ?: 0L) as Long
+    def rows = rememberedAreas.collect { area ->
+        def accent = "#94a3b8"
+        if (isInactiveInterferenceAreaBounds(area.bounds as Map)) {
+            return "<div style='border-left:4px solid ${accent}; background:#ffffff; padding:8px 10px; margin:6px 0;'>" +
+                    "<div style='font-weight:bold; color:#111827; margin-bottom:2px;'>Area ${area.areaIndex}</div>" +
+                    "<div style='color:#475569;'>Not configured</div>" +
+                    "</div>"
+        }
+
+        def statusText = "Configured, but no current ghost match"
+        def targetedCluster = activeGhosts.find { cluster ->
+            (cluster?.targetAreaIndex as Integer) == (area.areaIndex as Integer)
+        }
+        if (targetedCluster?.bounds && sameBounds(targetedCluster.bounds, area.bounds)) {
+            def idx = activeGhosts.indexOf(targetedCluster) + 1
+            statusText = "Currently targeting Ghost ${idx}"
+            accent = "#2563eb"
+        }
+        else if (targetedCluster?.bounds && isBoundsWithinBounds(targetedCluster.bounds, area.bounds)) {
+            def idx = activeGhosts.indexOf(targetedCluster) + 1
+            statusText = "Currently targeting Ghost ${idx}"
+            accent = "#2563eb"
+        }
+        else if (targetedCluster?.bounds && boundsOverlap(targetedCluster.bounds, area.bounds)) {
+            def idx = activeGhosts.indexOf(targetedCluster) + 1
+            statusText = "Currently targeting Ghost ${idx}, but the ghost now extends beyond this area"
+            accent = "#b91c1c"
+        } else {
+            def exactMatch = activeGhosts.find { cluster ->
+                cluster?.bounds && sameBounds(cluster.bounds, area.bounds)
+            }
+            if (exactMatch) {
+                def idx = activeGhosts.indexOf(exactMatch) + 1
+                statusText = "Matches Ghost ${idx}"
+                accent = "#2563eb"
+            } else {
+                def overlappingCluster = activeGhosts.find { cluster ->
+                    cluster?.bounds && boundsOverlap(cluster.bounds, area.bounds)
+                }
+                if (overlappingCluster) {
+                    def idx = activeGhosts.indexOf(overlappingCluster) + 1
+                    if (isBoundsWithinBounds(overlappingCluster.bounds, area.bounds)) {
+                        statusText = "Contains Ghost ${idx}"
+                        accent = "#0f766e"
+                    } else {
+                        statusText = "May be using older bounds than Ghost ${idx}"
+                        accent = "#b91c1c"
+                    }
+                } else {
+                    accent = "#d97706"
+                }
+            }
+        }
+
+        "<div style='border-left:4px solid ${accent}; background:#ffffff; padding:8px 10px; margin:6px 0;'>" +
+                "<div style='font-weight:bold; color:#111827; margin-bottom:4px;'>Area ${area.areaIndex}</div>" +
+                "<div style='color:#475569; margin-bottom:4px;'>X ${round2(area.bounds.xmin)}..${round2(area.bounds.xmax)}, Y ${round2(area.bounds.ymin)}..${round2(area.bounds.ymax)}, Z ${round2(area.bounds.zmin)}..${round2(area.bounds.zmax)}</div>" +
+                "<div style='color:#111827;'>${statusText}</div>" +
+                "</div>"
+    }
+    def header = updatedAt > 0L ? "Last updated: ${formatTimestamp(updatedAt)}<br>" : ""
+    renderNoteCard("Interference Areas And Assignments", header + rows.join(""))
+}
+
+private String renderCorrelationEventDefinitions(deviceId) {
+    def events = getCorrelatedActivationEvents(deviceId)
+    if (!events) {
+        return null
+    }
+
+    def rows = events.collect { event ->
+        "Event ${event.index}: ${event.cardTitle ? "${event.cardTitle} -> " : ""}${event.shortLabel}"
+    }
+    renderNoteCard("Correlation Event Definitions", rows.join("<br>"))
+}
+
+private String renderAreaAssignmentSummaryCard(deviceId) {
+    def devKey = deviceKey(deviceId)
+    def activeGhosts = (getTrackedGhostsForDisplay(deviceId) ?: []) as List
+    def areas = getRememberedInterferenceAreas(devKey)
+
+    if (!areas) {
+        return getInterface("deviceSubHeader", "Interference Area Controls") +
+                renderActionHintCard("Interference Area Status", "No interference area data is currently available for this device.")
+    }
+
+    def rows = areas.collect { area ->
+        def accent = "#94a3b8"
+        def text
+        if (isInactiveInterferenceAreaBounds(area.bounds as Map)) {
+            text = "Area ${area.areaIndex}: No area configured"
+            accent = "#94a3b8"
+        } else {
+            def targetedCluster = activeGhosts.find { cluster ->
+                (cluster?.targetAreaIndex as Integer) == (area.areaIndex as Integer)
+            }
+            if (targetedCluster) {
+                def idx = activeGhosts.indexOf(targetedCluster) + 1
+                def stale = targetedCluster?.bounds && boundsOverlap(targetedCluster.bounds, area.bounds) && !isBoundsWithinBounds(targetedCluster.bounds, area.bounds)
+                text = stale ?
+                        "Area ${area.areaIndex}: Ghost ${idx} targeted, but the ghost now extends beyond this area" :
+                        "Area ${area.areaIndex}: Ghost ${idx} targeted"
+                accent = stale ? "#b91c1c" : "#2563eb"
+            } else {
+                def exactMatch = activeGhosts.find { cluster ->
+                    cluster?.bounds && sameBounds(cluster.bounds, area.bounds)
+                }
+                if (exactMatch) {
+                    def idx = activeGhosts.indexOf(exactMatch) + 1
+                    text = "Area ${area.areaIndex}: Matches Ghost ${idx}"
+                    accent = "#2563eb"
+                } else {
+                    def overlappingCluster = activeGhosts.find { cluster ->
+                        cluster?.bounds && boundsOverlap(cluster.bounds, area.bounds)
+                    }
+                    if (overlappingCluster) {
+                        def idx = activeGhosts.indexOf(overlappingCluster) + 1
+                        text = isBoundsWithinBounds(overlappingCluster.bounds, area.bounds) ?
+                                "Area ${area.areaIndex}: Contains Ghost ${idx}" :
+                                "Area ${area.areaIndex}: Overlaps Ghost ${idx}, but the assignment may be stale"
+                        accent = isBoundsWithinBounds(overlappingCluster.bounds, area.bounds) ? "#0f766e" : "#b91c1c"
+                    } else {
+                        text = "Area ${area.areaIndex}: Configured, no current ghost match"
+                        accent = "#d97706"
+                    }
+                }
+            }
+        }
+
+        "<div style='border-left:4px solid ${accent}; background:#ffffff; padding:8px 10px; margin:4px 0;'>${text}</div>"
+    }
+
+    getInterface("deviceSubHeader", "Interference Area Controls") +
+            "<div style='margin:6px 0 2px 0;'>" +
+            rows.join("") +
+            "</div>"
+}
+
+private String renderDeviceStatsCard(dev, String devKey, Map displayCounts, Map displayData, Map lastSummary, List trackedGhosts, Integer archivedGhostCount, Integer escapingPointCount, Map xyScale) {
+    def ghostDetailActions = [
+            buttonLink("reclusterDevice_${devKey}", "<div style='float:right;vertical-align:middle; margin:4px;'><b><font size=3>Re-evaluate</font></b></div>", "#1A77C9", 14)
+    ]
+    def hasGhostDetails = (((displayCounts?.detectedGhosts ?: 0) as Integer) +
+            ((displayCounts?.persistentGhosts ?: 0) as Integer) +
+            ((displayCounts?.targetedGhosts ?: 0) as Integer) +
+            ((displayCounts?.escapingGhosts ?: 0) as Integer) +
+            ((displayCounts?.bustedGhosts ?: 0) as Integer)) > 0
+    def html = new StringBuilder()
+    html << "<div style='border:1px solid #bfccda; background:#eef4f8; padding:10px; margin:8px 0 14px 0; box-shadow: 1px 2px #d8e2ea;'>"
+    html << getInterface(
+            "deviceHeaderWithRightLink",
+            "Device: ${dev.displayName}",
+            buttonLink("clearDeviceStats_${devKey}", "<div style='float:right;vertical-align:middle; margin:4px;'><b><font size=3>Clear Device Stats</font></b></div>", "#b91c1c", 14)
+    )
+    html << renderMetricDashboard([
+            [title: "Ghost Summary", stats: getGhostSummaryStats(dev.id, "Overall Summary")],
+            [title: "Tracking", html: renderTrackingPanel(getTrackingStats(dev.id, displayCounts, lastSummary, displayData), devKey)]
+    ], 2)
+    if (hasGhostDetails) {
+        html << getInterface("deviceSubHeaderWithRightLink", "Ghost Details", ghostDetailActions.join(""))
+        html << renderSideBySidePlots(
+                "X / Y View",
+                renderClusterPlot(displayData.points, displayData.outOfBoundsPoints, displayData.currentClusters, displayData.historicalClusters, dev, "x", "y", xyScale, displayData.pointsPendingProcessing as boolean),
+                "X / Z View",
+                renderClusterPlot(displayData.points, displayData.outOfBoundsPoints, displayData.currentClusters, displayData.historicalClusters, dev, "x", "z", xyScale, displayData.pointsPendingProcessing as boolean)
+        )
+
+        def totalGraphPoints = (((displayData.points ?: []) as List).size() + ((displayData.outOfBoundsPoints ?: []) as List).size()) as Integer
+        if (totalGraphPoints > safeMaxGraphPointsPerDevice()) {
+            html << renderNoteCard(
+                    "Graph Point Limit",
+                    "${totalGraphPoints} total point(s) were available for this device, but the graphs are limited to ${safeMaxGraphPointsPerDevice()} points to keep the page responsive."
+            )
+        }
+
+        if ((displayCounts.leakingGhosts ?: 0) > 0 || (displayCounts.escapingGhosts ?: 0) > 0 || escapingPointCount > 0) {
+            html << buildGhostAlertsHtml(displayCounts.leakingGhosts as Integer, escapingPointCount as Integer)
+        }
+
+        trackedGhosts.eachWithIndex { cluster, idx ->
+            html << renderClusterDetails(cluster, idx + 1, devKey)
+        }
+    }
+
+    def correlationSummary = renderCorrelationSummary(dev.id)
+    if (hasGhostDetails && correlationSummary) {
+        html << getInterface(
+                "deviceSubHeaderWithRightLink",
+                "Correlation Tracking",
+                buttonLink("clearCorrelationEvents_${devKey}", "<div style='float:right;vertical-align:middle; margin:4px;'><b><font size=3>Clear</font></b></div>", "#b91c1c", 14)
+        )
+        html << correlationSummary
+    }
+
+    if ((lastSummary.unclusteredPointCount ?: 0) > 0) {
+        html << renderNoteCard("Detection Note", "Last processed run had ${lastSummary.unclusteredPointCount} point(s) that did not form a ghost cluster.")
+    }
+
+    if (hasGhostDetails) {
+        html << renderAreaAssignmentSummaryCard(dev.id)
+    }
+
+    html << getInterface(
+            "deviceSubHeaderWithRightLink",
+            "Archived Ghosts",
+            archivedGhostCount > 0 ?
+                    buttonLink(
+                            "${displayData.showArchivedGhosts ? 'hideArchivedGhosts' : 'showArchivedGhosts'}_${devKey}",
+                            "<div style='float:right;vertical-align:middle; margin:4px;'><b><font size=3>${displayData.showArchivedGhosts ? 'Hide Archived Ghosts' : 'Show Archived Ghosts'}</font></b></div>",
+                            "#1A77C9",
+                            14
+                    ) :
+                    ""
+    )
+    if ((archivedGhostCount ?: 0) <= 0) {
+        html << renderActionHintCard("No Archived Ghosts", "No ghosts have aged out of active tracking for this device yet.")
+    } else {
+        html << renderMetricDashboard([
+                [title: "Summary", stats: getArchivedGhostSectionStats(dev.id, displayData.archivedGhosts, displayData.showArchivedGhosts as boolean)]
+        ], 1)
+    }
+    if (displayData.showArchivedGhosts && displayData.archivedGhosts) {
+        displayData.archivedGhosts.eachWithIndex { archivedGhost, idx ->
+            html << renderArchivedGhostDetails(archivedGhost as Map, idx + 1)
+        }
+    }
+
+    html << "</div>"
+    html.toString()
+}
+
+private String renderAllDevicesSummaryCard(Map networkSummary, def recommendation) {
+    def html = new StringBuilder()
+    html << "<div style='border:1px solid #bfccda; background:#eef4f8; padding:10px; margin:8px 0 14px 0; box-shadow:1px 2px #d8e2ea;'>"
+    html << getInterface("deviceHeaderWithRightLink", "All Devices Summary", "")
+    html << renderMetricDashboard([
+            [title: "", stats: ((networkSummary ?: [:]) as Map).findAll { key, value -> key != "_html" }]
+    ], 1)
+    if (networkSummary?._html) {
+        html << networkSummary._html as String
+    }
+    if (recommendation) {
+        html << renderRecommendationSummary(recommendation)
+    }
+    html << "</div>"
+    html.toString()
+}
+
+private String renderFramedPageCard(String title, String bodyHtml, String headerLink = "") {
+    def html = new StringBuilder()
+    html << getInterface(headerLink ? "headerWithRightLink" : "header", title, headerLink)
+    html << "<div style='border:1px solid #bfccda; border-top:none; background:#eef4f8; padding:10px; margin:0 0 12px 0; box-shadow:1px 2px #d8e2ea;'>${bodyHtml ?: ""}</div>"
+    html.toString()
+}
+
+private String buildInstalledAppPageUrl(String pageName, Map params = [:]) {
+    def queryString = ((params ?: [:]).findAll { key, value -> value != null && value.toString() != "" } as Map).collect { key, value ->
+        "${java.net.URLEncoder.encode(key.toString(), 'UTF-8')}=${java.net.URLEncoder.encode(value.toString(), 'UTF-8')}"
+    }.join("&")
+    def base = "/installedapp/configure/${app?.id}/${pageName}"
+    queryString ? "${base}?${queryString}" : base
 }
 
 private Map emptyCorrelationAggregate(String deviceName, String attribute) {
@@ -5781,19 +6038,12 @@ private String describeInterferenceAreaAssignment(deviceId, Integer areaIndex) {
 }
 
 private String renderRecommendationSummary(def recommendation) {
-    def refreshAction = buttonLink("recommendNow", "<div style='float:right;vertical-align:middle; margin:2px 4px;'><b><font size=3>Refresh</font></b></div>", "#1A77C9", 13)
     if (recommendation?.message) {
-        return "<div style='border-left:4px solid #c28b00; background:#fff8e1; padding:8px 10px; margin:4px 0;'>" +
-                "<div style='font-weight:bold; margin-bottom:4px; overflow:auto;'><div style='display:inline-block;'>Recommendation</div><div style='float:right; display:inline-block; text-align:center;'>${refreshAction}</div></div>" +
-                "<div>${recommendation.message as String}</div></div>"
+        return renderNoteCard("Recommendation", recommendation.message as String)
     }
 
     def bounds = recommendation.bounds ?: [:]
-    def html = new StringBuilder()
-    html << "<div style='border:1px solid #d7d7d7; background:#fbfbfb; padding:8px 10px; margin:4px 0;'>"
-    html << "<div style='font-weight:bold; color:#333333; margin-bottom:6px; overflow:auto;'><div style='display:inline-block;'>Recommended Interference Area</div><div style='float:right; display:inline-block; text-align:center;'>${refreshAction}</div></div>"
-    html << "<table style='width:100%; border-collapse:collapse;'>"
-    [
+    renderStatBlock("Recommended Interference Area", [
             "Device": recommendation.deviceName,
             "Action": describeRecommendationAction(recommendation),
             "Reason": recommendation.reason == "leaking" ? "Targeted ghost is leaking beyond its current area" : "Persistent ghost should be targeted",
@@ -5801,14 +6051,7 @@ private String renderRecommendationSummary(def recommendation) {
             "Y bounds": "${round2(bounds.ymin)} to ${round2(bounds.ymax)} cm",
             "Z bounds": "${round2(bounds.zmin)} to ${round2(bounds.zmax)} cm",
             "Stability": "${round2(Math.min(100.0d, (recommendation.stabilityPct ?: 0.0d) as Double))}%"
-    ].each { label, value ->
-        html << "<tr>"
-        html << "<td style='padding:3px 0; color:#666666; width:40%;'>${label}</td>"
-        html << "<td style='padding:3px 0; color:#111111; font-weight:bold; text-align:right;'>${value}</td>"
-        html << "</tr>"
-    }
-    html << "</table></div>"
-    html.toString()
+    ])
 }
 
 private String describeRecommendationAction(def recommendation) {
@@ -6065,7 +6308,6 @@ private Map getConfigurationSummaryStats() {
             "Devices": summarizeDeviceNames(mmwaveDevices),
             "Activation": activationSummary,
             "Boundary": boundarySummary,
-            "Processing": shouldProcessPointsOnDetectionInactive() ? "on detection deactivate + daily boundary" : "daily boundary only",
             "Positional clustering": "${clusteringAlgorithm ?: 'DBSCAN'} / r=${clusterRadius ?: 50}cm / min=${minClusterEvents ?: 5}",
             "Persistence": "history ${historyDays ?: 14}d / persistent ${persistentGhostDays ?: 2}d / busted ${bustedGhostDays ?: 2}d",
             "Display": "detected grace ${safeDisplayGraceDays()}d / historical overlays ${showHistoricalGhostOverlaysEnabled() ? 'on' : 'off'}",
@@ -6113,24 +6355,14 @@ private Map getMainPageHeadlineSummary() {
     def escapingPoints = 0
 
     mmwaveDevices?.each { dev ->
-        def displayData = getDisplayData(dev.id)
-        if (shouldUseLiveHeadlineMetrics(displayData)) {
-            def displayCounts = getDisplayCounts(dev.id)
-            detected += displayCounts.detectedGhosts ?: 0
-            persistent += displayCounts.persistentGhosts ?: 0
-            targeted += displayCounts.targetedGhosts ?: 0
-            escaping += displayCounts.escapingGhosts ?: 0
-            busted += displayCounts.bustedGhosts ?: 0
-            leaking += displayCounts.leakingGhosts ?: 0
-            escapingPoints += getEscapingPointCount(dev.id) ?: 0
-        } else {
-            def summary = getSummaryForDevice(dev.id)
-            detected += summary.detectedGhosts ?: 0
-            persistent += summary.persistentGhosts ?: 0
-            targeted += summary.targetedGhosts ?: 0
-            escaping += summary.escapingGhosts ?: 0
-            busted += summary.bustedGhosts ?: 0
-        }
+        def displayCounts = getDisplayCounts(dev.id)
+        detected += displayCounts.detectedGhosts ?: 0
+        persistent += displayCounts.persistentGhosts ?: 0
+        targeted += displayCounts.targetedGhosts ?: 0
+        escaping += displayCounts.escapingGhosts ?: 0
+        busted += displayCounts.bustedGhosts ?: 0
+        leaking += displayCounts.leakingGhosts ?: 0
+        escapingPoints += getEscapingPointCount(dev.id) ?: 0
     }
 
     def stats = [
@@ -6145,10 +6377,6 @@ private Map getMainPageHeadlineSummary() {
         stats._html = alertHtml
     }
     stats
-}
-
-private boolean shouldUseLiveHeadlineMetrics(Map displayData) {
-    ((displayData?.pendingPointCount ?: 0) as Integer) <= safeMaxLivePendingRenderPoints()
 }
 
 private String renderHomeHeroCard() {
@@ -6196,6 +6424,16 @@ private void scheduleStatsPageRefresh(Long durationMs = 3000L, Long delayMs = 0L
     state.statsPageRefreshStartAt = nowMs + Math.max(0L, delayMs ?: 0L)
     state.statsPageRefreshUntil = nowMs + Math.max(1000L, durationMs ?: 3000L)
     state.statsPageRefreshIntervalSeconds = Math.max(1, intervalSeconds ?: 1)
+}
+
+private void scheduleDeviceAreaPageRefresh(String deviceId, Long durationMs = 12000L, Integer intervalSeconds = 1) {
+    if (!deviceId) {
+        return
+    }
+
+    state.deviceAreaPageDeviceId = deviceId
+    state.deviceAreaPageRefreshUntil = now() + Math.max(1000L, durationMs ?: 12000L)
+    state.deviceAreaPageRefreshIntervalSeconds = Math.max(1, intervalSeconds ?: 1)
 }
 
 private List filterPointsToDeviceBounds(List points, String devKey) {
@@ -6649,14 +6887,16 @@ private String renderMetricDashboard(List panels, Integer columnCount = 3) {
 private String renderMetricPanel(String title, Map stats) {
     def cards = new StringBuilder()
     cards << "<div class='gt-panel'>"
-    cards << "<div style='font-weight:bold; color:#333333; margin-bottom:8px;'>${title}</div>"
+    if (title) {
+        cards << "<div style='font-weight:bold; color:#333333; margin-bottom:8px;'>${title}</div>"
+    }
     cards << renderInlineMetricTiles(stats)
     cards << "</div>"
     cards.toString()
 }
 
 private String renderHtmlPanel(String title, String html) {
-    "<div class='gt-panel'><div style='font-weight:bold; color:#333333; margin-bottom:8px;'>${title}</div>${html}</div>"
+    "<div class='gt-panel'>${title ? "<div style='font-weight:bold; color:#333333; margin-bottom:8px;'>${title}</div>" : ""}${html}</div>"
 }
 
 private String renderInlineMetricTiles(Map stats) {
@@ -6927,9 +7167,11 @@ def getInterface(type, txt = "", link = "") {
         case "line":
             return "<hr style='background-color:#555555; height:1px; border:0;' />"
         case "header":
-            return "<div style='color:#ffffff;font-weight:bold;background-color:#555555;border:1px solid;box-shadow:2px 3px #A9A9A9'> ${txt}</div>"
+            return "<div style='color:#17324d;font-weight:bold;background:linear-gradient(180deg,#dbeafe 0%,#c7ddf7 100%);border:1px solid #9fb8d1;box-shadow:2px 3px #cbd5e1; border-radius:6px 6px 0 0; padding:2px 4px;'> ${txt}</div>"
         case "headerWithRightLink":
-            return "<div style='color:#ffffff;font-weight:bold;background-color:#555555;border:1px solid;box-shadow:2px 3px #A9A9A9; overflow:auto;'><div style='display:inline-block; padding-left:2px;'> ${txt}</div><div style='float:right; display:inline-block; text-align:center;'>${link}</div></div>"
+            return "<div style='color:#17324d;font-weight:bold;background:linear-gradient(180deg,#dbeafe 0%,#c7ddf7 100%);border:1px solid #9fb8d1;box-shadow:2px 3px #cbd5e1; overflow:auto; border-radius:6px 6px 0 0; padding:2px 4px;'><div style='display:inline-block; padding-left:2px;'> ${txt}</div><div style='float:right; display:inline-block; text-align:center;'>${link}</div></div>"
+        case "deviceHeaderWithRightLink":
+            return "<div style='color:#17324d;font-weight:bold;background:linear-gradient(180deg,#dbeafe 0%,#c7ddf7 100%);border:1px solid #9fb8d1;box-shadow:2px 3px #cbd5e1; overflow:auto; border-radius:6px 6px 0 0; padding:2px 4px; margin-top:4px;'><div style='display:inline-block; padding-left:2px;'> ${txt}</div><div style='float:right; display:inline-block; text-align:center;'>${link}</div></div>"
         case "error":
             return "<div style='color:#ff0000;font-weight:bold;'>${txt}</div>"
         case "note":
@@ -6937,9 +7179,13 @@ def getInterface(type, txt = "", link = "") {
         case "subField":
             return "<div style='color:#000000;background-color:#ededed;'>${txt}</div>"
         case "subHeader":
-            return "<div style='color:#000000;font-weight:bold;background-color:#ededed;border:1px solid;box-shadow:2px 3px #A9A9A9'> ${txt}</div>"
+            return "<div style='color:#17324d;font-weight:bold;background:#eaf2fb;border:1px solid #c8d7e6;box-shadow:1px 2px #dde6ef; border-radius:4px; padding:2px 4px;'> ${txt}</div>"
         case "subHeaderWithRightLink":
-            return "<div style='color:#000000;font-weight:bold;background-color:#ededed;border:1px solid;box-shadow:2px 3px #A9A9A9; overflow:auto;'><div style='display:inline-block; padding-left:2px;'> ${txt}</div><div style='float:right; display:inline-block; text-align:center;'>${link}</div></div>"
+            return "<div style='color:#17324d;font-weight:bold;background:#eaf2fb;border:1px solid #c8d7e6;box-shadow:1px 2px #dde6ef; overflow:auto; border-radius:4px; padding:2px 4px;'><div style='display:inline-block; padding-left:2px;'> ${txt}</div><div style='float:right; display:inline-block; text-align:center;'>${link}</div></div>"
+        case "deviceSubHeader":
+            return "<div style='color:#17324d;font-weight:bold;background:#eaf2fb;border:1px solid #c8d7e6;box-shadow:1px 2px #dde6ef; border-radius:4px; padding:2px 4px; margin-top:6px;'> ${txt}</div>"
+        case "deviceSubHeaderWithRightLink":
+            return "<div style='color:#17324d;font-weight:bold;background:#eaf2fb;border:1px solid #c8d7e6;box-shadow:1px 2px #dde6ef; overflow:auto; border-radius:4px; padding:2px 4px; margin-top:6px;'><div style='display:inline-block; padding-left:2px;'> ${txt}</div><div style='float:right; display:inline-block; text-align:center;'>${link}</div></div>"
         case "subSection1Start":
             return "<div style='color:#000000;background-color:#d4d4d4;border:0'>"
         case "subSection2Start":
