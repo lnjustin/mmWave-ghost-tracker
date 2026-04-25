@@ -578,7 +578,7 @@ def deviceAreaPage(params = [:]) {
                             options: getDynamicActivationOptions(dev.id),
                             defaultValue: getDynamicActivationSelection(dev.id, 3),
                             width: 2
-                    input "applyAllAreas_${devKey}", "button", title: "Apply Selected Area Assignments"
+                    input "applyAllAreas_${devKey}", "button", title: "Done"
                 } else {
                     paragraph "No ghosts are available for interference area targeting."
                 }
@@ -909,6 +909,8 @@ private initialize() {
 private initializeState() {
     state.dailyPoints = state.dailyPoints ?: [:]
     state.dailyOutOfBoundsPoints = state.dailyOutOfBoundsPoints ?: [:]
+    state.ignoredOutsideWindowPoints = state.ignoredOutsideWindowPoints ?: [:]
+    state.lastIgnoredOutsideWindowAt = state.lastIgnoredOutsideWindowAt ?: [:]
     state.stabilityData = state.stabilityData ?: [:]
     state.archivedGhosts = state.archivedGhosts ?: [:]
     state.archivedGhostVisibility = state.archivedGhostVisibility ?: [:]
@@ -1255,11 +1257,6 @@ def targetInfoHandler(evt) {
         return
     }
 
-    if (!isDeviceActive(dev)) {
-        debugLog("Ignoring targetInfo for ${dev.displayName}: detection conditions not active")
-        return
-    }
-
     def payload = parseTargetPayload(evt.value)
     if (!payload) {
         debugLog("Dropped targetInfo for ${dev.displayName}: malformed payload")
@@ -1269,6 +1266,12 @@ def targetInfoHandler(evt) {
     def result = extractPoints(payload, dev)
     if (!result.inBounds && !result.outOfBounds) {
         debugLog("Dropped targetInfo for ${dev.displayName}: no valid targets")
+        return
+    }
+
+    if (!isDeviceActive(dev)) {
+        recordIgnoredOutsideWindowPoints(dev, (((result.inBounds ?: []) as List).size() + ((result.outOfBounds ?: []) as List).size()) as Integer)
+        debugLog("Ignoring targetInfo for ${dev.displayName}: detection conditions not active")
         return
     }
 
@@ -1292,6 +1295,17 @@ def targetInfoHandler(evt) {
     }
 
     recordCorrelationSample(dev, result)
+}
+
+private void recordIgnoredOutsideWindowPoints(dev, Integer count) {
+    def devKey = deviceKey(dev?.id)
+    def ignoredCount = Math.max(0, count ?: 0)
+    if (!devKey || ignoredCount <= 0) {
+        return
+    }
+
+    state.ignoredOutsideWindowPoints[devKey] = ((state.ignoredOutsideWindowPoints[devKey] ?: 0) as Integer) + ignoredCount
+    state.lastIgnoredOutsideWindowAt[devKey] = now()
 }
 
 private parseTargetPayload(String rawValue) {
@@ -3445,6 +3459,8 @@ private void recomputeDailyCorrelationEpisodesForDevice(dev) {
 private void clearDeviceStats(String devKey) {
     state.dailyPoints?.remove(devKey)
     state.dailyOutOfBoundsPoints?.remove(devKey)
+    state.ignoredOutsideWindowPoints?.remove(devKey)
+    state.lastIgnoredOutsideWindowAt?.remove(devKey)
     state.stabilityData?.remove(devKey)
     state.archivedGhosts?.remove(devKey)
     state.archivedGhostVisibility?.remove(devKey)
@@ -3811,10 +3827,13 @@ private Map getGhostSummaryStats(deviceId, String summaryView) {
 
 private Map getTrackingStats(deviceId, Map displayCounts, Map lastSummary, Map displayData = [:]) {
     def dev = mmwaveDevices?.find { deviceKey(it.id) == deviceKey(deviceId) }
+    def devKey = deviceKey(deviceId)
     def outOfBounds = lastSummary.outOfBoundsPointCount ?: 0
     def leaking = displayCounts.leakingGhosts ?: 0
     def escapingPoints = getEscapingPointCount(deviceId)
     def pendingPointCount = (displayData?.pointsPendingProcessing ? (((displayData?.points ?: []) as List).size() + ((displayData?.outOfBoundsPoints ?: []) as List).size()) : 0) as Integer
+    def ignoredOutsideWindow = ((state.ignoredOutsideWindowPoints ?: [:])[devKey] ?: 0) as Integer
+    def lastIgnoredOutsideWindowAt = ((state.lastIgnoredOutsideWindowAt ?: [:])[devKey] ?: null)
     def alertText = "None"
     if (leaking > 0 && escapingPoints > 0) {
         alertText = "${leaking} ghost(s) need area expansion and ${escapingPoints} in-area occupancy point(s) remain."
@@ -3828,7 +3847,9 @@ private Map getTrackingStats(deviceId, Map displayCounts, Map lastSummary, Map d
             "Tracking days": getActiveTrackingDaysForDevice(deviceId),
             "Points processed": "${lastSummary.pointCount ?: 0} (${outOfBounds} OOB)",
             "Pending processing": pendingPointCount,
-            "Ghost alerts": alertText
+            "Ghost alerts": alertText,
+            "Ignored outside window": ignoredOutsideWindow,
+            "Last outside-window point": lastIgnoredOutsideWindowAt ? formatTimeOfDay(lastIgnoredOutsideWindowAt as Long) : "None"
     ]
 }
 
@@ -5533,7 +5554,7 @@ private String renderInterferenceAreasControlCard(deviceId, List selectableClust
     def activeGhosts = (getTrackedGhostsForDisplay(deviceId) ?: []) as List
     def rememberedAreas = getRememberedInterferenceAreas(devKey)
     if (!rememberedAreas) {
-        return renderNoteCard("Interference Areas And Assignments", "No interference area data is currently available for this device.")
+        return renderActionHintCard("No Interference Area Data", "No interference area data is currently available for this device.")
     }
 
     def updatedAt = (rememberedAreas.collect { it.updatedAt ?: 0L }.max() ?: 0L) as Long
@@ -5597,8 +5618,8 @@ private String renderInterferenceAreasControlCard(deviceId, List selectableClust
                 "<div style='color:#111827;'>${statusText}</div>" +
                 "</div>"
     }
-    def header = updatedAt > 0L ? "Last updated: ${formatTimestamp(updatedAt)}<br>" : ""
-    renderNoteCard("Interference Areas And Assignments", header + rows.join(""))
+    def footer = updatedAt > 0L ? "<div style='text-align:right; color:#64748b; font-size:11px; margin-top:8px;'>Last updated: ${formatTimestamp(updatedAt)}</div>" : ""
+    "<div>${rows.join('')}${footer}</div>"
 }
 
 private String renderCorrelationEventDefinitions(deviceId) {
@@ -5684,6 +5705,8 @@ private String renderDeviceStatsCard(dev, String devKey, Map displayCounts, Map 
             ((displayCounts?.targetedGhosts ?: 0) as Integer) +
             ((displayCounts?.escapingGhosts ?: 0) as Integer) +
             ((displayCounts?.bustedGhosts ?: 0) as Integer)) > 0
+    def totalGraphPoints = (((displayData.points ?: []) as List).size() + ((displayData.outOfBoundsPoints ?: []) as List).size()) as Integer
+    def showGraphSection = hasGhostDetails || totalGraphPoints > 0
     def html = new StringBuilder()
     html << "<div style='border:1px solid #bfccda; background:#eef4f8; padding:10px; margin:8px 0 14px 0; box-shadow: 1px 2px #d8e2ea;'>"
     html << getInterface(
@@ -5695,7 +5718,7 @@ private String renderDeviceStatsCard(dev, String devKey, Map displayCounts, Map 
             [title: "Ghost Summary", stats: getGhostSummaryStats(dev.id, "Overall Summary")],
             [title: "Tracking", html: renderTrackingPanel(getTrackingStats(dev.id, displayCounts, lastSummary, displayData), devKey)]
     ], 2)
-    if (hasGhostDetails) {
+    if (showGraphSection) {
         html << getInterface("deviceSubHeaderWithRightLink", "Ghost Details", ghostDetailActions.join(""))
         html << renderSideBySidePlots(
                 "X / Y View",
@@ -5704,7 +5727,6 @@ private String renderDeviceStatsCard(dev, String devKey, Map displayCounts, Map 
                 renderClusterPlot(displayData.points, displayData.outOfBoundsPoints, displayData.currentClusters, displayData.historicalClusters, dev, "x", "z", xyScale, displayData.pointsPendingProcessing as boolean)
         )
 
-        def totalGraphPoints = (((displayData.points ?: []) as List).size() + ((displayData.outOfBoundsPoints ?: []) as List).size()) as Integer
         if (totalGraphPoints > safeMaxGraphPointsPerDevice()) {
             html << renderNoteCard(
                     "Graph Point Limit",
@@ -5716,8 +5738,10 @@ private String renderDeviceStatsCard(dev, String devKey, Map displayCounts, Map 
             html << buildGhostAlertsHtml(displayCounts.leakingGhosts as Integer, escapingPointCount as Integer)
         }
 
-        trackedGhosts.eachWithIndex { cluster, idx ->
-            html << renderClusterDetails(cluster, idx + 1, devKey)
+        if (trackedGhosts) {
+            trackedGhosts.eachWithIndex { cluster, idx ->
+                html << renderClusterDetails(cluster, idx + 1, devKey)
+            }
         }
     }
 
@@ -6498,6 +6522,14 @@ private String childDni(deviceId) {
     "${app.id}-${deviceKey(deviceId)}"
 }
 
+private String formatTimeOfDay(Long timestamp) {
+    if (!timestamp) {
+        return "Unknown"
+    }
+    def tz = location?.timeZone ?: TimeZone.getTimeZone("UTC")
+    new Date(timestamp).format("h:mm a", tz)
+}
+
 private Map cloneCluster(Map cluster) {
     [
             center: clonePoint(cluster.center),
@@ -6969,20 +7001,33 @@ private String renderTrackingPanel(Map stats, String devKey = null) {
     def pointsProcessed = stats["Points processed"]
     def pendingProcessing = stats["Pending processing"]
     def ghostAlerts = stats["Ghost alerts"]
+    def ignoredOutsideWindow = stats["Ignored outside window"]
+    def lastOutsideWindowPoint = stats["Last outside-window point"]
     def pendingCount = 0
+    def ignoredCount = 0
     try {
         pendingCount = (pendingProcessing instanceof Number) ? (pendingProcessing as Integer) : ((pendingProcessing?.toString()?.isInteger()) ? (pendingProcessing as Integer) : 0)
     } catch (Exception ignored) {
         pendingCount = 0
     }
+    try {
+        ignoredCount = (ignoredOutsideWindow instanceof Number) ? (ignoredOutsideWindow as Integer) : ((ignoredOutsideWindow?.toString()?.isInteger()) ? (ignoredOutsideWindow as Integer) : 0)
+    } catch (Exception ignored) {
+        ignoredCount = 0
+    }
     def pendingLabel = devKey ? "<span style='display:block; overflow:auto;'><span style='float:left;'>Pending processing</span><span style='float:right;'>${buttonLink("clearPendingPoints_${devKey}", "<span style='font-size:11px; font-weight:bold;'>Clear</span>", "#b91c1c", 11)}</span></span>" : "Pending processing"
-    def processedValue = devKey && pendingCount > 0 ?
-            "<div>${pointsProcessed}</div><div style='text-align:right; margin-top:6px;'>${buttonLink("processPendingPoints_${devKey}", "<span style='font-size:11px; font-weight:bold;'>Process</span>", "#1A77C9", 11)}</div>" :
-            pointsProcessed
+    def processedValue = pointsProcessed
+    def pendingValue = devKey && pendingCount > 0 ?
+            "<span style='display:block; overflow:auto;'><span style='float:left;'>${pendingProcessing}</span><span style='float:right;'>${buttonLink("processPendingPoints_${devKey}", "<span style='font-size:11px; font-weight:bold;'>Process</span>", "#1A77C9", 11)}</span></span>" :
+            pendingProcessing
+    def outsideWindowHtml = ignoredCount > 0 ? """
+<div class='gt-metric-half'>${renderMetricTile("Ignored outside window", ignoredOutsideWindow)}</div>
+<div class='gt-metric-half'>${renderMetricTile("Last outside-window point", lastOutsideWindowPoint)}</div>""" : ""
     """<div class='gt-metric-grid'>
 <div class='gt-metric-full'>${renderMetricTile("Detection", detectionValue)}</div>
 <div class='gt-metric-half'>${renderMetricTile("Points processed", processedValue)}</div>
-<div class='gt-metric-half'>${renderMetricTile(pendingLabel, pendingProcessing)}</div>
+<div class='gt-metric-half'>${renderMetricTile(pendingLabel, pendingValue)}</div>
+${outsideWindowHtml}
 <div class='gt-metric-full'>${renderMetricTile("Ghost alerts", ghostAlerts)}</div>
 </div>"""
 }
