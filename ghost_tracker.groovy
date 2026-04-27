@@ -158,6 +158,11 @@ def settingsPage() {
                             title: "Run daily analysis at",
                             required: true
                 }
+
+                input "processPointsOnDetectionInactive",
+                        "bool",
+                        title: "Process points when detection becomes inactive",
+                        defaultValue: false
             }
 
             section(getInterface("header", "Point Filtering")) {
@@ -238,10 +243,17 @@ def settingsPage() {
                         title: "Minimum ghost points per positional cluster",
                         defaultValue: 5
 
+                input "pointBinSizeCm",
+                        "decimal",
+                        title: "Point bin size before clustering and plotting (cm)",
+                        defaultValue: 1.0d
+
                 input "maxClusters",
                         "number",
                         title: "Maximum K-Means clusters",
                         defaultValue: 5
+
+                paragraph renderNoteCard("Point Binning", "Points are merged into X/Y/Z bins before clustering and graphing. Smaller bins preserve more shape detail; larger bins reduce load more aggressively.")
             }
 
             section(getInterface("header", "Persistence")) {
@@ -653,7 +665,6 @@ def statsPage() {
             sortedDevices.each { dev ->
                 def devKey = deviceKey(dev.id)
                 refreshStoredGhostSnapshotsForDevice(dev.id)
-                def todayClusters = getTodayClusters(dev.id)
                 def stableClusters = getStableClusters(dev.id)
                 def trackedGhosts = getTrackedGhostsForDisplay(dev.id)
                 def displayCounts = getDisplayCounts(dev.id)
@@ -902,7 +913,7 @@ private initialize() {
         }
     }
 
-    updateDetectionState()
+    updateDetectionState(false)
     updateDynamicInterferenceAreas()
 }
 
@@ -1031,7 +1042,7 @@ private List getRetainedPointsForEpisodeRecompute(deviceId) {
     ((snapshotPoints ?: []).size() > (currentPoints ?: []).size()) ? snapshotPoints : currentPoints
 }
 
-private updateDetectionState() {
+private updateDetectionState(boolean allowDeactivateProcessing = false) {
     mmwaveDevices?.each { dev ->
         def devKey = deviceKey(dev.id)
         def shouldBeActive = isDeviceActive(dev)
@@ -1044,7 +1055,7 @@ private updateDetectionState() {
         }
 
         if (!shouldBeActive && wasActive) {
-            deactivateDetection(dev)
+            deactivateDetection(dev, allowDeactivateProcessing)
         }
 
         state.activeDevices[devKey] = shouldBeActive
@@ -1094,13 +1105,20 @@ private activateDetection(dev) {
     }
 }
 
-private deactivateDetection(dev) {
+private deactivateDetection(dev, boolean allowDeactivateProcessing = false) {
     sendMmWaveUnBind(dev)
-    state.activeDevices[deviceKey(dev.id)] = false
+    def devKey = deviceKey(dev.id)
+    state.activeDevices[devKey] = false
+
+    if (allowDeactivateProcessing && shouldProcessPointsOnDetectionInactive()) {
+        processPendingPointsNow(devKey)
+    }
+
     infoLog("Ghost detection deactivated for ${dev.displayName}")
 
     if (notifyOnDeactivate) {
-        def counts = getGhostCounts(deviceKey(dev.id), getTodayClusters(dev.id))
+        def summary = getSummaryForDevice(dev.id)
+        def counts = summary ?: getGhostCounts(devKey, getTodayClusters(dev.id))
         sendNotification("""Ghost detection deactivated for ${dev.displayName}
 Ghosts today: ${counts.ghostsToday}
 Persistent ghosts: ${counts.persistentGhosts}
@@ -1197,12 +1215,12 @@ def modeHandler(evt) {
     }
 
     state.lastMode = evt.value
-    updateDetectionState()
+    updateDetectionState(true)
 }
 
 def activatorSwitchHandler(evt) {
     debugLog("Activator switch changed: ${evt.device?.displayName} -> ${evt.value}")
-    updateDetectionState()
+    updateDetectionState(true)
 }
 
 def correlationAttributeHandler(evt) {
@@ -1680,7 +1698,7 @@ private void mergeDailyCluster(Map stableCluster, Map dailyCluster, Integer curr
     stableCluster.bounds = dailyCluster.bounds
     stableCluster.radius = dailyCluster.radius
     stableCluster.density = dailyCluster.density
-    stableCluster.points = dailyCluster.points  // Store points for cluster splitting
+    stableCluster.points = representativeClusterPoints(dailyCluster.points)
     stableCluster.lastSeen = currentDay
     stableCluster.seenHistory = ((stableCluster.seenHistory ?: []) + currentDay).unique().sort()
     pruneSeenHistory(stableCluster, historyCutoff)
@@ -1698,7 +1716,7 @@ private Map buildStableCluster(Map dailyCluster, Integer currentDay) {
             bounds: cloneBounds(dailyCluster.bounds),
             radius: dailyCluster.radius,
             density: dailyCluster.density,
-            points: dailyCluster.points?.collect { clonePoint(it) },  // Store points for cluster splitting
+            points: representativeClusterPoints(dailyCluster.points),
             daysSeen: 1,
             lastSeen: currentDay,
             seenHistory: [currentDay],
@@ -2204,7 +2222,8 @@ private Map cloneCorrelationTrackerStats(Map stats) {
 }
 
 private List detectClusters(List points) {
-    if (!points || points.size() < safeMinClusterEvents()) {
+    def binnedPoints = binPointsForClustering(points)
+    if (!binnedPoints || totalPointWeight(binnedPoints) < safeMinClusterEvents()) {
         return []
     }
 
@@ -2212,14 +2231,14 @@ private List detectClusters(List points) {
     def clusters = []
 
     if (algorithm == "K-Means") {
-        clusters = detectClustersKMeans(points, safeMaxClusters(), 40)
+        clusters = detectClustersKMeans(binnedPoints, safeMaxClusters(), 40)
         if (!clusters) {
-            clusters = detectClustersDBSCAN(points, safeClusterRadius(), safeMinClusterEvents())
+            clusters = detectClustersDBSCAN(binnedPoints, safeClusterRadius(), safeMinClusterEvents())
         }
     } else {
-        clusters = detectClustersDBSCAN(points, safeClusterRadius(), safeMinClusterEvents())
+        clusters = detectClustersDBSCAN(binnedPoints, safeClusterRadius(), safeMinClusterEvents())
         if (!clusters) {
-            clusters = detectClustersKMeans(points, safeMaxClusters(), 40)
+            clusters = detectClustersKMeans(binnedPoints, safeMaxClusters(), 40)
         }
     }
 
@@ -2254,10 +2273,12 @@ def detectClustersKMeans(List points, Integer k, Integer maxIterations) {
                 return centroids[idx]
             }
 
+            def totalWeight = totalPointWeight(clusterPoints)
+
             [
-                    x: clusterPoints.collect { it.x }.sum() / clusterPoints.size(),
-                    y: clusterPoints.collect { it.y }.sum() / clusterPoints.size(),
-                    z: clusterPoints.collect { it.z }.sum() / clusterPoints.size()
+                    x: weightedAxisAverage(clusterPoints, "x", totalWeight),
+                    y: weightedAxisAverage(clusterPoints, "y", totalWeight),
+                    z: weightedAxisAverage(clusterPoints, "z", totalWeight)
             ]
         }
 
@@ -2282,7 +2303,7 @@ def detectClustersKMeans(List points, Integer k, Integer maxIterations) {
             }
         }
 
-        if (clusterPoints.size() >= safeMinClusterEvents()) {
+        if (totalPointWeight(clusterPoints) >= safeMinClusterEvents()) {
             clusters << buildCluster(clusterPoints)
         }
     }
@@ -2306,7 +2327,7 @@ private List detectClustersDBSCAN(List points, BigDecimal eps, Integer minPts) {
 
         visited << idx
         def neighbors = regionQuery(points, point, eps)
-        if (neighbors.size() < minPts) {
+        if (totalPointWeight(neighbors.collect { points[it] }) < minPts) {
             return
         }
 
@@ -2314,7 +2335,7 @@ private List detectClustersDBSCAN(List points, BigDecimal eps, Integer minPts) {
         expandCluster(points, idx, neighbors, clusterIndexes, visited, assigned, eps, minPts)
 
         def clusterPoints = clusterIndexes.collect { points[it] }
-        if (clusterPoints.size() >= minPts) {
+        if (totalPointWeight(clusterPoints) >= minPts) {
             clusters << buildCluster(clusterPoints)
             assigned.addAll(clusterIndexes)
         }
@@ -2332,7 +2353,7 @@ private void expandCluster(List points, Integer seedIdx, List neighbors, Set clu
         if (!visited.contains(idx)) {
             visited << idx
             def extraNeighbors = regionQuery(points, points[idx], eps)
-            if (extraNeighbors.size() >= minPts) {
+            if (totalPointWeight(extraNeighbors.collect { points[it] }) >= minPts) {
                 queue.addAll(extraNeighbors.findAll { !queue.contains(it) })
             }
         }
@@ -2359,10 +2380,11 @@ private Map buildCluster(List points) {
     def xs = points.collect { it.x }
     def ys = points.collect { it.y }
     def zs = points.collect { it.z }
+    def totalWeight = totalPointWeight(points)
     def center = [
-            x: xs.sum() / xs.size(),
-            y: ys.sum() / ys.size(),
-            z: zs.sum() / zs.size()
+            x: weightedAxisAverage(points, "x", totalWeight),
+            y: weightedAxisAverage(points, "y", totalWeight),
+            z: weightedAxisAverage(points, "z", totalWeight)
     ]
     def bounds = [
             xmin: xs.min(),
@@ -2379,7 +2401,7 @@ private Map buildCluster(List points) {
             center: center,
             bounds: bounds,
             radius: maxDistance,
-            density: points.size(),
+            density: totalWeight,
             points: points.collect { clonePoint(it) }
     ]
 }
@@ -3496,20 +3518,118 @@ private void clearTrackedGhost(String devKey, Integer displayIndex) {
         return
     }
 
+    def dev = mmwaveDevices?.find { deviceKey(it?.id) == devKey }
+    if (!dev) {
+        return
+    }
+
     def displayGhosts = getTrackedGhostsForDisplay(devKey)
     def selectedGhost = (displayGhosts && displayGhosts.size() >= displayIndex) ? (displayGhosts[displayIndex - 1] as Map) : null
     if (!selectedGhost) {
         return
     }
 
+    def currentGhost = getCurrentClusterForGhost(devKey, selectedGhost)
+    clearStoredPointsForGhost(dev, selectedGhost, currentGhost)
+
     def stableClusters = ((state.stabilityData[devKey] ?: []) as List).findAll { cluster ->
         distance3D((cluster?.center ?: [:]) as Map, (selectedGhost?.center ?: [:]) as Map) > 5.0d
     }.collect { cloneCluster(it as Map) }
     state.stabilityData[devKey] = stableClusters
 
+    rebuildProcessedSnapshotForDevice(dev)
+    refreshStoredGhostSnapshotsForDevice(dev.id)
+
     if (state.recommendation?.deviceId == devKey) {
         refreshRecommendation()
     }
+}
+
+private void clearStoredPointsForGhost(dev, Map selectedGhost, Map currentGhost = null) {
+    def devKey = deviceKey(dev?.id)
+    if (!devKey || !selectedGhost) {
+        return
+    }
+
+    def pointKeys = buildGhostPointKeySet(selectedGhost, currentGhost)
+    def boundsCandidates = buildGhostBoundsCandidates(selectedGhost, currentGhost)
+
+    state.dailyPoints[devKey] = removeGhostAssociatedPoints((state.dailyPoints[devKey] ?: []) as List, pointKeys, boundsCandidates)
+    state.lastPointsSnapshot[devKey] = removeGhostAssociatedPoints((state.lastPointsSnapshot[devKey] ?: []) as List, pointKeys, boundsCandidates)
+    state.dailyOutOfBoundsPoints[devKey] = removeGhostAssociatedPoints((state.dailyOutOfBoundsPoints[devKey] ?: []) as List, pointKeys, boundsCandidates)
+    state.lastOutOfBoundsSnapshot[devKey] = removeGhostAssociatedPoints((state.lastOutOfBoundsSnapshot[devKey] ?: []) as List, pointKeys, boundsCandidates)
+}
+
+private Set buildGhostPointKeySet(Map selectedGhost, Map currentGhost = null) {
+    def keys = [] as Set
+    [selectedGhost, currentGhost].findAll { it != null }.each { ghost ->
+        ((ghost.points ?: []) as List).each { point ->
+            def pointKey = pointIdentityKey(point as Map)
+            if (pointKey) {
+                keys << pointKey
+            }
+        }
+    }
+    keys
+}
+
+private List buildGhostBoundsCandidates(Map selectedGhost, Map currentGhost = null) {
+    def candidates = []
+    [selectedGhost?.bounds, currentGhost?.bounds, currentGhost?.escapingBounds].findAll { isValidBounds(it as Map) }.each { bounds ->
+        candidates << cloneBounds(bounds as Map)
+    }
+    candidates
+}
+
+private List removeGhostAssociatedPoints(List points, Set pointKeys, List boundsCandidates) {
+    ((points ?: []) as List).findAll { point ->
+        !pointMatchesClearedGhost(point as Map, pointKeys, boundsCandidates)
+    }.collect { clonePoint(it as Map) }
+}
+
+private boolean pointMatchesClearedGhost(Map point, Set pointKeys, List boundsCandidates) {
+    if (!point) {
+        return false
+    }
+
+    def pointKey = pointIdentityKey(point)
+    if (pointKey && pointKeys?.contains(pointKey)) {
+        return true
+    }
+
+    (boundsCandidates ?: []).any { bounds ->
+        isValidBounds(bounds as Map) &&
+                isPointWithinBounds(point.x as Double, point.y as Double, point.z as Double, bounds as Map)
+    }
+}
+
+private String pointIdentityKey(Map point) {
+    if (!point) {
+        return null
+    }
+    "${point.x}:${point.y}:${point.z}:${point.ts}:${point.ghostEligible}:${point.ghostIgnoreReason}"
+}
+
+private void rebuildProcessedSnapshotForDevice(dev) {
+    def devKey = deviceKey(dev?.id)
+    if (!devKey) {
+        return
+    }
+
+    def rawPoints = getSnapshotPoints(dev.id)
+    def rawOutOfBoundsPoints = getSnapshotOutOfBoundsPoints(dev.id)
+    def filteredPoints = filterPointsForGhostDetection(rawPoints, dev)
+    def snapshotClusters = detectClusters(filteredPoints)
+    def counts = getGhostCounts(devKey, snapshotClusters)
+
+    state.lastClustersSnapshot[devKey] = (snapshotClusters ?: []).collect { cluster ->
+        snapshotCluster(enrichClusterWithGhostSnapshotData(devKey, cluster as Map, dev, cluster as Map, rawPoints, rawOutOfBoundsPoints))
+    }
+    state.dailySummary[devKey] = counts + [
+            pointCount: filteredPoints.size(),
+            unclusteredPointCount: calculateUnclusteredPointCount(filteredPoints, snapshotClusters),
+            outOfBoundsPointCount: ((rawOutOfBoundsPoints ?: []) as List).size()
+    ]
 }
 
 private void expandTrackedGhost(String devKey, Integer displayIndex) {
@@ -3831,7 +3951,7 @@ private Map getTrackingStats(deviceId, Map displayCounts, Map lastSummary, Map d
     def outOfBounds = lastSummary.outOfBoundsPointCount ?: 0
     def leaking = displayCounts.leakingGhosts ?: 0
     def escapingPoints = getEscapingPointCount(deviceId)
-    def pendingPointCount = (displayData?.pointsPendingProcessing ? (((displayData?.points ?: []) as List).size() + ((displayData?.outOfBoundsPoints ?: []) as List).size()) : 0) as Integer
+    def pendingPointCount = (displayData?.pointsPendingProcessing ? ((displayData?.pendingPointCount ?: 0) as Integer) : 0) as Integer
     def ignoredOutsideWindow = ((state.ignoredOutsideWindowPoints ?: [:])[devKey] ?: 0) as Integer
     def lastIgnoredOutsideWindowAt = ((state.lastIgnoredOutsideWindowAt ?: [:])[devKey] ?: null)
     def alertText = "None"
@@ -3891,16 +4011,23 @@ private Map getDisplayData(deviceId) {
     def currentOutOfBounds = getOutOfBoundsPointsForDevice(deviceId)
     def lastOutOfBounds = getSnapshotOutOfBoundsPoints(deviceId)
     def preferredPointSet = preferDisplayPointSet(currentPoints, lastPoints, currentOutOfBounds, lastOutOfBounds)
+    def limitedPointSet = limitPointsForGraph(preferredPointSet.points, preferredPointSet.outOfBoundsPoints)
+    def useLiveComputation = shouldUseLiveDisplayComputation(currentPoints, currentOutOfBounds)
+    def snapshotClusters = getSnapshotClusters(deviceId)
+    def totalPointCount = (((preferredPointSet.points ?: []) as List).size() + ((preferredPointSet.outOfBoundsPoints ?: []) as List).size()) as Integer
+    def pendingPointCount = ((((currentPoints ?: []) as List).size() + ((currentOutOfBounds ?: []) as List).size())) as Integer
 
     if (displayLocks[devKey] == true) {
         return [
-                points: preferredPointSet.points,
-                outOfBoundsPoints: preferredPointSet.outOfBoundsPoints,
+                points: limitedPointSet.points,
+                outOfBoundsPoints: limitedPointSet.outOfBoundsPoints,
                 pointSource: preferredPointSet.source,
                 pointsPendingProcessing: preferredPointSet.pendingProcessing,
-                currentClusters: [],
+                totalPointCount: totalPointCount,
+                pendingPointCount: pendingPointCount,
+                currentClusters: useLiveComputation ? [] : snapshotClusters,
                 historicalClusters: [],
-                selectableClusters: [],
+                selectableClusters: useLiveComputation ? [] : buildSelectableClusters(snapshotClusters, getHistoricalClustersForSelection(deviceId)),
                 archivedGhosts: [],
                 archivedGhostCount: getArchivedGhostCount(deviceId),
                 showArchivedGhosts: showArchivedGhostsEnabled(devKey)
@@ -3909,7 +4036,7 @@ private Map getDisplayData(deviceId) {
 
     try {
         state.displayDataLocks = displayLocks + [(devKey): true]
-        def currentClusters = getTodayClusters(deviceId)
+        def currentClusters = useLiveComputation ? getTodayClusters(deviceId) : snapshotClusters
         def historicalClusters = []
         if (showHistoricalGhostOverlaysEnabled()) {
             historicalClusters.addAll(getHistoricalClustersForDisplay(deviceId))
@@ -3921,10 +4048,12 @@ private Map getDisplayData(deviceId) {
         def selectableHistoricalClusters = getHistoricalClustersForSelection(deviceId)
 
         return [
-                points: preferredPointSet.points,
-                outOfBoundsPoints: preferredPointSet.outOfBoundsPoints,
+                points: limitedPointSet.points,
+                outOfBoundsPoints: limitedPointSet.outOfBoundsPoints,
                 pointSource: preferredPointSet.source,
                 pointsPendingProcessing: preferredPointSet.pendingProcessing,
+                totalPointCount: totalPointCount,
+                pendingPointCount: pendingPointCount,
                 currentClusters: currentClusters,
                 historicalClusters: historicalClusters,
                 selectableClusters: buildSelectableClusters(currentClusters, selectableHistoricalClusters),
@@ -3943,6 +4072,14 @@ private Map getDisplayData(deviceId) {
 private Map preferDisplayPointSet(List currentPoints, List lastPoints, List currentOutOfBounds, List lastOutOfBounds) {
     def currentTotal = ((currentPoints ?: []) as List).size() + ((currentOutOfBounds ?: []) as List).size()
     def snapshotTotal = ((lastPoints ?: []) as List).size() + ((lastOutOfBounds ?: []) as List).size()
+    if (!shouldUseLiveDisplayComputation(currentPoints, currentOutOfBounds) && snapshotTotal > 0) {
+        return [
+                points: (lastPoints ?: []) as List,
+                outOfBoundsPoints: (lastOutOfBounds ?: []) as List,
+                source: "processed-snapshot",
+                pendingProcessing: currentTotal > 0
+        ]
+    }
     if (snapshotTotal > currentTotal) {
         return [
                 points: (lastPoints ?: []) as List,
@@ -3957,6 +4094,15 @@ private Map preferDisplayPointSet(List currentPoints, List lastPoints, List curr
             source: currentTotal > 0 ? "live" : "processed-snapshot",
             pendingProcessing: currentTotal > 0
     ]
+}
+
+private boolean shouldUseLiveDisplayComputation(List currentPoints, List currentOutOfBounds) {
+    def currentTotal = ((currentPoints ?: []) as List).size() + ((currentOutOfBounds ?: []) as List).size()
+    currentTotal <= safeMaxGraphPointsPerDevice()
+}
+
+private List getSnapshotClusters(deviceId) {
+    ((state.lastClustersSnapshot?.get(deviceKey(deviceId)) ?: []) as List).collect { snapshotCluster(it) }
 }
 
 private void refreshStoredGhostSnapshotsForDevice(deviceId, List currentClustersOverride = null, List pointsOverride = null, List outOfBoundsOverride = null) {
@@ -4037,10 +4183,12 @@ private Map getSummaryForDevice(deviceId) {
 
 private Map getDisplayCounts(deviceId) {
     def devKey = deviceKey(deviceId)
-    def liveClusters = getTodayClusters(deviceId)
+    def displayData = getDisplayData(deviceId)
+    def liveClusters = (displayData?.currentClusters ?: []) as List
     def summary = getSummaryForDevice(deviceId)
     def currentCounts = getDisplayGhostCounts(devKey, liveClusters)
-    currentCounts.ghostsToday = (getPointsForDevice(deviceId) || liveClusters) ? (liveClusters?.size() ?: 0) : (summary.ghostsToday ?: 0)
+    def totalPoints = ((displayData?.totalPointCount ?: 0) as Integer)
+    currentCounts.ghostsToday = (totalPoints > 0 || liveClusters) ? (liveClusters?.size() ?: 0) : (summary.ghostsToday ?: 0)
     currentCounts
 }
 
@@ -4208,7 +4356,7 @@ private List dedupeClusters(List clusters) {
 }
 
 private Integer calculateUnclusteredPointCount(List points, List clusters) {
-    Math.max(0, (points?.size() ?: 0) - ((clusters ?: []).collect { it.points?.size() ?: 0 }.sum() ?: 0))
+    Math.max(0, totalPointWeight(points) - ((clusters ?: []).collect { totalPointWeight(it.points) }.sum() ?: 0))
 }
 
 private Map getAutoGhostBustBoundary() {
@@ -5184,8 +5332,8 @@ private String renderClusterPlot(List points, List outOfBoundsPoints, List curre
 }
 
 private Map limitPointsForGraph(List points, List outOfBoundsPoints) {
-    def inBounds = (points ?: []) as List
-    def outOfBounds = (outOfBoundsPoints ?: []) as List
+    def inBounds = binPointsForDisplay(points)
+    def outOfBounds = binPointsForDisplay(outOfBoundsPoints)
     def total = inBounds.size() + outOfBounds.size()
     def maxPoints = safeMaxGraphPointsPerDevice()
 
@@ -5217,6 +5365,93 @@ private Map limitPointsForGraph(List points, List outOfBoundsPoints) {
 
 private Integer safeMaxGraphPointsPerDevice() {
     Math.max(1, (maxGraphPointsPerDevice ?: 500) as Integer)
+}
+
+private List binPointsForClustering(List points) {
+    binPointsByRoundedCoordinates(points, false)
+}
+
+private List binPointsForDisplay(List points) {
+    binPointsByRoundedCoordinates(points, true)
+}
+
+private List binPointsByRoundedCoordinates(List points, boolean preserveEligibilityState) {
+    def source = (points ?: []) as List
+    if (!source) {
+        return []
+    }
+
+    def bins = [:]
+    source.each { point ->
+        def roundedX = roundToPointBin(point?.x)
+        def roundedY = roundToPointBin(point?.y)
+        def roundedZ = roundToPointBin(point?.z)
+        def stateKey = preserveEligibilityState ? "${point?.ghostEligible}|${point?.ghostIgnoreReason ?: ''}" : ""
+        def key = "${roundedX}|${roundedY}|${roundedZ}|${stateKey}"
+        def existing = bins[key]
+        if (!existing) {
+            bins[key] = [
+                    x: roundedX,
+                    y: roundedY,
+                    z: roundedZ,
+                    ts: point?.ts,
+                    ghostEligible: point?.ghostEligible,
+                    ghostIgnoreReason: point?.ghostIgnoreReason,
+                    binCount: pointWeight(point)
+            ]
+            return
+        }
+
+        existing.binCount = (existing.binCount ?: 0) + pointWeight(point)
+        if ((point?.ts instanceof Number) && (!(existing.ts instanceof Number) || (point.ts as Long) > (existing.ts as Long))) {
+            existing.ts = point.ts
+        }
+    }
+
+    bins.values().collect { clonePoint(it as Map) }
+}
+
+private Double roundToPointBin(value) {
+    def numeric = toDouble(value)
+    if (numeric == null) {
+        return 0.0d
+    }
+    def binSize = safePointBinSizeCm()
+    roundToConfiguredBin(numeric, binSize)
+}
+
+private Double safePointBinSizeCm() {
+    def configured = toDouble(pointBinSizeCm)
+    if (configured == null) {
+        return 1.0d
+    }
+
+    Math.max(0.1d, Math.min(100.0d, configured))
+}
+
+private Double roundToConfiguredBin(Double value, Double binSize) {
+    if (value == null) {
+        return 0.0d
+    }
+
+    def safeBinSize = Math.max(0.1d, binSize ?: 1.0d)
+    def rounded = Math.round(value / safeBinSize) * safeBinSize
+    round2(rounded).doubleValue()
+}
+
+private Integer pointWeight(Map point) {
+    Math.max(1, ((point?.binCount ?: point?.pointCount ?: 1) as Integer))
+}
+
+private Integer totalPointWeight(List points) {
+    ((points ?: []) as List).collect { pointWeight(it as Map) }.sum() ?: 0
+}
+
+private Double weightedAxisAverage(List points, String axis, Integer totalWeight = null) {
+    def weight = Math.max(1, totalWeight ?: totalPointWeight(points))
+    (((points ?: []) as List).collect { point ->
+        ((point?."${axis}" ?: 0.0d) as Double) * pointWeight(point as Map)
+    }.sum() ?: 0.0d) / weight
 }
 
 private List evenlySamplePoints(List points, Integer limit) {
@@ -5266,13 +5501,15 @@ private String pendingPointFill(String fill) {
 }
 
 private String plotPointTooltip(Map point) {
+    def countText = pointWeight(point) > 1 ? "Count ${pointWeight(point)}" : null
     def timestamp = safeTimestamp(point?.ts)
     [
             "X ${round2(point?.x)} cm",
             "Y ${round2(point?.y)} cm",
             "Z ${round2(point?.z)} cm",
+            countText,
             "Detected ${timestamp ? formatTimestamp(timestamp) : 'Unknown time'}"
-    ].join("&#10;")
+    ].findAll { it }.join("&#10;")
 }
 
 private Map getPreferredRenderCluster(Map currentCluster, List historicalClusters, String devKey) {
@@ -5705,7 +5942,7 @@ private String renderDeviceStatsCard(dev, String devKey, Map displayCounts, Map 
             ((displayCounts?.targetedGhosts ?: 0) as Integer) +
             ((displayCounts?.escapingGhosts ?: 0) as Integer) +
             ((displayCounts?.bustedGhosts ?: 0) as Integer)) > 0
-    def totalGraphPoints = (((displayData.points ?: []) as List).size() + ((displayData.outOfBoundsPoints ?: []) as List).size()) as Integer
+    def totalGraphPoints = ((displayData.totalPointCount ?: 0) as Integer)
     def showGraphSection = hasGhostDetails || totalGraphPoints > 0
     def html = new StringBuilder()
     html << "<div style='border:1px solid #bfccda; background:#eef4f8; padding:10px; margin:8px 0 14px 0; box-shadow: 1px 2px #d8e2ea;'>"
@@ -6152,6 +6389,10 @@ private String describeAutoBustConfiguration() {
     "${mode} / cm X ${autoBustBoundaryXMin}..${autoBustBoundaryXMax}, Y ${autoBustBoundaryYMin}..${autoBustBoundaryYMax}, Z ${autoBustBoundaryZMin}..${autoBustBoundaryZMax}"
 }
 
+private boolean shouldProcessPointsOnDetectionInactive() {
+    processPointsOnDetectionInactive == true
+}
+
 private String describeBustMode(Map cluster) {
     if (isClusterBusted(cluster)) {
         return "Area ${cluster.targetAreaIndex} (${describeTargetSource(cluster.targetSource)}) eliminated this ghost for ${cluster.absentStreak ?: 0} active day(s)"
@@ -6332,7 +6573,8 @@ private Map getConfigurationSummaryStats() {
             "Devices": summarizeDeviceNames(mmwaveDevices),
             "Activation": activationSummary,
             "Boundary": boundarySummary,
-            "Positional clustering": "${clusteringAlgorithm ?: 'DBSCAN'} / r=${clusterRadius ?: 50}cm / min=${minClusterEvents ?: 5}",
+            "Processing": shouldProcessPointsOnDetectionInactive() ? "On detection inactive + daily boundary fallback" : "Daily boundary only",
+            "Positional clustering": "${clusteringAlgorithm ?: 'DBSCAN'} / r=${clusterRadius ?: 50}cm / min=${minClusterEvents ?: 5} / bin=${round2(safePointBinSizeCm())}cm",
             "Persistence": "history ${historyDays ?: 14}d / persistent ${persistentGhostDays ?: 2}d / busted ${bustedGhostDays ?: 2}d",
             "Display": "detected grace ${safeDisplayGraceDays()}d / historical overlays ${showHistoricalGhostOverlaysEnabled() ? 'on' : 'off'}",
             "Auto busting": enableAutoGhostBusting ? describeAutoBustConfiguration() : "Disabled",
@@ -6536,6 +6778,7 @@ private Map cloneCluster(Map cluster) {
             bounds: cloneBounds(cluster.bounds),
             radius: cluster.radius,
             density: cluster.density,
+            points: representativeClusterPoints(cluster.points),
             daysSeen: cluster.daysSeen ?: 0,
             lastSeen: cluster.lastSeen ?: 0,
             seenHistory: ((cluster.seenHistory ?: []) as List).collect { it },
@@ -6557,7 +6800,7 @@ private Map snapshotCluster(Map cluster) {
             bounds: cloneBounds(cluster.bounds),
             radius: cluster.radius ?: 0.0d,
             density: cluster.density ?: 0,
-            points: ((cluster.points ?: []) as List).collect { clonePoint(it) },
+            points: representativeClusterPoints(cluster.points),
             daysSeen: cluster.daysSeen ?: 0,
             lastSeen: cluster.lastSeen ?: 0,
             seenHistory: ((cluster.seenHistory ?: []) as List).collect { it },
@@ -6571,6 +6814,15 @@ private Map snapshotCluster(Map cluster) {
             appliedBounds: cloneBounds(cluster.appliedBounds),
             maxStateReached: cluster.maxStateReached
     ] + ghostSnapshotFields(cluster)
+}
+
+private List representativeClusterPoints(List points) {
+    def cloned = ((points ?: []) as List).collect { clonePoint(it) }
+    evenlySamplePoints(cloned, safeMaxClusterStoredPoints())
+}
+
+private Integer safeMaxClusterStoredPoints() {
+    Math.max(10, Math.min(200, safeMaxGraphPointsPerDevice()))
 }
 
 private Map ghostSnapshotFields(Map cluster) {
@@ -6666,6 +6918,8 @@ private Map clonePoint(Map point) {
             y: point?.y ?: 0.0d,
             z: point?.z ?: 0.0d,
             ts: point?.ts,
+            binCount: point?.binCount,
+            pointCount: point?.pointCount,
             ghostEligible: point?.ghostEligible,
             ghostIgnoreReason: point?.ghostIgnoreReason
     ]
