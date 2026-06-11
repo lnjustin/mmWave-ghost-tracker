@@ -1,5 +1,8 @@
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
+import groovy.transform.Field
+
+@Field private Map pageRenderCache = [:]
 
 definition(
         name: "mmWave Ghost Buster",
@@ -22,7 +25,7 @@ preferences {
 
 def mainPage() {
     try {
-        refreshRecommendation()
+        beginPageRenderCache()
         return dynamicPage(name: "mainPage", install: true, uninstall: true) {
             section() {
                 paragraph renderHomeHeroCard()
@@ -37,7 +40,7 @@ def mainPage() {
                     body << (landingSummary._html as String)
                 }
                 if (state.recommendation) {
-                    body << renderRecommendationSummary(state.recommendation)
+                    body << renderRecommendationsSummary(state.recommendations, state.recommendation)
                 }
                 body << renderActionHintCard(
                         "Next Step",
@@ -274,7 +277,7 @@ def settingsPage() {
 
                 input "leakRecoveryDays",
                         "number",
-                        title: "Consecutive clear days before an escaping or targeted ghost becomes busted again",
+                        title: "Consecutive clear days before an escaping or covered ghost becomes busted again",
                         defaultValue: 2
 
                 input "displayGraceDays",
@@ -318,6 +321,11 @@ def settingsPage() {
                 input "showHistoricalGhostOverlays",
                         "bool",
                         title: "Show historical ghost overlays on stats graphs",
+                        defaultValue: true
+
+                input "showPendingPointsOnGraphs",
+                        "bool",
+                        title: "Show pending-processing points on stats graphs",
                         defaultValue: true
 
                 input "maxGraphPointsPerDevice",
@@ -438,13 +446,41 @@ def settingsPage() {
 
                     input "notifyOnTargetedPersistentGhost",
                             "bool",
-                            title: "Notify when a targeted ghost is still persistent",
+                            title: "Notify when a covered ghost is still persistent",
                             defaultValue: true
 
                     input "notifyOnEscapingGhost",
                             "bool",
-                            title: "Notify when a targeted ghost is escaping from inside its interference area",
+                            title: "Notify when a covered ghost extends beyond its interference area",
                             defaultValue: true
+
+                    input "notifyOnParameter107VerificationFailure",
+                            "bool",
+                            title: "Notify when P107 verification fails after retries",
+                            defaultValue: true
+
+                    input "notifyOnOutsideWindowTargetInfo",
+                            "bool",
+                            title: "Notify when target info reports keep arriving outside the tracking window",
+                            defaultValue: false,
+                            submitOnChange: true
+
+                    if (notifyOnOutsideWindowTargetInfo) {
+                        input "outsideWindowTargetInfoThreshold",
+                                "number",
+                                title: "Notify after this many outside-window target points",
+                                defaultValue: 25
+
+                        input "outsideWindowTargetInfoWindowMinutes",
+                                "number",
+                                title: "Count reports over this many minutes",
+                                defaultValue: 10
+
+                        input "outsideWindowTargetInfoCooldownMinutes",
+                                "number",
+                                title: "Minimum minutes between repeat notifications per device",
+                                defaultValue: 60
+                    }
                 }
             }
 
@@ -456,7 +492,7 @@ def settingsPage() {
             }
 
             section(getInterface("header", "Done")) {
-                href "mainPage", title: "Return To Landing Page", description: "Back to the app home page"
+                href name: "settingsDone", page: "mainPage", title: "Return To Landing Page", description: "Back to the app home page"
             }
         }
     } catch (Throwable t) {
@@ -468,6 +504,7 @@ def settingsPage() {
 def deviceAreaPage(params = [:]) {
     try {
         initializeState()
+        beginPageRenderCache()
         def requestedDeviceId = params?.deviceId ?: state.deviceAreaPageDeviceId
         if (requestedDeviceId) {
             state.deviceAreaPageDeviceId = requestedDeviceId
@@ -491,15 +528,21 @@ def deviceAreaPage(params = [:]) {
             }
 
             def devKey = deviceKey(dev.id)
+            preloadDeviceInterferenceAreas(dev)
+            state.deviceAreaPendingApplyDevKey = devKey
+            state.deviceAreaPendingApplyAt = now()
             def displayData = getDisplayData(dev.id)
             def trackedGhosts = getTrackedGhostsForDisplay(dev.id)
+            def localRecommendations = (state.recommendations ?: []).findAll { it.deviceId == devKey }
             def recommendation = state.recommendation?.deviceId == devKey ? state.recommendation : null
 
             section() {
                 def body = new StringBuilder()
                 body << renderInterferenceAreasControlCard(dev.id, displayData.selectableClusters)
-                if (recommendation) {
-                    body << renderRecommendationSummary(recommendation)
+                if (localRecommendations || recommendation) {
+                    body << renderRecommendationsSummary(localRecommendations, recommendation)
+                } else {
+                    body << renderNoteCard("Recommendation Status", "No recommendation available right now for this device.")
                 }
                 paragraph renderFramedPageCard(
                         "Interference Areas: ${dev.displayName}",
@@ -520,7 +563,7 @@ def deviceAreaPage(params = [:]) {
                 }
             }
 
-            section(getInterface("subHeader", "Area Assignments")) {
+            section(getInterface("subHeader", "Area Setup")) {
                 if (displayData.selectableClusters) {
                     def eventDefinitions = renderCorrelationEventDefinitions(dev.id)
                     if (eventDefinitions) {
@@ -528,7 +571,7 @@ def deviceAreaPage(params = [:]) {
                     }
                     input "targetCluster_${devKey}_0",
                             "enum",
-                            title: buildAreaSelectorTitle(dev.id, 0, displayData.selectableClusters),
+                            title: buildAreaSelectorTitle(0),
                             multiple: false,
                             required: false,
                             options: buildSelectableClusterOptions(displayData.selectableClusters),
@@ -544,7 +587,7 @@ def deviceAreaPage(params = [:]) {
                             width: 2
                     input "targetCluster_${devKey}_1",
                             "enum",
-                            title: buildAreaSelectorTitle(dev.id, 1, displayData.selectableClusters),
+                            title: buildAreaSelectorTitle(1),
                             multiple: false,
                             required: false,
                             options: buildSelectableClusterOptions(displayData.selectableClusters),
@@ -560,7 +603,7 @@ def deviceAreaPage(params = [:]) {
                             width: 2
                     input "targetCluster_${devKey}_2",
                             "enum",
-                            title: buildAreaSelectorTitle(dev.id, 2, displayData.selectableClusters),
+                            title: buildAreaSelectorTitle(2),
                             multiple: false,
                             required: false,
                             options: buildSelectableClusterOptions(displayData.selectableClusters),
@@ -576,7 +619,7 @@ def deviceAreaPage(params = [:]) {
                             width: 2
                     input "targetCluster_${devKey}_3",
                             "enum",
-                            title: buildAreaSelectorTitle(dev.id, 3, displayData.selectableClusters),
+                            title: buildAreaSelectorTitle(3),
                             multiple: false,
                             required: false,
                             options: buildSelectableClusterOptions(displayData.selectableClusters),
@@ -590,7 +633,7 @@ def deviceAreaPage(params = [:]) {
                             options: getDynamicActivationOptions(dev.id),
                             defaultValue: getDynamicActivationSelection(dev.id, 3),
                             width: 2
-                    input "applyAllAreas_${devKey}", "button", title: "Done"
+                    paragraph renderNoteCard("Done", "Press Done to apply the current assignments and return to the previous page.")
                 } else {
                     paragraph "No ghosts are available for interference area targeting."
                 }
@@ -624,8 +667,10 @@ def deviceAreaDispatchPage(params = [:]) {
 def statsPage() {
     try {
         initializeState()
-        refreshRecommendation()
+        beginPageRenderCache()
         def sortedDevices = getSortedMmwaveDevices()
+        preloadDeviceInterferenceAreasForPage(sortedDevices)
+        reconcileStatsPageAreaRefresh()
 
         def refreshStartAt = (state.statsPageRefreshStartAt ?: 0L) as Long
         def refreshUntil = (state.statsPageRefreshUntil ?: 0L) as Long
@@ -651,7 +696,6 @@ def statsPage() {
             def aggregateBusted = 0
 
             sortedDevices.each { dev ->
-                refreshStoredGhostSnapshotsForDevice(dev.id)
                 def displayCounts = getDisplayCounts(dev.id)
                 aggregatePersistent += displayCounts.persistentGhosts
                 aggregateBusted += displayCounts.bustedGhosts
@@ -659,20 +703,20 @@ def statsPage() {
 
             section() {
                 def networkSummary = getNetworkSummaryStats(sortedDevices, aggregatePersistent, aggregateBusted)
-                paragraph renderAllDevicesSummaryCard(networkSummary, state.recommendation)
+                paragraph renderAllDevicesSummaryCard(networkSummary, state.recommendations, state.recommendation)
             }
 
             sortedDevices.each { dev ->
                 def devKey = deviceKey(dev.id)
-                refreshStoredGhostSnapshotsForDevice(dev.id)
-                def stableClusters = getStableClusters(dev.id)
                 def trackedGhosts = getTrackedGhostsForDisplay(dev.id)
                 def displayCounts = getDisplayCounts(dev.id)
                 def displayData = getDisplayData(dev.id)
                 def lastSummary = getSummaryForDevice(dev.id)
                 def archivedGhostCount = displayData.archivedGhostCount ?: 0
-                def pointBuckets = classifyPlotPoints(displayData.points, displayData.outOfBoundsPoints, dev)
+                def pointBuckets = getPointBucketsForDevice(dev.id)
                 def escapingPointCount = (pointBuckets.occupancyAssociatedInterferencePoints ?: []).size()
+                def xyPointBuckets = getPlotPointBucketsForDevice(dev.id, dev, "x", "y", displayData.points, displayData.outOfBoundsPoints)
+                def xzPointBuckets = getPlotPointBucketsForDevice(dev.id, dev, "x", "z", displayData.points, displayData.outOfBoundsPoints)
                 def xyScale = calculatePlotScale(
                         displayData.points,
                         displayData.outOfBoundsPoints,
@@ -680,14 +724,16 @@ def statsPage() {
                         displayData.historicalClusters,
                         dev,
                         "x",
-                        "y"
+                        "y",
+                        null,
+                        xyPointBuckets
                 )
 
                 section() {
-                    paragraph renderDeviceStatsCard(dev, devKey, displayCounts, displayData, lastSummary, trackedGhosts, archivedGhostCount, escapingPointCount, xyScale)
+                    paragraph renderDeviceStatsCard(dev, devKey, displayCounts, displayData, lastSummary, trackedGhosts, archivedGhostCount, escapingPointCount, xyScale, xyPointBuckets, xzPointBuckets)
                     href(
                             name: "manageDeviceAreas_${devKey}",
-                            page: "deviceAreaPage",
+                            page: "deviceAreaDispatchPage",
                             title: "Manage Interference Areas",
                             description: "Review current device areas, compare ghost bounds, and update assignments",
                             params: [deviceId: dev.id?.toString()],
@@ -698,6 +744,10 @@ def statsPage() {
 
             section(getInterface("header", "Plot Legend")) {
                 paragraph renderCommonPlotLegend()
+            }
+
+            section(getInterface("header", "Done")) {
+                href name: "statsDone", page: "mainPage", title: "Return To Landing Page", description: "Back to the app home page"
             }
         }
     } catch (Throwable t) {
@@ -727,6 +777,13 @@ def appButtonHandler(btn) {
     if (btn.startsWith("clearPendingPoints_")) {
         def devKey = btn.substring("clearPendingPoints_".length())
         clearPendingPoints(devKey)
+        return
+    }
+
+    if (btn.startsWith("clearIgnoredOutsideWindow_")) {
+        def devKey = btn.substring("clearIgnoredOutsideWindow_".length())
+        clearIgnoredOutsideWindow(devKey)
+        scheduleStatsPageRefresh(0L, 3000L, 1)
         return
     }
 
@@ -760,7 +817,20 @@ def appButtonHandler(btn) {
             def devKey = remainder.substring(0, splitIndex)
             def ghostIndex = remainder.substring(splitIndex + 1)
             expandTrackedGhost(devKey, ghostIndex?.isInteger() ? (ghostIndex as Integer) : null)
+        }
+        return
+    }
+
+    if (btn.startsWith("targetGhost_")) {
+        def remainder = btn.substring("targetGhost_".length())
+        def splitIndex = remainder.lastIndexOf("_")
+        if (splitIndex > 0) {
+            def devKey = remainder.substring(0, splitIndex)
+            def ghostIndex = remainder.substring(splitIndex + 1)
+            targetTrackedGhost(devKey, ghostIndex?.isInteger() ? (ghostIndex as Integer) : null)
+            updateDynamicInterferenceAreas()
             refreshDeviceInterferenceAreas(devKey)
+            scheduleStatsPageRefresh(0L, 5000L, 1)
         }
         return
     }
@@ -795,6 +865,7 @@ def appButtonHandler(btn) {
             applySelectedZoneForArea(parts[0], safeInterferenceAreaIndex(parts[1]))
             updateDynamicInterferenceAreas()
             refreshDeviceInterferenceAreas(parts[0])
+            scheduleStatsPageRefresh(0L, 5000L, 1)
         }
         return
     }
@@ -804,7 +875,7 @@ def appButtonHandler(btn) {
         applyAllSelectedZones(devKey)
         updateDynamicInterferenceAreas()
         refreshDeviceInterferenceAreas(devKey)
-        scheduleStatsPageRefresh(12000L, 3000L, 3)
+        scheduleStatsPageRefresh(0L, 5000L, 1)
         return
     }
 
@@ -858,6 +929,63 @@ private void refreshDeviceInterferenceAreas(String devKey, boolean scheduleRefre
     requestDeviceInterferenceAreaPopulate(dev)
 }
 
+private void startStatsPageAreaRefresh(String deviceId, String devKey, Integer areaIndex, Map expectedBounds, Long durationMs = 5000L, Integer intervalSeconds = 1) {
+    if (!deviceId || !devKey || areaIndex == null || !isValidBounds(expectedBounds)) {
+        return
+    }
+
+    def nowMs = now()
+    state.statsPageAreaRefresh = [
+            deviceId: deviceId?.toString(),
+            devKey: devKey,
+            areaIndex: areaIndex as Integer,
+            expectedBounds: integerBounds(expectedBounds),
+            refreshUntil: nowMs + Math.max(1000L, durationMs ?: 5000L)
+    ]
+    state.statsPageRefreshStartAt = nowMs
+    state.statsPageRefreshUntil = (state.statsPageAreaRefresh.refreshUntil ?: nowMs) as Long
+    state.statsPageRefreshIntervalSeconds = Math.max(1, intervalSeconds ?: 1)
+}
+
+private void clearStatsPageAreaRefresh() {
+    state.statsPageAreaRefresh = null
+    state.statsPageRefreshStartAt = null
+    state.statsPageRefreshUntil = null
+    state.statsPageRefreshIntervalSeconds = null
+}
+
+private void reconcileStatsPageAreaRefresh() {
+    def refreshState = (state.statsPageAreaRefresh ?: [:]) as Map
+    if (!refreshState) {
+        return
+    }
+
+    def refreshUntil = (refreshState.refreshUntil ?: 0L) as Long
+    if (refreshUntil <= now()) {
+        clearStatsPageAreaRefresh()
+        return
+    }
+
+    def deviceId = refreshState.deviceId?.toString()
+    def areaIndex = refreshState.areaIndex instanceof Number ? (refreshState.areaIndex as Integer) : safeInterferenceAreaIndex(refreshState.areaIndex)
+    def expectedBounds = refreshState.expectedBounds as Map
+    if (!deviceId || areaIndex == null || !isValidBounds(expectedBounds)) {
+        clearStatsPageAreaRefresh()
+        return
+    }
+
+    def dev = mmwaveDevices?.find { deviceKey(it?.id) == deviceKey(deviceId) }
+    if (!dev) {
+        clearStatsPageAreaRefresh()
+        return
+    }
+
+    def reported = (readDeviceInterferenceAreas(dev) ?: []).find { (it.areaIndex as Integer) == areaIndex }
+    if (reported?.bounds && sameBounds(reported.bounds as Map, expectedBounds)) {
+        clearStatsPageAreaRefresh()
+    }
+}
+
 def installed() {
     initializeState()
     syncChildDevices()
@@ -876,6 +1004,8 @@ def updated() {
         debugLog("updated(): state initialized")
         reconcileCorrelationEpisodeSettings()
         debugLog("updated(): correlation episode settings reconciled")
+        applyPendingDeviceAreaAssignmentsOnUpdate()
+        debugLog("updated(): pending device area assignments applied")
         syncChildDevices()
         debugLog("updated(): child devices synced")
         initialize()
@@ -930,10 +1060,12 @@ private initializeState() {
     state.lastOutOfBoundsSnapshot = state.lastOutOfBoundsSnapshot ?: [:]
     state.lastClustersSnapshot = state.lastClustersSnapshot ?: [:]
     state.recommendation = state.recommendation ?: null
+    state.recommendations = state.recommendations ?: []
     state.activeDevices = state.activeDevices ?: [:]
     state.activationStart = state.activationStart ?: [:]
     state.autoBustedZones = state.autoBustedZones ?: [:]
     state.interferenceAreas = state.interferenceAreas ?: [:]
+    state.pendingInterferenceAreaWrites = state.pendingInterferenceAreaWrites ?: [:]
     state.autoManagedZoneRange = state.autoManagedZoneRange ?: [:]
     state.manualManagedZoneRange = state.manualManagedZoneRange ?: [:]
     state.correlationDaily = state.correlationDaily ?: [:]
@@ -943,6 +1075,8 @@ private initializeState() {
     state.correlationEpisodeState = state.correlationEpisodeState ?: [:]
     state.correlationChangeHistory = state.correlationChangeHistory ?: [:]
     state.correlationEpisodeGapApplied = state.correlationEpisodeGapApplied ?: null
+    state.pendingMmWaveTargetInfoVerification = state.pendingMmWaveTargetInfoVerification ?: [:]
+    state.outsideWindowTargetInfoAlert = state.outsideWindowTargetInfoAlert ?: [:]
     state.deviceActiveDayHistory = state.deviceActiveDayHistory ?: [:]
     state.deviceActiveToday = state.deviceActiveToday ?: [:]
     state.dynamicAreaStatus = state.dynamicAreaStatus ?: [:]
@@ -960,6 +1094,181 @@ private void reconcileCorrelationEpisodeSettings() {
         infoLog("Correlation episode gap changed from ${priorGap}s to ${currentGap}s. Retained transition-correlation episode counts were recomputed from stored point snapshots where possible.")
     }
     state.correlationEpisodeGapApplied = currentGap
+}
+
+private void applyPendingDeviceAreaAssignmentsOnUpdate() {
+    def devKey = state.deviceAreaPendingApplyDevKey?.toString()
+    def pendingAt = (state.deviceAreaPendingApplyAt ?: 0L) as Long
+    state.deviceAreaPendingApplyDevKey = null
+    state.deviceAreaPendingApplyAt = null
+
+    if (!devKey || pendingAt <= 0L || (now() - pendingAt) > 120000L) {
+        return
+    }
+
+    def dev = mmwaveDevices?.find { deviceKey(it?.id) == devKey }
+    if (!dev) {
+        return
+    }
+
+    applyAllSelectedZones(devKey)
+    updateDynamicInterferenceAreas()
+    refreshDeviceInterferenceAreas(devKey)
+    scheduleStatsPageRefresh(0L, 5000L, 1)
+}
+
+private void beginPageRenderCache() {
+    this.pageRenderCache = [
+            displayData: [:],
+            displayCounts: [:],
+            pointBuckets: [:],
+            plotPointBuckets: [:],
+            trackedGhosts: [:],
+            episodeCounts: [:],
+            rawDeviceInterferenceAreas: [:],
+            liveInterferenceAreas: [:],
+            liveInterferenceAreaLoads: [:],
+            ghostEvalGuards: [:]
+    ]
+}
+
+private Map getPageRenderCacheSection(String name) {
+    def cache = (this.pageRenderCache ?: [:]) as Map
+    def section = (cache[name] ?: [:]) as Map
+    if (cache[name] != section) {
+        cache[name] = section
+        this.pageRenderCache = cache
+    }
+    section
+}
+
+private String ghostEvalKey(String devKey, Map cluster) {
+    if (!devKey || !cluster) {
+        return null
+    }
+    def bounds = cluster.bounds ?: [:]
+    def center = cluster.center ?: [:]
+    [
+            devKey,
+            cluster.targetAreaIndex,
+            cluster.lastSeen ?: 0,
+            cluster.daysSeen ?: 0,
+            round2(center.x),
+            round2(center.y),
+            round2(center.z),
+            round2(bounds.xmin),
+            round2(bounds.xmax),
+            round2(bounds.ymin),
+            round2(bounds.ymax),
+            round2(bounds.zmin),
+            round2(bounds.zmax)
+    ].join("|")
+}
+
+private boolean beginGhostEval(String evalType, String devKey, Map cluster) {
+    def evalKey = ghostEvalKey(devKey, cluster)
+    if (!evalKey) {
+        return true
+    }
+    def guards = getPageRenderCacheSection("ghostEvalGuards")
+    def active = (((guards[evalType] ?: [:]) as Map).collectEntries { key, value -> [(key): value] }) as Map
+    if (active[evalKey]) {
+        return false
+    }
+    active[evalKey] = true
+    guards[evalType] = active
+    true
+}
+
+private void endGhostEval(String evalType, String devKey, Map cluster) {
+    def evalKey = ghostEvalKey(devKey, cluster)
+    if (!evalKey) {
+        return
+    }
+    def guards = getPageRenderCacheSection("ghostEvalGuards")
+    def active = (((guards[evalType] ?: [:]) as Map).collectEntries { key, value -> [(key): value] }) as Map
+    active.remove(evalKey)
+    guards[evalType] = active
+}
+
+private List buildFallbackLiveInterferenceAreas(Map metadata, List pendingAreas = null) {
+    def merged = [:]
+    (rememberedInterferenceAreasFromMetadata(metadata) ?: []).each { area ->
+        merged[(area.areaIndex as Integer).toString()] = [
+                areaIndex: area.areaIndex as Integer,
+                bounds: cloneBounds(area.bounds as Map),
+                source: area.source ?: "manual-entry",
+                updatedAt: area.updatedAt ?: 0L,
+                dynamic: cloneDynamicAreaConfig(area.dynamic as Map),
+                dynamicActive: area.dynamicActive == true
+        ]
+    }
+    (pendingAreas ?: []).each { pending ->
+        def key = (pending.areaIndex as Integer).toString()
+        def existing = merged[key] as Map
+        if (!existing?.bounds || !sameBounds(existing.bounds as Map, pending.bounds as Map)) {
+            merged[key] = pending
+        }
+    }
+    merged.values().sort { a, b -> (a.areaIndex as Integer) <=> (b.areaIndex as Integer) }
+}
+
+private List mergeDeviceInterferenceAreasWithMetadata(List deviceAreas, Map metadata, List pendingAreas = null) {
+    def merged = [:]
+    (deviceAreas ?: []).each { area ->
+        merged[(area.areaIndex as Integer).toString()] = [
+                areaIndex: area.areaIndex as Integer,
+                bounds: cloneBounds(area.bounds as Map),
+                source: area.source ?: "device",
+                updatedAt: area.updatedAt ?: 0L,
+                dynamic: null,
+                dynamicActive: false
+        ]
+    }
+    (pendingAreas ?: []).each { pending ->
+        def key = (pending.areaIndex as Integer).toString()
+        def existing = merged[key] as Map
+        if (!existing?.bounds || !sameBounds(existing.bounds as Map, pending.bounds as Map)) {
+            merged[key] = pending
+        }
+    }
+    merged.values().collect { area ->
+        def meta = (metadata[((area.areaIndex ?: 0) as Integer).toString()] ?: [:]) as Map
+        area + [
+                source: meta.source ?: area.source ?: "device",
+                updatedAt: meta.updatedAt ?: area.updatedAt ?: 0L,
+                dynamic: cloneDynamicAreaConfig(meta.dynamic as Map),
+                dynamicActive: meta.dynamicActive == true
+        ]
+    }.sort { a, b -> (a.areaIndex as Integer) <=> (b.areaIndex as Integer) }
+}
+
+private List getCoverageInterferenceAreas(String devKey) {
+    def metadata = (((state.interferenceAreas ?: [:])[devKey] ?: [:]) as Map)
+    def pendingAreas = getPendingInterferenceAreaWrites(devKey)
+    def rawCache = getPageRenderCacheSection("rawDeviceInterferenceAreas")
+    if (rawCache.containsKey(devKey)) {
+        return mergeDeviceInterferenceAreasWithMetadata((rawCache[devKey] ?: []) as List, metadata, pendingAreas)
+    }
+    buildFallbackLiveInterferenceAreas(metadata, pendingAreas)
+}
+
+private void preloadDeviceInterferenceAreas(dev) {
+    if (!dev) {
+        return
+    }
+    def devKey = deviceKey(dev.id)
+    def rawCache = getPageRenderCacheSection("rawDeviceInterferenceAreas")
+    if (rawCache.containsKey(devKey)) {
+        return
+    }
+    rawCache[devKey] = (readDeviceInterferenceAreas(dev) ?: []) as List
+}
+
+private void preloadDeviceInterferenceAreasForPage(List devices) {
+    (devices ?: []).each { dev ->
+        preloadDeviceInterferenceAreas(dev)
+    }
 }
 
 private void recomputeRetainedTransitionCorrelationStats() {
@@ -1131,8 +1440,7 @@ private sendMmWaveBind(dev) {
         return
     }
 
-    dev.updateSetting("parameter107", [value: "1", type: "enum"])
-    dev.configure("All")
+    writeMmWaveTargetInfoReportSetting(dev, 1)
 }
 
 private sendMmWaveUnBind(dev) {
@@ -1140,8 +1448,139 @@ private sendMmWaveUnBind(dev) {
         return
     }
 
-    dev.updateSetting("parameter107", [value: "0", type: "enum"])
-    dev.configure("All")
+    writeMmWaveTargetInfoReportSetting(dev, 0)
+}
+
+private void writeMmWaveTargetInfoReportSetting(dev, Integer value) {
+    if (!dev || value == null) {
+        return
+    }
+
+    def devKey = deviceKey(dev.id)
+    def pending = ((state.pendingMmWaveTargetInfoVerification ?: [:]) as Map).collectEntries { key, entry ->
+        [(key): (entry as Map)]
+    }
+    pending[devKey] = [
+            deviceId: dev.id?.toString(),
+            expected: value as Integer,
+            requestedAt: now(),
+            attempts: 0,
+            nextVerifyAt: now() + 2000L
+    ]
+    state.pendingMmWaveTargetInfoVerification = pending
+
+    dev.setParameter(107, value as Integer, 8)
+    infoLog("Requested P107=${value} for ${dev.displayName}. Driver setParameter() should perform an immediate readback.")
+    runIn(2, "verifyMmWaveTargetInfoReportSettings")
+}
+
+void verifyMmWaveTargetInfoReportSettings() {
+    def pending = ((state.pendingMmWaveTargetInfoVerification ?: [:]) as Map).collectEntries { key, entry ->
+        [(key): (entry as Map)]
+    }
+    if (!pending) {
+        return
+    }
+
+    def nowMs = now()
+    def delaysSeconds = [2, 5, 10]
+    def remaining = [:]
+    Long earliestNextVerifyAt = null
+
+    pending.each { devKey, entry ->
+        def dev = mmwaveDevices?.find { deviceKey(it?.id) == devKey }
+        if (!dev) {
+            return
+        }
+
+        def expected = entry.expected instanceof Number ? (entry.expected as Integer) : null
+        def nextVerifyAt = (entry.nextVerifyAt ?: 0L) as Long
+        if (nextVerifyAt > nowMs) {
+            remaining[devKey] = entry
+            earliestNextVerifyAt = earliestNextVerifyAt == null ? nextVerifyAt : Math.min(earliestNextVerifyAt, nextVerifyAt)
+            return
+        }
+
+        def observed = getObservedMmWaveTargetInfoReportSetting(dev)
+        def attempt = (entry.attempts ?: 0) as Integer
+        if (observed != null && expected != null && observed == expected) {
+            infoLog("Verified P107=${expected} for ${dev.displayName}.")
+            return
+        }
+
+        dev.getParameter(107)
+        dev.refresh("All")
+
+        if (attempt < (delaysSeconds.size() - 1)) {
+            def nextDelaySeconds = delaysSeconds[attempt + 1]
+            def updatedEntry = [
+                    deviceId: entry.deviceId?.toString(),
+                    expected: expected,
+                    requestedAt: entry.requestedAt ?: nowMs,
+                    attempts: attempt + 1,
+                    nextVerifyAt: nowMs + (nextDelaySeconds * 1000L)
+            ]
+            remaining[devKey] = updatedEntry
+            earliestNextVerifyAt = earliestNextVerifyAt == null ? updatedEntry.nextVerifyAt as Long : Math.min(earliestNextVerifyAt, updatedEntry.nextVerifyAt as Long)
+            warnLog("P107 verification pending for ${dev.displayName}: expected=${expected}, observed=${observed != null ? observed : 'unknown'}. Retrying in ${nextDelaySeconds}s.")
+            return
+        }
+
+        warnLog("P107 verification failed for ${dev.displayName}: expected=${expected}, observed=${observed != null ? observed : 'unknown'} after ${attempt + 1} verification attempt(s). Confirm the driver logs show the final P107 value.")
+        if (sendPush && notifyOnParameter107VerificationFailure) {
+            sendNotification("${dev.displayName}: P107 verification failed after retries. Expected ${expected}, observed ${observed != null ? observed : 'unknown'}. Check the driver logs for the final P107 readback.")
+        }
+    }
+
+    state.pendingMmWaveTargetInfoVerification = remaining
+    if (earliestNextVerifyAt != null && !remaining.isEmpty()) {
+        def delaySeconds = Math.max(1, Math.ceil((earliestNextVerifyAt - now()) / 1000.0d) as Integer)
+        runIn(delaySeconds, "verifyMmWaveTargetInfoReportSettings")
+    }
+}
+
+private Integer getObservedMmWaveTargetInfoReportSetting(dev) {
+    if (!dev) {
+        return null
+    }
+
+    def candidates = []
+    try {
+        candidates << dev.currentValue("parameter107")
+    } catch (Throwable ignored) {
+    }
+    try {
+        candidates << dev.currentValue("parameter107value")
+    } catch (Throwable ignored) {
+    }
+    try {
+        candidates << dev.latestValue("parameter107")
+    } catch (Throwable ignored) {
+    }
+    try {
+        candidates << dev.latestValue("parameter107value")
+    } catch (Throwable ignored) {
+    }
+    try {
+        candidates << dev.getSetting("parameter107")
+    } catch (Throwable ignored) {
+    }
+
+    def raw = candidates.find { it != null && it.toString().trim() != "" }
+    def normalized = raw?.toString()?.trim()
+    if (!normalized) {
+        return null
+    }
+    if (normalized.isInteger()) {
+        return normalized as Integer
+    }
+    if (normalized.equalsIgnoreCase("enabled")) {
+        return 1
+    }
+    if (normalized.equalsIgnoreCase("disabled")) {
+        return 0
+    }
+    null
 }
 
 private sendNotification(String message) {
@@ -1324,6 +1763,43 @@ private void recordIgnoredOutsideWindowPoints(dev, Integer count) {
 
     state.ignoredOutsideWindowPoints[devKey] = ((state.ignoredOutsideWindowPoints[devKey] ?: 0) as Integer) + ignoredCount
     state.lastIgnoredOutsideWindowAt[devKey] = now()
+    trackOutsideWindowTargetInfoAlert(dev, ignoredCount)
+}
+
+private void trackOutsideWindowTargetInfoAlert(dev, Integer ignoredCount) {
+    if (!dev || ignoredCount == null || ignoredCount <= 0 || !sendPush || !notifyOnOutsideWindowTargetInfo) {
+        return
+    }
+
+    def threshold = Math.max(1, (outsideWindowTargetInfoThreshold ?: 25) as Integer)
+    def windowMs = Math.max(1, (outsideWindowTargetInfoWindowMinutes ?: 10) as Integer) * 60000L
+    def cooldownMs = Math.max(1, (outsideWindowTargetInfoCooldownMinutes ?: 60) as Integer) * 60000L
+    def devKey = deviceKey(dev.id)
+    def nowMs = now()
+    def alerts = ((state.outsideWindowTargetInfoAlert ?: [:]) as Map).collectEntries { key, entry ->
+        [(key): (entry as Map)]
+    }
+    def current = (alerts[devKey] ?: [:]) as Map
+    def windowStart = (current.windowStart ?: 0L) as Long
+    def windowCount = (current.windowCount ?: 0) as Integer
+    def lastNotifiedAt = (current.lastNotifiedAt ?: 0L) as Long
+
+    if (windowStart <= 0L || (nowMs - windowStart) > windowMs) {
+        windowStart = nowMs
+        windowCount = 0
+    }
+
+    windowCount += ignoredCount
+    current.windowStart = windowStart
+    current.windowCount = windowCount
+
+    if (windowCount >= threshold && (lastNotifiedAt <= 0L || (nowMs - lastNotifiedAt) >= cooldownMs)) {
+        sendNotification("${dev.displayName}: received ${windowCount} target info point(s) outside the tracking window since ${formatTimeOfDay(windowStart)}. This suggests the device is still reporting while the app is inactive.")
+        current.lastNotifiedAt = nowMs
+    }
+
+    alerts[devKey] = current
+    state.outsideWindowTargetInfoAlert = alerts
 }
 
 private parseTargetPayload(String rawValue) {
@@ -1754,13 +2230,13 @@ private String buildDailySummary() {
         lines << "Ghosts today: ${summary.ghostsToday}"
         lines << "Detected, not persistent: ${summary.detectedGhosts ?: 0}"
         lines << "Persistent ghosts: ${summary.persistentGhosts}"
-        lines << "Targeted ghosts: ${summary.targetedGhosts ?: 0}"
-        lines << "Leaking targeted ghosts: ${summary.leakingGhosts ?: 0}"
-        lines << "Escaping targeted ghosts: ${summary.escapingGhosts ?: 0}"
+        lines << "Covered ghosts: ${summary.targetedGhosts ?: 0}"
+        lines << "Leaking covered ghosts: ${summary.leakingGhosts ?: 0}"
+        lines << "Escaping covered ghosts: ${summary.escapingGhosts ?: 0}"
         lines << "Busted ghosts: ${summary.bustedGhosts}"
-        lines << "Auto-targeted persistent: ${summary.autoBusted ?: 0}"
-        lines << "Manual-targeted persistent: ${summary.manualBusted ?: 0}"
-        lines << "Untargeted persistent: ${summary.unbusted ?: 0}"
+        lines << "Auto-covered persistent: ${summary.autoBusted ?: 0}"
+        lines << "Manual-covered persistent: ${summary.manualBusted ?: 0}"
+        lines << "Uncovered persistent: ${summary.unbusted ?: 0}"
     }
 
     lines.join("\n")
@@ -1787,23 +2263,9 @@ private void pruneOldActivationStarts() {
 }
 
 private List getTodayClusters(deviceId) {
-    def devKey = deviceKey(deviceId)
-    def clusterLocks = (state.todayClusterLocks ?: [:]) as Map
-    if (clusterLocks[devKey] == true) {
-        return []
-    }
-
-    def dev = mmwaveDevices?.find { deviceKey(it?.id) == devKey }
-    try {
-        state.todayClusterLocks = clusterLocks + [(devKey): true]
-        def effectivePoints = filterPointsForGhostDetection(getPointsForDevice(deviceId), dev)
-        return detectClusters(effectivePoints)
-    } finally {
-        def updatedLocks = ((state.todayClusterLocks ?: [:]) as Map).findAll { key, value ->
-            key != devKey
-        }
-        state.todayClusterLocks = updatedLocks
-    }
+    def dev = mmwaveDevices?.find { deviceKey(it?.id) == deviceKey(deviceId) }
+    def effectivePoints = filterPointsForGhostDetection(getPointsForDevice(deviceId), dev)
+    detectClusters(effectivePoints)
 }
 
 private List getAllConfiguredCorrelationTrackers() {
@@ -1881,14 +2343,14 @@ private String getDynamicActivationSelection(deviceId, Integer areaIndex) {
 }
 
 private List getCorrelatedActivationEvents(deviceId) {
-    buildCorrelationTrackerCards(deviceId).collectMany { card ->
+    buildCorrelationTrackerCards(deviceId, getDisplayGhostEpisodeCount(deviceId)).collectMany { card ->
         ((card.events ?: []) as List).findAll { (it.type ?: "") == "value" && it.selectionKey }.collect { event ->
             event + [cardTitle: card.title]
         }
     }
 }
 
-private List buildCorrelationTrackerCards(deviceId) {
+private List buildCorrelationTrackerCards(deviceId, Integer displayEpisodeCountOverride = null) {
     def devKey = deviceKey(deviceId)
     def configuredTrackers = getConfiguredCorrelationTrackersForDevice(devKey)
     def cards = []
@@ -1898,11 +2360,14 @@ private List buildCorrelationTrackerCards(deviceId) {
         def events = []
         events.addAll(buildValueCorrelationEvents(tracker, aggregate))
         events.addAll(buildTransitionCorrelationEvents(tracker, aggregate))
+        def transitionAssessment = assessTransitionCorrelation(aggregate, displayEpisodeCountOverride)
         cards << [
                 trackerKey: "${tracker.deviceKey}:${tracker.attribute}",
                 title: "${tracker.deviceName} / ${tracker.attribute}",
                 deviceName: tracker.deviceName,
                 attribute: tracker.attribute,
+                aggregate: aggregate,
+                transitionAssessment: transitionAssessment,
                 events: events,
                 hasEvents: !events.isEmpty()
         ]
@@ -2466,17 +2931,17 @@ private Double boundsVolume(Map bounds) {
 private Map getGhostCounts(String devKey, List todayClusters) {
     def stableClusters = (state.stabilityData[devKey] ?: []) as List
     def bustCounts = getPersistentBustSourceCountsForDevice(devKey)
-    def activeGhosts = stableClusters.findAll { !isGhostHistoricallyBusted(devKey, it) && ((it.daysSeen ?: 0) > 0) }
+    def activeGhosts = stableClusters.findAll { !checkGhostHistoricallyBusted(devKey, it) && ((it.daysSeen ?: 0) > 0) }
     def displayStates = activeGhosts.collect { determineGhostState(devKey, it) }
 
     [
             ghostsToday: todayClusters?.size() ?: 0,
             detectedGhosts: displayStates.count { it == "Detected" },
             persistentGhosts: displayStates.count { it == "Persistent" },
-            targetedGhosts: displayStates.count { it == "Targeted" },
-            leakingGhosts: activeGhosts.count { getEscapingGhostMode(devKey, it) in ["adjacent", "both"] },
+            targetedGhosts: displayStates.count { it == "Covered" },
+            leakingGhosts: activeGhosts.count { hasCoverageFailureInsideArea(devKey, it as Map) },
             escapingGhosts: displayStates.count { it == "Escaping" },
-            bustedGhosts: stableClusters.count { determineGhostState(devKey, it) == "Busted" || isGhostHistoricallyBusted(devKey, it) },
+            bustedGhosts: stableClusters.count { determineGhostState(devKey, it) == "Busted" || checkGhostHistoricallyBusted(devKey, it) },
             autoBusted: bustCounts.autoBusted,
             manualBusted: bustCounts.manualBusted,
             unbusted: bustCounts.unbusted
@@ -2493,10 +2958,10 @@ private Map getDisplayGhostCounts(String devKey, List todayClusters) {
             ghostsToday: todayClusters?.size() ?: 0,
             detectedGhosts: visibleStates.count { it == "Detected" },
             persistentGhosts: visibleStates.count { it == "Persistent" },
-            targetedGhosts: visibleStates.count { it == "Targeted" },
-            leakingGhosts: visibleGhosts.count { getEscapingGhostMode(devKey, it as Map) in ["adjacent", "both"] },
+            targetedGhosts: visibleStates.count { it == "Covered" },
+            leakingGhosts: visibleGhosts.count { hasCoverageFailureInsideArea(devKey, it as Map) },
             escapingGhosts: visibleStates.count { it == "Escaping" },
-            bustedGhosts: stableClusters.count { determineGhostState(devKey, it as Map) == "Busted" || isGhostHistoricallyBusted(devKey, it as Map) },
+            bustedGhosts: stableClusters.count { determineGhostState(devKey, it as Map) == "Busted" || checkGhostHistoricallyBusted(devKey, it as Map) },
             autoBusted: bustCounts.autoBusted,
             manualBusted: bustCounts.manualBusted,
             unbusted: bustCounts.unbusted
@@ -2504,7 +2969,7 @@ private Map getDisplayGhostCounts(String devKey, List todayClusters) {
 }
 
 private boolean shouldDisplayActiveGhost(String devKey, Map cluster) {
-    if (!cluster || (cluster.daysSeen ?: 0) <= 0 || isGhostHistoricallyBusted(devKey, cluster)) {
+    if (!cluster || (cluster.daysSeen ?: 0) <= 0 || checkGhostHistoricallyBusted(devKey, cluster)) {
         return false
     }
 
@@ -2513,7 +2978,7 @@ private boolean shouldDisplayActiveGhost(String devKey, Map cluster) {
         return isWithinDisplayGrace(cluster)
     }
 
-    state in ["Persistent", "Targeted", "Escaping"]
+    state in ["Persistent", "Covered", "Escaping"]
 }
 
 private boolean shouldDisplayHistoricalGhost(String devKey, Map cluster) {
@@ -2521,19 +2986,32 @@ private boolean shouldDisplayHistoricalGhost(String devKey, Map cluster) {
         return false
     }
 
-    def state = determineGhostState(devKey, cluster)
+    def state = (cluster?.ghostStateSnapshot == "Targeted") ? "Covered" : (cluster?.ghostStateSnapshot as String)
+    if (!state) {
+        state = (cluster?.maxStateReached == "Targeted") ? "Covered" : (cluster?.maxStateReached as String)
+    }
+    if (!state) {
+        state = isClusterPersistent(cluster) ? "Persistent" : "Detected"
+    }
     if (state == "Detected") {
         return isWithinDisplayGrace(cluster)
     }
 
-    state in ["Persistent", "Targeted", "Escaping", "Busted"]
+    state in ["Persistent", "Covered", "Escaping", "Busted"]
 }
 
 private List getTrackedGhostsForDisplay(deviceId) {
     def devKey = deviceKey(deviceId)
-    getStableClusters(deviceId).findAll { cluster ->
+    def cache = getPageRenderCacheSection("trackedGhosts")
+    if (cache.containsKey(devKey)) {
+        return (cache[devKey] ?: []) as List
+    }
+
+    def ghosts = getStableClusters(deviceId).findAll { cluster ->
         shouldDisplayHistoricalGhost(devKey, cluster as Map)
     }.collect { cloneCluster(it as Map) }
+    cache[devKey] = ghosts
+    ghosts
 }
 
 private boolean isWithinDisplayGrace(Map cluster) {
@@ -2544,13 +3022,13 @@ def generateRecommendation() {
     def totalDays = state.totalDays ?: 0
     if (totalDays <= 0) {
         state.recommendation = [message: "Insufficient data to generate a recommendation."]
+        state.recommendations = []
         return state.recommendation
     }
 
-    def best = null
-    def bestScore = -1.0d
-
-    def blockedByCapacity = false
+    def plans = []
+    def blockedByCapacityDevices = []
+    def belowThresholdCandidates = []
 
     (state.stabilityData ?: [:]).each { devKey, clusters ->
         def dev = mmwaveDevices?.find { deviceKey(it.id) == devKey }
@@ -2558,31 +3036,55 @@ def generateRecommendation() {
             def stabilityPct = calculateStabilityPercent(cluster)
             def plan = buildRecommendationPlan(dev, cluster, stabilityPct)
             if (plan?.blockedByCapacity) {
-                blockedByCapacity = true
+                blockedByCapacityDevices << (dev?.displayName ?: devKey)
             }
-            if (plan && !plan.blockedByCapacity && stabilityPct >= safeStableThreshold() && stabilityPct > bestScore) {
-                best = [
+            if (plan && !plan.blockedByCapacity && stabilityPct >= safeStableThreshold()) {
+                plans << [
                         deviceId: devKey,
+                        deviceName: dev?.displayName ?: devKey,
                         center: clonePoint(cluster.center),
                         bounds: cloneBounds(plan.bounds),
                         radius: cluster.radius,
                         density: cluster.density,
                         stabilityPct: Math.min(100.0d, stabilityPct as Double),
                         action: plan.action,
-                        areaIndex: plan.areaIndex
+                        areaIndex: plan.areaIndex,
+                        reason: plan.reason
                 ]
-                bestScore = stabilityPct
+            } else if (plan && !plan.blockedByCapacity) {
+                belowThresholdCandidates << [
+                        deviceId: devKey,
+                        deviceName: dev?.displayName ?: devKey,
+                        stabilityPct: Math.min(100.0d, stabilityPct as Double)
+                ]
             }
         }
     }
 
-    if (!best) {
-        state.recommendation = [message: blockedByCapacity ? "Recommendation available for a persistent ghost, but there is no free interference area and no overlapping area that can be expanded automatically." : "No recommendation available right now because no persistent ghost currently qualifies for targeting."]
+    plans = plans.sort { a, b ->
+        ((b.stabilityPct ?: 0.0d) as Double) <=> ((a.stabilityPct ?: 0.0d) as Double)
+    }
+    plans = plans.groupBy { it.deviceId }.collect { devId, devicePlans ->
+        (devicePlans as List).sort { a, b ->
+            ((b.stabilityPct ?: 0.0d) as Double) <=> ((a.stabilityPct ?: 0.0d) as Double)
+        }[0]
+    }.sort { a, b ->
+        ((b.stabilityPct ?: 0.0d) as Double) <=> ((a.stabilityPct ?: 0.0d) as Double)
+    }
+    state.recommendations = plans
+
+    if (!plans) {
+        def blockedDevices = blockedByCapacityDevices.unique().sort()
+        def message = blockedDevices ?
+                "Persistent ghost recommendations exist for ${blockedDevices.join(', ')}, but those devices do not currently have a free interference area and no overlapping area can be expanded automatically." :
+                belowThresholdCandidates ?
+                        "No recommendation available right now." :
+                        "No recommendation available right now because no persistent ghost currently qualifies for targeting."
+        state.recommendation = [message: message]
         return state.recommendation
     }
 
-    def dev = mmwaveDevices?.find { deviceKey(it.id) == best.deviceId }
-    best.deviceName = dev?.displayName ?: best.deviceId
+    def best = plans[0]
     state.recommendation = best
     best
 }
@@ -2619,6 +3121,7 @@ private void applySelectedZones(String devKey) {
     rememberAppliedZones(devKey, appliedZoneSpecs, "manual")
     updateClusterBustMode(dev.id, [selectedCluster], appliedZoneSpecs, "manual")
     syncClusterTargetsForDevice(devKey)
+    refreshRecommendation()
 }
 
 private void applySelectedZoneForArea(String devKey, Integer areaIndex) {
@@ -2651,6 +3154,7 @@ private void applySelectedZoneForArea(String devKey, Integer areaIndex) {
     rememberAppliedZones(devKey, appliedZoneSpecs, "manual")
     updateClusterBustMode(dev.id, [selectedCluster], appliedZoneSpecs, "manual")
     syncClusterTargetsForDevice(devKey)
+    refreshRecommendation()
 }
 
 private void applyAllSelectedZones(String devKey) {
@@ -2706,6 +3210,7 @@ private void applyAllSelectedZones(String devKey) {
     }
     debugLog("applyAllSelectedZones(${dev.displayName}): applied=${appliedZoneSpecs.size()}, cleared=${clearedAreaIndexes}")
     syncClusterTargetsForDevice(devKey)
+    refreshRecommendation()
 }
 
 private void applyAutomaticGhostBusting(dev) {
@@ -2782,6 +3287,7 @@ private void applyAutomaticGhostBusting(dev) {
 private List applyZonesToDevice(dev, List zoneSpecs, String sourceLabel) {
     def appliedZoneSpecs = []
     def deviceBounds = clampReferenceBounds(dev)
+    def devKey = deviceKey(dev?.id)
 
     (zoneSpecs ?: []).each { zoneSpec ->
         def zoneBounds = clampBoundsToReference(zoneSpec.bounds, deviceBounds)
@@ -2795,7 +3301,11 @@ private List applyZonesToDevice(dev, List zoneSpecs, String sourceLabel) {
             return
         }
 
-        def bounds = integerBounds(zoneBounds)
+        def bounds = integerBoundsCovering(zoneBounds)
+        if (!isValidBounds(bounds)) {
+            warnLog("Skipped interference area with non-covering bounds for ${dev.displayName} from ${sourceLabel}")
+            return
+        }
         debugLog("Applying interference area ${areaIndex} to ${dev.displayName} from ${sourceLabel}: ${JsonOutput.toJson(bounds)}")
         dev.mmWaveSetInterferenceArea(
                 areaIndex,
@@ -2806,9 +3316,17 @@ private List applyZonesToDevice(dev, List zoneSpecs, String sourceLabel) {
                 bounds.zmin,
                 bounds.zmax
         )
+        recordPendingInterferenceAreaWrite(devKey, areaIndex, bounds)
         appliedZoneSpecs << [
                 areaIndex: areaIndex,
-                bounds: cloneBounds(zoneBounds),
+                bounds: cloneBounds([
+                        xmin: bounds.xmin as Double,
+                        xmax: bounds.xmax as Double,
+                        ymin: bounds.ymin as Double,
+                        ymax: bounds.ymax as Double,
+                        zmin: bounds.zmin as Double,
+                        zmax: bounds.zmax as Double
+                ]),
                 cluster: zoneSpec.cluster
         ]
     }
@@ -2831,9 +3349,9 @@ private Map buildRecommendationPlan(dev, Map cluster, BigDecimal stabilityPct) {
         return null
     }
 
-    def rememberedAreas = getRememberedInterferenceAreas(devKey)
-    def targetedArea = getRememberedAreaForGhost(devKey, cluster)
-    if (targetedArea && isGhostLeaking(devKey, cluster)) {
+    def qualifiesForRecommendation = true
+    def targetedArea = findLiveAreaForGhost(devKey, cluster)
+    if (targetedArea && checkGhostLeaking(devKey, cluster)) {
         def expandedBounds = clampBoundsToReference(unionBounds(targetedArea.bounds, clampedClusterBounds), deviceBounds)
         if (isValidBounds(expandedBounds) && !sameBounds(expandedBounds, targetedArea.bounds)) {
             return [
@@ -2841,19 +3359,21 @@ private Map buildRecommendationPlan(dev, Map cluster, BigDecimal stabilityPct) {
                     areaIndex: targetedArea.areaIndex,
                     bounds: expandedBounds,
                     stabilityPct: stabilityPct,
-                    reason: "leaking"
+                    reason: "leaking",
+                    qualifiesForRecommendation: qualifiesForRecommendation
             ]
         }
     }
 
-    def containingArea = rememberedAreas.find { area ->
+    def activeAreas = getActiveRememberedInterferenceAreas(devKey)
+    def containingArea = activeAreas.find { area ->
         isBoundsWithinBounds(clampedClusterBounds, area.bounds)
     }
     if (containingArea) {
         return null
     }
 
-    def overlappingArea = rememberedAreas.find { area ->
+    def overlappingArea = activeAreas.find { area ->
         boundsOverlap(clampedClusterBounds, area.bounds)
     }
     if (overlappingArea) {
@@ -2866,22 +3386,23 @@ private Map buildRecommendationPlan(dev, Map cluster, BigDecimal stabilityPct) {
                 areaIndex: overlappingArea.areaIndex,
                 bounds: expandedBounds,
                 stabilityPct: stabilityPct,
-                reason: "overlap"
+                reason: "overlap",
+                qualifiesForRecommendation: qualifiesForRecommendation
         ]
     }
 
-    def availableIndexes = (0..3).findAll { idx ->
-        !rememberedAreas.any { it.areaIndex == idx }
-    }
+    def availableIndexes = getFreeInterferenceAreaIndexes(devKey)
     if (!availableIndexes) {
-        return [blockedByCapacity: true]
+        return [blockedByCapacity: true, qualifiesForRecommendation: qualifiesForRecommendation]
     }
 
     [
             action: "set",
             areaIndex: availableIndexes[0],
             bounds: clampedClusterBounds,
-            stabilityPct: stabilityPct
+            stabilityPct: stabilityPct,
+            reason: "persistent",
+            qualifiesForRecommendation: qualifiesForRecommendation
     ]
 }
 
@@ -2898,9 +3419,9 @@ private void applyAutomaticTargetedAreaExpansion(dev) {
     }
 
     stableClusters.findAll { cluster ->
-        !isGhostBusted(devKey, cluster) && isGhostLeaking(devKey, cluster)
+        !checkGhostBusted(devKey, cluster) && checkGhostLeaking(devKey, cluster)
     }.each { cluster ->
-        def rememberedArea = getRememberedAreaForGhost(devKey, cluster)
+        def rememberedArea = findLiveAreaForGhost(devKey, cluster)
         if (!rememberedArea?.bounds) {
             return
         }
@@ -2912,7 +3433,8 @@ private void applyAutomaticTargetedAreaExpansion(dev) {
 
         def appliedZoneSpecs = applyZonesToDevice(dev, [[areaIndex: rememberedArea.areaIndex, bounds: expandedBounds, cluster: cluster]], "targeted ghost expansion")
         if (appliedZoneSpecs) {
-            rememberInterferenceArea(devKey, rememberedArea.areaIndex as Integer, expandedBounds, rememberedArea.source ?: "manual", rememberedArea.dynamic as Map)
+            def metadata = getRememberedInterferenceAreaMetadata(devKey, rememberedArea.areaIndex as Integer)
+            rememberInterferenceArea(devKey, rememberedArea.areaIndex as Integer, expandedBounds, metadata.source ?: rememberedArea.source ?: "manual", metadata.dynamic as Map)
         }
     }
 
@@ -2968,6 +3490,7 @@ private void clearManagedZoneIndexes(dev, List zoneIndexes) {
                 clearedBounds.zmin,
                 clearedBounds.zmax
         )
+        recordPendingInterferenceAreaWrite(deviceKey(dev.id), zoneIdx as Integer, clearedBounds)
     }
 }
 
@@ -3005,6 +3528,115 @@ private List getRememberedInterferenceAreas(String devKey) {
     rememberedInterferenceAreasFromMetadata(metadata)
 }
 
+private Long safePendingInterferenceWriteMs() {
+    15000L
+}
+
+private void prunePendingInterferenceAreaWrites(String devKey = null) {
+    def nowMs = now()
+    def current = ((state.pendingInterferenceAreaWrites ?: [:]) as Map).collectEntries { key, value ->
+        def writes = ((value ?: [:]) as Map).findAll { idx, spec ->
+            ((spec?.expiresAt ?: 0L) as Long) > nowMs
+        }
+        writes ? [(key): writes] : [:]
+    }
+    if (devKey) {
+        state.pendingInterferenceAreaWrites = current
+        return
+    }
+    state.pendingInterferenceAreaWrites = current
+}
+
+private void recordPendingInterferenceAreaWrite(String devKey, Integer areaIndex, Map bounds) {
+    if (!devKey || areaIndex == null || !isValidBounds(bounds)) {
+        return
+    }
+    prunePendingInterferenceAreaWrites(devKey)
+    def current = (((state.pendingInterferenceAreaWrites ?: [:])[devKey] ?: [:]) as Map).collectEntries { key, value -> [(key): value] }
+    current[areaIndex.toString()] = [
+            bounds: cloneBounds(bounds),
+            writtenAt: now(),
+            expiresAt: now() + safePendingInterferenceWriteMs()
+    ]
+    state.pendingInterferenceAreaWrites[devKey] = current
+}
+
+private List getPendingInterferenceAreaWrites(String devKey) {
+    prunePendingInterferenceAreaWrites(devKey)
+    (((state.pendingInterferenceAreaWrites ?: [:])[devKey] ?: [:]) as Map).collect { idx, spec ->
+        [
+                areaIndex: idx as Integer,
+                bounds: cloneBounds(spec.bounds as Map),
+                source: "pending-device-write",
+                updatedAt: spec.writtenAt ?: 0L,
+                dynamic: null,
+                dynamicActive: false
+        ]
+    }.sort { a, b -> (a.areaIndex as Integer) <=> (b.areaIndex as Integer) }
+}
+
+private Map getRememberedInterferenceAreaMetadata(String devKey, Integer areaIndex) {
+    if (!devKey || areaIndex == null) {
+        return [:]
+    }
+    ((((state.interferenceAreas ?: [:])[devKey] ?: [:]) as Map)[areaIndex.toString()] ?: [:]) as Map
+}
+
+private List loadLiveInterferenceAreas(String devKey) {
+    def cache = getPageRenderCacheSection("liveInterferenceAreas")
+    if (cache.containsKey(devKey)) {
+        return (cache[devKey] ?: []) as List
+    }
+
+    def metadata = (((state.interferenceAreas ?: [:])[devKey] ?: [:]) as Map)
+    def pendingAreas = getPendingInterferenceAreaWrites(devKey)
+    def loadGuards = getPageRenderCacheSection("liveInterferenceAreaLoads")
+    if (loadGuards[devKey]) {
+        def fallback = buildFallbackLiveInterferenceAreas(metadata, pendingAreas)
+        cache[devKey] = fallback
+        return fallback
+    }
+
+    // Guard against re-entrant lookups for the same device while the list is being built.
+    cache[devKey] = []
+    loadGuards[devKey] = true
+
+    try {
+        def dev = mmwaveDevices?.find { deviceKey(it?.id) == devKey }
+        def rawCache = getPageRenderCacheSection("rawDeviceInterferenceAreas")
+        def deviceAreas = dev ? ((rawCache.containsKey(devKey) ? rawCache[devKey] : (readDeviceInterferenceAreas(dev) ?: [])) ?: []) as List : []
+
+        if (!dev && !pendingAreas) {
+            def fallback = rememberedInterferenceAreasFromMetadata(metadata)
+            cache[devKey] = fallback
+            return fallback
+        }
+
+        def areas = mergeDeviceInterferenceAreasWithMetadata(deviceAreas, metadata, pendingAreas)
+        cache[devKey] = areas
+        areas
+    } finally {
+        loadGuards.remove(devKey)
+    }
+}
+
+private List findActiveLiveInterferenceAreas(String devKey) {
+    getCoverageInterferenceAreas(devKey).findAll { area ->
+        area?.bounds && !isInactiveInterferenceAreaBounds(area.bounds as Map)
+    }
+}
+
+private List getActiveRememberedInterferenceAreas(String devKey) {
+    loadLiveInterferenceAreas(devKey).findAll { area ->
+        area?.bounds && !isInactiveInterferenceAreaBounds(area.bounds as Map)
+    }
+}
+
+private List<Integer> getFreeInterferenceAreaIndexes(String devKey) {
+    def activeIndexes = findActiveLiveInterferenceAreas(devKey).collect { it.areaIndex as Integer }
+    (0..3).findAll { !activeIndexes.contains(it) }.collect { it as Integer }
+}
+
 private List rememberedInterferenceAreasFromMetadata(Map metadata) {
     (metadata ?: [:]).collect { idx, area ->
         [
@@ -3021,7 +3653,9 @@ private List rememberedInterferenceAreasFromMetadata(Map metadata) {
 private List readDeviceInterferenceAreas(dev) {
     def readAt = now()
     def areas = (0..3).collect { areaIndex ->
-        def raw = dev.currentValue("interferenceArea${areaIndex}")?.toString()
+        def attributeName = "interferenceArea" + areaIndex
+        def rawValue = dev.currentValue(attributeName)
+        def raw = rawValue instanceof CharSequence || rawValue instanceof Number ? rawValue.toString() : null
         def bounds = parseJsonMap(raw)
         if (!isValidBounds(bounds) && !isInactiveInterferenceAreaBounds(bounds)) {
             return null
@@ -3060,7 +3694,9 @@ private boolean hasAnyDeviceInterferenceAreaAttribute(dev) {
         return false
     }
     (0..3).any { areaIndex ->
-        def raw = dev.currentValue("interferenceArea${areaIndex}")?.toString()
+        def attributeName = "interferenceArea" + areaIndex
+        def rawValue = dev.currentValue(attributeName)
+        def raw = rawValue instanceof CharSequence || rawValue instanceof Number ? rawValue.toString() : null
         raw?.trim()
     }
 }
@@ -3158,7 +3794,7 @@ private void rememberAppliedZones(String devKey, List appliedZoneSpecs, String s
 }
 
 private List getAutoAssignableIndexes(String devKey, Integer neededCount) {
-    def remembered = getRememberedInterferenceAreas(devKey).findAll { !isInactiveInterferenceAreaBounds(it.bounds as Map) }
+    def remembered = findActiveLiveInterferenceAreas(devKey)
     def reserved = remembered.findAll { it.source != "auto" }.collect { it.areaIndex as Integer }
     def existingAuto = remembered.findAll { it.source == "auto" }.collect { it.areaIndex as Integer }.sort()
     def free = (0..3).findAll { !reserved.contains(it) && !existingAuto.contains(it) }
@@ -3483,6 +4119,8 @@ private void clearDeviceStats(String devKey) {
     state.dailyOutOfBoundsPoints?.remove(devKey)
     state.ignoredOutsideWindowPoints?.remove(devKey)
     state.lastIgnoredOutsideWindowAt?.remove(devKey)
+    state.outsideWindowTargetInfoAlert?.remove(devKey)
+    state.pendingMmWaveTargetInfoVerification?.remove(devKey)
     state.stabilityData?.remove(devKey)
     state.archivedGhosts?.remove(devKey)
     state.archivedGhostVisibility?.remove(devKey)
@@ -3511,6 +4149,15 @@ private void clearPendingPoints(String devKey) {
     state.dailyOutOfBoundsPoints?.remove(devKey)
     state.correlationGhostPresence?.remove(devKey)
     state.correlationEpisodeState?.remove(devKey)
+}
+
+private void clearIgnoredOutsideWindow(String devKey) {
+    if (!devKey) {
+        return
+    }
+    state.ignoredOutsideWindowPoints?.remove(devKey)
+    state.lastIgnoredOutsideWindowAt?.remove(devKey)
+    state.outsideWindowTargetInfoAlert?.remove(devKey)
 }
 
 private void clearTrackedGhost(String devKey, Integer displayIndex) {
@@ -3648,7 +4295,7 @@ private void expandTrackedGhost(String devKey, Integer displayIndex) {
         return
     }
 
-    def rememberedArea = getRememberedAreaForGhost(devKey, selectedGhost)
+    def rememberedArea = findLiveAreaForGhost(devKey, selectedGhost)
     if (!rememberedArea?.bounds || !isValidBounds(selectedGhost?.bounds)) {
         return
     }
@@ -3660,9 +4307,55 @@ private void expandTrackedGhost(String devKey, Integer displayIndex) {
 
     def appliedZoneSpecs = applyZonesToDevice(dev, [[areaIndex: rememberedArea.areaIndex, bounds: expandedBounds, cluster: selectedGhost]], "manual targeted ghost expansion")
     if (appliedZoneSpecs) {
-        rememberInterferenceArea(devKey, rememberedArea.areaIndex as Integer, expandedBounds, rememberedArea.source ?: "manual", rememberedArea.dynamic as Map)
+        def appliedSpec = appliedZoneSpecs.find { (it.areaIndex as Integer) == (rememberedArea.areaIndex as Integer) } as Map
+        def metadata = getRememberedInterferenceAreaMetadata(devKey, rememberedArea.areaIndex as Integer)
+        rememberInterferenceArea(devKey, rememberedArea.areaIndex as Integer, expandedBounds, metadata.source ?: rememberedArea.source ?: "manual", metadata.dynamic as Map)
         syncClusterTargetsForDevice(devKey)
         refreshStoredGhostSnapshotsForDevice(dev.id)
+        refreshRecommendation()
+        refreshDeviceInterferenceAreas(devKey, false)
+        if (appliedSpec?.bounds) {
+            startStatsPageAreaRefresh(dev.id?.toString(), devKey, rememberedArea.areaIndex as Integer, appliedSpec.bounds as Map, 5000L, 1)
+        }
+    }
+}
+
+private void targetTrackedGhost(String devKey, Integer displayIndex) {
+    if (!devKey || displayIndex == null || displayIndex < 1) {
+        return
+    }
+
+    def dev = mmwaveDevices?.find { deviceKey(it?.id) == devKey }
+    if (!dev) {
+        return
+    }
+
+    def displayGhosts = getTrackedGhostsForDisplay(dev.id)
+    def selectedGhost = (displayGhosts && displayGhosts.size() >= displayIndex) ? (displayGhosts[displayIndex - 1] as Map) : null
+    if (!selectedGhost?.bounds || findLiveAreaForGhost(devKey, selectedGhost) != null) {
+        return
+    }
+
+    def freeIndexes = getFreeInterferenceAreaIndexes(devKey)
+    if (!freeIndexes) {
+        warnLog("No free interference area indexes remain for ${dev.displayName}.")
+        return
+    }
+
+    def clampedBounds = clampBoundsToDevice(selectedGhost.bounds, dev)
+    if (!isValidBounds(clampedBounds)) {
+        warnLog("Selected ghost bounds are outside the device boundary for ${dev.displayName}.")
+        return
+    }
+
+    def areaIndex = freeIndexes[0] as Integer
+    def appliedZoneSpecs = applyZonesToDevice(dev, [[areaIndex: areaIndex, bounds: cloneBounds(clampedBounds), cluster: selectedGhost]], "manual targeted ghost shortcut")
+    if (appliedZoneSpecs) {
+        rememberAppliedZones(devKey, appliedZoneSpecs, "manual")
+        updateClusterBustMode(dev.id, [selectedGhost], appliedZoneSpecs, "manual")
+        syncClusterTargetsForDevice(devKey)
+        refreshStoredGhostSnapshotsForDevice(dev.id)
+        refreshRecommendation()
     }
 }
 
@@ -3707,8 +4400,8 @@ private void archiveExpiredGhosts(String devKey, List retiringClusters) {
 private Map buildArchivedGhost(String devKey, Map cluster) {
     def seenHistory = ((cluster?.seenHistory ?: []) as List).collect { it as Integer }.sort()
     def archivedBounds = isValidBounds(cluster?.bounds) ? integerBounds(cluster.bounds) : cloneBounds(cluster?.bounds)
-    def rememberedArea = getRememberedAreaForGhost(devKey, cluster)
-    def archivedState = cluster?.maxStateReached ?: cluster?.ghostStateSnapshot ?: (cluster?.targetAreaIndex != null ? "Targeted" : (isClusterPersistent(cluster) ? "Persistent" : "Detected"))
+    def rememberedArea = findRememberedAreaForGhost(devKey, cluster)
+    def archivedState = cluster?.maxStateReached ?: cluster?.ghostStateSnapshot ?: (checkGhostTargeted(devKey, cluster) ? "Covered" : (isClusterPersistent(cluster) ? "Persistent" : "Detected"))
     [
             center: clonePoint(cluster?.center ?: boundsCenter(archivedBounds)),
             bounds: cloneBounds(archivedBounds),
@@ -3818,7 +4511,7 @@ private Integer ghostStateRank(String stateName) {
             return 5
         case "Escaping":
             return 4
-        case "Targeted":
+        case "Covered":
             return 3
         case "Persistent":
             return 2
@@ -3841,7 +4534,7 @@ private void updateClusterMaxStatesForDevice(deviceId) {
     }
 
     stableClusters.each { cluster ->
-        def currentState = cluster?.ghostStateSnapshot ?: (cluster?.targetAreaIndex != null ? "Targeted" : (isClusterPersistent(cluster as Map) ? "Persistent" : "Detected"))
+        def currentState = cluster?.ghostStateSnapshot ?: (checkGhostTargeted(devKey, cluster as Map) ? "Covered" : (isClusterPersistent(cluster as Map) ? "Persistent" : "Detected"))
         cluster.maxStateReached = promoteGhostState(cluster.maxStateReached as String, currentState)
     }
     state.stabilityData[devKey] = stableClusters
@@ -3884,6 +4577,20 @@ private Map integerBounds(Map bounds) {
     ]
 }
 
+private Map integerBoundsCovering(Map bounds) {
+    if (!isValidBounds(bounds)) {
+        return null
+    }
+    [
+            xmin: Math.floor((bounds.xmin ?: 0.0d) as Double) as Integer,
+            xmax: Math.ceil((bounds.xmax ?: 0.0d) as Double) as Integer,
+            ymin: Math.floor((bounds.ymin ?: 0.0d) as Double) as Integer,
+            ymax: Math.ceil((bounds.ymax ?: 0.0d) as Double) as Integer,
+            zmin: Math.floor((bounds.zmin ?: 0.0d) as Double) as Integer,
+            zmax: Math.ceil((bounds.zmax ?: 0.0d) as Double) as Integer
+    ]
+}
+
 private List getPointsForDevice(deviceId) {
     ((state.dailyPoints[deviceKey(deviceId)] ?: []) as List).collect { clonePoint(it) }
 }
@@ -3895,32 +4602,28 @@ private List getOutOfBoundsPointsForDevice(deviceId) {
 private List getStableClusters(deviceId) {
     def devKey = deviceKey(deviceId)
     ((state.stabilityData[devKey] ?: []) as List).collect { cluster ->
-        def clone = cloneCluster(cluster)
+        def clone = [
+                center: clonePoint(cluster.center),
+                bounds: cloneBounds(cluster.bounds),
+                radius: cluster.radius ?: 0.0d,
+                density: cluster.density ?: 0,
+                points: [],
+                daysSeen: cluster.daysSeen ?: 0,
+                lastSeen: cluster.lastSeen ?: 0,
+                seenHistory: ((cluster.seenHistory ?: []) as List).collect { it },
+                activeDayHistory: ((cluster.activeDayHistory ?: []) as List).collect { it },
+                consecutiveSeen: cluster.consecutiveSeen ?: 0,
+                absentStreak: cluster.absentStreak ?: 0,
+                lastMatchedDay: cluster.lastMatchedDay ?: 0,
+                bustMode: cluster.bustMode,
+                targetSource: cluster.targetSource ?: cluster.bustMode,
+                targetAreaIndex: cluster.targetAreaIndex,
+                appliedBounds: cloneBounds(cluster.appliedBounds),
+                maxStateReached: cluster.maxStateReached
+        ] + ghostSnapshotFields(cluster)
         clone.stabilityPct = calculateStabilityPercent(cluster)
         clone
     }
-}
-
-private Map getClusterSummary(deviceId) {
-    def devKey = deviceKey(deviceId)
-    def stableClusters = getStableClusters(deviceId)
-    def persistentClusters = stableClusters.findAll { isClusterPersistent(it) && !isGhostTargeted(devKey, it) && !isGhostBusted(devKey, it) }
-    def targetedClusters = stableClusters.findAll { isGhostTargeted(devKey, it) && !isGhostBusted(devKey, it) }
-    def bustedClusters = stableClusters.findAll { isGhostBusted(devKey, it) }
-    def detectedClusters = stableClusters.findAll { !isClusterPersistent(it) && !isGhostTargeted(devKey, it) && !isGhostBusted(devKey, it) }
-    def bustCounts = getPersistentBustSourceCountsForDevice(devKey)
-
-    [
-            "Tracked clusters": stableClusters.size(),
-            "Detected, not persistent": detectedClusters.size(),
-            "Persistent": persistentClusters.size(),
-            "Targeted": targetedClusters.size(),
-            "Busted": bustedClusters.size(),
-            "Auto-targeted persistent": bustCounts.autoBusted,
-            "Manual-targeted persistent": bustCounts.manualBusted,
-            "Untargeted persistent": bustCounts.unbusted,
-            "Tracking days in window": getActiveTrackingDaysForDevice(deviceId)
-    ]
 }
 
 private Map getGhostSummaryStats(deviceId, String summaryView) {
@@ -3929,7 +4632,7 @@ private Map getGhostSummaryStats(deviceId, String summaryView) {
         return [
                 "Detected": summary.detectedGhosts ?: 0,
                 "Persistent": summary.persistentGhosts ?: 0,
-                "Targeted": summary.targetedGhosts ?: 0,
+                "Covered": summary.targetedGhosts ?: 0,
                 "Escaping": summary.escapingGhosts ?: 0,
                 "Busted": summary.bustedGhosts ?: 0
         ]
@@ -3939,7 +4642,7 @@ private Map getGhostSummaryStats(deviceId, String summaryView) {
     [
             "Detected": counts.detectedGhosts ?: 0,
             "Persistent": counts.persistentGhosts ?: 0,
-            "Targeted": counts.targetedGhosts ?: 0,
+            "Covered": counts.targetedGhosts ?: 0,
             "Escaping": counts.escapingGhosts ?: 0,
             "Busted": counts.bustedGhosts ?: 0
     ]
@@ -3949,18 +4652,18 @@ private Map getTrackingStats(deviceId, Map displayCounts, Map lastSummary, Map d
     def dev = mmwaveDevices?.find { deviceKey(it.id) == deviceKey(deviceId) }
     def devKey = deviceKey(deviceId)
     def outOfBounds = lastSummary.outOfBoundsPointCount ?: 0
-    def leaking = displayCounts.leakingGhosts ?: 0
+    def escaping = displayCounts.escapingGhosts ?: 0
     def escapingPoints = getEscapingPointCount(deviceId)
-    def pendingPointCount = (displayData?.pointsPendingProcessing ? ((displayData?.pendingPointCount ?: 0) as Integer) : 0) as Integer
+    def pendingPointCount = ((displayData?.pendingPointCount ?: 0) as Integer)
     def ignoredOutsideWindow = ((state.ignoredOutsideWindowPoints ?: [:])[devKey] ?: 0) as Integer
     def lastIgnoredOutsideWindowAt = ((state.lastIgnoredOutsideWindowAt ?: [:])[devKey] ?: null)
     def alertText = "None"
-    if (leaking > 0 && escapingPoints > 0) {
-        alertText = "${leaking} ghost(s) need area expansion and ${escapingPoints} in-area occupancy point(s) remain."
-    } else if (leaking > 0) {
-        alertText = "${leaking} ghost(s) may need targeted area expansion."
+    if (escaping > 0 && escapingPoints > 0) {
+        alertText = "${escaping} ghost(s) extend beyond interference areas and ${escapingPoints} point(s) are still leaking inside."
+    } else if (escaping > 0) {
+        alertText = "${escaping} ghost(s) extend beyond interference areas."
     } else if (escapingPoints > 0) {
-        alertText = "${escapingPoints} occupancy-contributing point(s) remain inside targeted areas."
+        alertText = "${escapingPoints} point(s) are still leaking inside configured interference areas."
     }
     [
             "Detection": getDeviceStatus(dev),
@@ -4005,73 +4708,67 @@ private Map getArchivedGhostSectionStats(deviceId, List visibleArchivedGhosts = 
 
 private Map getDisplayData(deviceId) {
     def devKey = deviceKey(deviceId)
-    def displayLocks = (state.displayDataLocks ?: [:]) as Map
+    def cache = getPageRenderCacheSection("displayData")
+    if (cache.containsKey(devKey)) {
+        return (cache[devKey] ?: [:]) as Map
+    }
+
     def currentPoints = getPointsForDevice(deviceId)
     def lastPoints = getSnapshotPoints(deviceId)
     def currentOutOfBounds = getOutOfBoundsPointsForDevice(deviceId)
     def lastOutOfBounds = getSnapshotOutOfBoundsPoints(deviceId)
-    def preferredPointSet = preferDisplayPointSet(currentPoints, lastPoints, currentOutOfBounds, lastOutOfBounds)
+    def preferredPointSet = preferDisplayPointSet(currentPoints, lastPoints, currentOutOfBounds, lastOutOfBounds, showPendingPointsOnGraphsEnabled())
     def limitedPointSet = limitPointsForGraph(preferredPointSet.points, preferredPointSet.outOfBoundsPoints)
-    def useLiveComputation = shouldUseLiveDisplayComputation(currentPoints, currentOutOfBounds)
     def snapshotClusters = getSnapshotClusters(deviceId)
     def totalPointCount = (((preferredPointSet.points ?: []) as List).size() + ((preferredPointSet.outOfBoundsPoints ?: []) as List).size()) as Integer
     def pendingPointCount = ((((currentPoints ?: []) as List).size() + ((currentOutOfBounds ?: []) as List).size())) as Integer
-
-    if (displayLocks[devKey] == true) {
-        return [
-                points: limitedPointSet.points,
-                outOfBoundsPoints: limitedPointSet.outOfBoundsPoints,
-                pointSource: preferredPointSet.source,
-                pointsPendingProcessing: preferredPointSet.pendingProcessing,
-                totalPointCount: totalPointCount,
-                pendingPointCount: pendingPointCount,
-                currentClusters: useLiveComputation ? [] : snapshotClusters,
-                historicalClusters: [],
-                selectableClusters: useLiveComputation ? [] : buildSelectableClusters(snapshotClusters, getHistoricalClustersForSelection(deviceId)),
-                archivedGhosts: [],
-                archivedGhostCount: getArchivedGhostCount(deviceId),
-                showArchivedGhosts: showArchivedGhostsEnabled(devKey)
-        ]
+    def historicalClusters = []
+    if (showHistoricalGhostOverlaysEnabled()) {
+        historicalClusters.addAll(getHistoricalClustersForDisplay(deviceId))
     }
-
-    try {
-        state.displayDataLocks = displayLocks + [(devKey): true]
-        def currentClusters = useLiveComputation ? getTodayClusters(deviceId) : snapshotClusters
-        def historicalClusters = []
-        if (showHistoricalGhostOverlaysEnabled()) {
-            historicalClusters.addAll(getHistoricalClustersForDisplay(deviceId))
-        }
-        def archivedGhosts = showArchivedGhostsEnabled(devKey) ? getArchivedGhosts(deviceId) : []
-        if (archivedGhosts) {
-            historicalClusters.addAll(getArchivedGhostsForGraph(deviceId))
-        }
-        def selectableHistoricalClusters = getHistoricalClustersForSelection(deviceId)
-
-        return [
-                points: limitedPointSet.points,
-                outOfBoundsPoints: limitedPointSet.outOfBoundsPoints,
-                pointSource: preferredPointSet.source,
-                pointsPendingProcessing: preferredPointSet.pendingProcessing,
-                totalPointCount: totalPointCount,
-                pendingPointCount: pendingPointCount,
-                currentClusters: currentClusters,
-                historicalClusters: historicalClusters,
-                selectableClusters: buildSelectableClusters(currentClusters, selectableHistoricalClusters),
-                archivedGhosts: archivedGhosts,
-                archivedGhostCount: getArchivedGhostCount(deviceId),
-                showArchivedGhosts: showArchivedGhostsEnabled(devKey)
-        ]
-    } finally {
-        def updatedLocks = ((state.displayDataLocks ?: [:]) as Map).findAll { key, value ->
-            key != devKey
-        }
-        state.displayDataLocks = updatedLocks
+    def archivedGhosts = showArchivedGhostsEnabled(devKey) ? getArchivedGhosts(deviceId) : []
+    if (archivedGhosts) {
+        historicalClusters.addAll(getArchivedGhostsForGraph(deviceId))
     }
+    def selectableHistoricalClusters = getHistoricalClustersForSelection(deviceId)
+
+    def result = [
+            points: limitedPointSet.points,
+            outOfBoundsPoints: limitedPointSet.outOfBoundsPoints,
+            pointSource: preferredPointSet.source,
+            pointsPendingProcessing: preferredPointSet.pendingProcessing,
+            totalPointCount: totalPointCount,
+            pendingPointCount: pendingPointCount,
+            currentClusters: snapshotClusters,
+            historicalClusters: historicalClusters,
+            selectableClusters: buildSelectableClusters(snapshotClusters, selectableHistoricalClusters),
+            archivedGhosts: archivedGhosts,
+            archivedGhostCount: getArchivedGhostCount(deviceId),
+            showArchivedGhosts: showArchivedGhostsEnabled(devKey)
+    ]
+    cache[devKey] = result
+    result
 }
 
-private Map preferDisplayPointSet(List currentPoints, List lastPoints, List currentOutOfBounds, List lastOutOfBounds) {
+private Map preferDisplayPointSet(List currentPoints, List lastPoints, List currentOutOfBounds, List lastOutOfBounds, boolean graphPendingPoints = true) {
     def currentTotal = ((currentPoints ?: []) as List).size() + ((currentOutOfBounds ?: []) as List).size()
     def snapshotTotal = ((lastPoints ?: []) as List).size() + ((lastOutOfBounds ?: []) as List).size()
+    if (!graphPendingPoints) {
+        if (snapshotTotal > 0) {
+            return [
+                    points: (lastPoints ?: []) as List,
+                    outOfBoundsPoints: (lastOutOfBounds ?: []) as List,
+                    source: "processed-snapshot",
+                    pendingProcessing: false
+            ]
+        }
+        return [
+                points: [],
+                outOfBoundsPoints: [],
+                source: "pending-hidden",
+                pendingProcessing: false
+        ]
+    }
     if (!shouldUseLiveDisplayComputation(currentPoints, currentOutOfBounds) && snapshotTotal > 0) {
         return [
                 points: (lastPoints ?: []) as List,
@@ -4130,30 +4827,41 @@ private void refreshStoredGhostSnapshotsForDevice(deviceId, List currentClusters
 }
 
 private Integer getEscapingPointCount(deviceId) {
-    def displayData = getDisplayData(deviceId)
-    def dev = mmwaveDevices?.find { deviceKey(it.id) == deviceKey(deviceId) }
-    def pointBuckets = classifyPlotPoints(displayData.points, displayData.outOfBoundsPoints, dev)
+    def devKey = deviceKey(deviceId)
+    def cache = getPageRenderCacheSection("pointBuckets")
+    if (cache.containsKey(devKey)) {
+        return (((cache[devKey] ?: [:]).occupancyAssociatedInterferencePoints ?: []) as List).size()
+    }
+
+    def pointBuckets = getPointBucketsForDevice(deviceId)
     ((pointBuckets.occupancyAssociatedInterferencePoints ?: []) as List).size()
 }
 
-private Integer getEscapingTargetCountForDeviceKey(String devKey) {
-    def dev = mmwaveDevices?.find { deviceKey(it.id) == devKey }
-    if (!dev) {
-        return 0
+private Map getPointBucketsForDevice(deviceId) {
+    def devKey = deviceKey(deviceId)
+    def cache = getPageRenderCacheSection("pointBuckets")
+    if (cache.containsKey(devKey)) {
+        return (cache[devKey] ?: [:]) as Map
     }
 
-    def displayData = getDisplayData(dev.id)
+    def displayData = getDisplayData(deviceId)
+    def dev = mmwaveDevices?.find { deviceKey(it.id) == deviceKey(deviceId) }
     def pointBuckets = classifyPlotPoints(displayData.points, displayData.outOfBoundsPoints, dev)
-    def escapingPoints = (pointBuckets.occupancyAssociatedInterferencePoints ?: []) as List
-    if (!escapingPoints) {
-        return 0
+    cache[devKey] = pointBuckets
+    pointBuckets
+}
+
+private Map getPlotPointBucketsForDevice(deviceId, dev, String horizontalAxis, String verticalAxis, List points, List outOfBoundsPoints) {
+    def devKey = deviceKey(deviceId)
+    def cache = getPageRenderCacheSection("plotPointBuckets")
+    def cacheKey = "${devKey}:${horizontalAxis}:${verticalAxis}"
+    if (cache.containsKey(cacheKey)) {
+        return (cache[cacheKey] ?: [:]) as Map
     }
 
-    getRememberedInterferenceAreas(devKey).findAll { area ->
-        escapingPoints.any { point ->
-            isPointWithinBounds(point.x as Double, point.y as Double, point.z as Double, area.bounds)
-        }
-    }.size()
+    def pointBuckets = classifyPlotPoints(points, outOfBoundsPoints, dev, horizontalAxis, verticalAxis)
+    cache[cacheKey] = pointBuckets
+    pointBuckets
 }
 
 private Map getSummaryForDevice(deviceId) {
@@ -4183,12 +4891,18 @@ private Map getSummaryForDevice(deviceId) {
 
 private Map getDisplayCounts(deviceId) {
     def devKey = deviceKey(deviceId)
+    def cache = getPageRenderCacheSection("displayCounts")
+    if (cache.containsKey(devKey)) {
+        return (cache[devKey] ?: [:]) as Map
+    }
+
     def displayData = getDisplayData(deviceId)
     def liveClusters = (displayData?.currentClusters ?: []) as List
     def summary = getSummaryForDevice(deviceId)
     def currentCounts = getDisplayGhostCounts(devKey, liveClusters)
     def totalPoints = ((displayData?.totalPointCount ?: 0) as Integer)
     currentCounts.ghostsToday = (totalPoints > 0 || liveClusters) ? (liveClusters?.size() ?: 0) : (summary.ghostsToday ?: 0)
+    cache[devKey] = currentCounts
     currentCounts
 }
 
@@ -4196,18 +4910,17 @@ private Map getNetworkSummaryStats(List sortedDevices, Integer aggregatePersiste
     def detected = sortedDevices.collect { getDisplayCounts(it.id).detectedGhosts ?: 0 }.sum() ?: 0
     def targeted = sortedDevices.collect { getDisplayCounts(it.id).targetedGhosts ?: 0 }.sum() ?: 0
     def escaping = sortedDevices.collect { getDisplayCounts(it.id).escapingGhosts ?: 0 }.sum() ?: 0
-    def leaking = sortedDevices.collect { getDisplayCounts(it.id).leakingGhosts ?: 0 }.sum() ?: 0
     def escapingPoints = (sortedDevices ?: []).collect { getEscapingPointCount(it.id) ?: 0 }.sum() ?: 0
 
     def stats = [
             "Detected": detected,
             "Persistent": aggregatePersistent,
-            "Targeted": targeted,
+            "Covered": targeted,
             "Escaping": escaping,
             "Busted": aggregateBusted
     ]
 
-    def alertHtml = buildGhostAlertsHtml(leaking as Integer, escapingPoints as Integer)
+    def alertHtml = buildGhostAlertsHtml(escaping as Integer, escapingPoints as Integer)
     if (alertHtml) {
         stats._html = alertHtml
     }
@@ -4217,66 +4930,12 @@ private Map getNetworkSummaryStats(List sortedDevices, Integer aggregatePersiste
 private String buildGhostAlertsHtml(Integer escapingBeyondAreaCount, Integer escapingInsidePointCount) {
     def alertParts = []
     if ((escapingBeyondAreaCount ?: 0) > 0) {
-        alertParts << "${escapingBeyondAreaCount} ghost(s) escaping beyond their targeted interference areas and may require interference area expansion."
+        alertParts << "${escapingBeyondAreaCount} ghost(s) extend beyond their interference areas and may require expansion."
     }
     if ((escapingInsidePointCount ?: 0) > 0) {
-        alertParts << "${escapingInsidePointCount} occupancy-contributing point(s) are still appearing inside targeted interference areas."
+        alertParts << "${escapingInsidePointCount} point(s) are still leaking inside configured interference areas."
     }
     alertParts ? renderNoteCard("Ghost Alerts", alertParts.join(" ")) : null
-}
-
-private String buildInterferenceAreaControlNotes(deviceId, List selectableClusters) {
-    def devKey = deviceKey(deviceId)
-    def notes = []
-    def activeGhosts = (getTrackedGhostsForDisplay(deviceId) ?: []) as List
-    getRememberedInterferenceAreas(devKey).each { area ->
-        if (isInactiveInterferenceAreaBounds(area.bounds as Map)) {
-            notes << "Area ${area.areaIndex} is not currently configured on the device."
-            return
-        }
-        def targetedCluster = activeGhosts.find { cluster ->
-            (cluster?.targetAreaIndex as Integer) == (area.areaIndex as Integer)
-        }
-        if (targetedCluster?.bounds && sameBounds(targetedCluster.bounds, area.bounds)) {
-            def idx = activeGhosts.indexOf(targetedCluster) + 1
-            notes << "Area ${area.areaIndex} is currently configured to target Ghost ${idx}."
-            return
-        }
-        if (targetedCluster?.bounds && isBoundsWithinBounds(targetedCluster.bounds, area.bounds)) {
-            def idx = activeGhosts.indexOf(targetedCluster) + 1
-            notes << "Area ${area.areaIndex} is currently configured to target Ghost ${idx}."
-            return
-        }
-        if (targetedCluster?.bounds && boundsOverlap(targetedCluster.bounds, area.bounds)) {
-            def idx = activeGhosts.indexOf(targetedCluster) + 1
-            notes << "Area ${area.areaIndex} is currently configured to target Ghost ${idx}, but Ghost ${idx} has expanded beyond the currently configured area. Reapply area assignments to update Area ${area.areaIndex} to Ghost ${idx}'s current bounds."
-            return
-        }
-
-        def exactMatch = activeGhosts.find { cluster ->
-            cluster?.bounds && sameBounds(cluster.bounds, area.bounds)
-        }
-        if (exactMatch) {
-            def idx = activeGhosts.indexOf(exactMatch) + 1
-            notes << "Area ${area.areaIndex} currently matches Ghost ${idx}."
-            return
-        }
-
-        def overlappingCluster = activeGhosts.find { cluster ->
-            cluster?.bounds && boundsOverlap(cluster.bounds, area.bounds)
-        }
-        if (overlappingCluster) {
-            def idx = activeGhosts.indexOf(overlappingCluster) + 1
-            if (isBoundsWithinBounds(overlappingCluster.bounds, area.bounds)) {
-                notes << "Area ${area.areaIndex} currently contains Ghost ${idx}."
-            } else {
-                notes << "Area ${area.areaIndex} may be using older bounds than Ghost ${idx}. Reapply area assignments if you want Area ${area.areaIndex} updated to the current bounds of Ghost ${idx}."
-            }
-        } else {
-            notes << "Area ${area.areaIndex} is configured on the device, but no current ghost exactly matches its current bounds."
-        }
-    }
-    notes ? notes.join("<br>") : null
 }
 
 private List getSnapshotPoints(deviceId) {
@@ -4312,21 +4971,44 @@ private List getSelectableClusters(deviceId) {
 
 private Map buildSelectableClusterOptions(List selectableClusters) {
     def options = ["__none__": "None"]
-    options + (selectableClusters ?: []).collectEntries { cluster ->
-        def idx = selectableClusters.indexOf(cluster)
-        [(idx.toString()): describeClusterOption(cluster, idx)]
+    options + (selectableClusters ?: []).withIndex().collectEntries { cluster, idx ->
+        [(idx.toString()): describeClusterOption(idx)]
     }
 }
 
 private String getAssignedClusterOption(deviceId, Integer areaIndex, List selectableClusters) {
-    def matchedCluster = (selectableClusters ?: []).find { cluster ->
-        (cluster?.targetAreaIndex as Integer) == areaIndex
+    def devKey = deviceKey(deviceId)
+    def area = loadLiveInterferenceAreas(devKey).find { (it.areaIndex as Integer) == areaIndex }
+    if (!area?.bounds || isInactiveInterferenceAreaBounds(area.bounds as Map)) {
+        return "__none__"
     }
-    matchedCluster != null ? selectableClusters.indexOf(matchedCluster).toString() : "__none__"
+
+    def exactMatch = (selectableClusters ?: []).find { cluster ->
+        cluster?.bounds && sameBounds(cluster.bounds as Map, area.bounds as Map)
+    }
+    if (exactMatch != null) {
+        return selectableClusters.indexOf(exactMatch).toString()
+    }
+
+    def containingMatch = (selectableClusters ?: []).findAll { cluster ->
+        cluster?.bounds && isBoundsWithinBounds(cluster.bounds as Map, area.bounds as Map)
+    }.min { cluster ->
+        boundsVolume(cluster.bounds as Map)
+    }
+    if (containingMatch != null) {
+        return selectableClusters.indexOf(containingMatch).toString()
+    }
+
+    def overlappingMatch = (selectableClusters ?: []).findAll { cluster ->
+        cluster?.bounds && boundsOverlap(cluster.bounds as Map, area.bounds as Map)
+    }.max { cluster ->
+        boundsVolume(intersectBounds(cluster.bounds as Map, area.bounds as Map))
+    }
+    overlappingMatch != null ? selectableClusters.indexOf(overlappingMatch).toString() : "__none__"
 }
 
-private String buildAreaSelectorTitle(deviceId, Integer areaIndex, List selectableClusters) {
-    "Area ${areaIndex}: Ghost to target"
+private String buildAreaSelectorTitle(Integer areaIndex) {
+    "Area ${areaIndex}: Ghost bounds to copy"
 }
 
 private List buildSelectableClusters(List currentClusters, List historicalClusters) {
@@ -4503,7 +5185,7 @@ private void syncClusterTargetsForDevice(String devKey) {
         return
     }
 
-    def rememberedAreas = getRememberedInterferenceAreas(devKey)
+    def rememberedAreas = findActiveLiveInterferenceAreas(devKey)
     def areasByIndex = rememberedAreas.collectEntries { area -> [(area.areaIndex.toString()): area] }
 
     stableClusters.each { cluster ->
@@ -4512,27 +5194,11 @@ private void syncClusterTargetsForDevice(String devKey) {
 
         if (existingArea && boundsOverlap(cluster.appliedBounds ?: cluster.bounds, existingArea.bounds)) {
             cluster.targetAreaIndex = existingArea.areaIndex
-            cluster.targetSource = existingArea.source
-            cluster.bustMode = existingArea.source in ["manual", "auto"] ? existingArea.source : cluster.bustMode
             cluster.appliedBounds = cloneBounds(existingArea.bounds)
             return
         }
-
-        def matchedArea = isClusterPersistent(cluster) ? rememberedAreas.find { area ->
-            boundsOverlap(cluster.bounds, area.bounds)
-        } : null
-
-        if (matchedArea) {
-            cluster.targetAreaIndex = matchedArea.areaIndex
-            cluster.targetSource = matchedArea.source
-            cluster.bustMode = matchedArea.source in ["manual", "auto"] ? matchedArea.source : cluster.bustMode
-            cluster.appliedBounds = cloneBounds(matchedArea.bounds)
-        } else {
-            cluster.targetAreaIndex = null
-            cluster.targetSource = null
-            cluster.bustMode = null
-            cluster.appliedBounds = null
-        }
+        cluster.targetAreaIndex = null
+        cluster.appliedBounds = null
     }
 
     state.stabilityData[devKey] = stableClusters
@@ -4542,42 +5208,22 @@ private boolean boundsOverlap(Map a, Map b) {
     intersectBounds(a, b) != null
 }
 
-private Map getPersistentBustSourceCounts(List stableClusters) {
-    def persistentClusters = (stableClusters ?: []).findAll { isClusterPersistent(it) || isClusterTargeted(it) || isClusterBusted(it) }
-    [
-            autoBusted: persistentClusters.count { (it.targetSource ?: it.bustMode) == "auto" },
-            manualBusted: persistentClusters.count { (it.targetSource ?: it.bustMode) in ["manual", "manual-entry"] },
-            unbusted: persistentClusters.count { isClusterPersistent(it) && !isClusterTargeted(it) && !isClusterBusted(it) }
-    ]
-}
-
-private Map getAggregateBustSourceCounts() {
-    def totals = [autoBusted: 0, manualBusted: 0, unbusted: 0]
-    mmwaveDevices?.each { dev ->
-        def counts = getPersistentBustSourceCountsForDevice(deviceKey(dev.id))
-        totals.autoBusted += counts.autoBusted
-        totals.manualBusted += counts.manualBusted
-        totals.unbusted += counts.unbusted
-    }
-    totals
-}
-
 private Map getPersistentBustSourceCountsForDevice(String devKey) {
     def stableClusters = (state.stabilityData[devKey] ?: []) as List
-    def persistentClusters = (stableClusters ?: []).findAll { isClusterPersistent(it) || isGhostTargeted(devKey, it) || isGhostBusted(devKey, it) }
+    def persistentClusters = (stableClusters ?: []).findAll { isClusterPersistent(it) || checkGhostTargeted(devKey, it) || checkGhostBusted(devKey, it) }
     [
             autoBusted: persistentClusters.count { ghost ->
-                def rememberedArea = getRememberedAreaForGhost(devKey, ghost)
-                def source = rememberedArea?.source ?: ghost.targetSource ?: ghost.bustMode
+                def rememberedArea = findLiveAreaForGhost(devKey, ghost)
+                def source = getRememberedInterferenceAreaMetadata(devKey, rememberedArea?.areaIndex as Integer)?.source ?: ghost.targetSource ?: ghost.bustMode
                 source == "auto"
             },
             manualBusted: persistentClusters.count { ghost ->
-                def rememberedArea = getRememberedAreaForGhost(devKey, ghost)
-                def source = rememberedArea?.source ?: ghost.targetSource ?: ghost.bustMode
+                def rememberedArea = findLiveAreaForGhost(devKey, ghost)
+                def source = getRememberedInterferenceAreaMetadata(devKey, rememberedArea?.areaIndex as Integer)?.source ?: ghost.targetSource ?: ghost.bustMode
                 source in ["manual", "manual-entry"]
             },
             unbusted: persistentClusters.count { ghost ->
-                isClusterPersistent(ghost) && !isGhostTargeted(devKey, ghost) && !isGhostBusted(devKey, ghost)
+                isClusterPersistent(ghost) && !checkGhostTargeted(devKey, ghost) && !checkGhostBusted(devKey, ghost)
             }
     ]
 }
@@ -4625,78 +5271,132 @@ private boolean isClusterBusted(Map cluster) {
     isClusterTargeted(cluster) && ((cluster?.absentStreak ?: 0) >= safeBustedGhostDays())
 }
 
-private Map getRememberedAreaForGhost(String devKey, Map cluster) {
+private Map findRememberedAreaForGhost(String devKey, Map cluster) {
+    return findLiveAreaForGhost(devKey, cluster)
+}
+
+private List findOverlappingAreasForGhost(String devKey, Map cluster) {
+    if (!devKey || !cluster?.bounds) {
+        return []
+    }
+    findActiveLiveInterferenceAreas(devKey).findAll { area ->
+        area?.bounds && boundsOverlap(cluster.bounds as Map, area.bounds as Map)
+    }
+}
+
+private List findContainingAreasForGhost(String devKey, Map cluster) {
+    findOverlappingAreasForGhost(devKey, cluster).findAll { area ->
+        isBoundsWithinBounds(cluster.bounds as Map, area.bounds as Map)
+    }
+}
+
+private Map findPrimaryAreaForGhost(String devKey, Map cluster) {
+    if (!devKey || !cluster?.bounds) {
+        return null
+    }
+
+    def containing = findContainingAreasForGhost(devKey, cluster)
+    if (containing) {
+        return containing.min { area ->
+            boundsVolume(area.bounds as Map)
+        }
+    }
+
+    def overlapping = findOverlappingAreasForGhost(devKey, cluster)
+    if (!overlapping) {
+        return null
+    }
+
+    overlapping.max { area ->
+        def overlap = intersectBounds(cluster.bounds as Map, area.bounds as Map)
+        boundsVolume(overlap)
+    }
+}
+
+private Map findLiveAreaForGhost(String devKey, Map cluster) {
+    findPrimaryAreaForGhost(devKey, cluster)
+}
+
+private boolean checkGhostTargeted(String devKey, Map cluster) {
+    if (!beginGhostEval("targeted", devKey, cluster)) {
+        return false
+    }
+    try {
+        !findContainingAreasForGhost(devKey, cluster).isEmpty()
+    } finally {
+        endGhostEval("targeted", devKey, cluster)
+    }
+}
+
+private boolean checkGhostHistoricallyBusted(String devKey, Map cluster) {
+    if (!beginGhostEval("historicallyBusted", devKey, cluster)) {
+        return false
+    }
+    try {
+        if (!checkGhostTargeted(devKey, cluster)) {
+            return false
+        }
+
+        def activeIssue = checkGhostLeaking(devKey, cluster) || checkGhostEscaping(devKey, cluster)
+        def requiredAbsentDays = activeIssue ? Integer.MAX_VALUE : safeLeakRecoveryDays()
+        ((cluster?.absentStreak ?: 0) >= requiredAbsentDays)
+    } finally {
+        endGhostEval("historicallyBusted", devKey, cluster)
+    }
+}
+
+private boolean checkGhostBusted(String devKey, Map cluster) {
+    if (!beginGhostEval("busted", devKey, cluster)) {
+        return false
+    }
+    try {
+        if (!checkGhostTargeted(devKey, cluster)) {
+            return false
+        }
+
+        if (checkGhostHistoricallyBusted(devKey, cluster)) {
+            return true
+        }
+
+        def targetArea = findLiveAreaForGhost(devKey, cluster)
+        def currentCluster = getCurrentClusterForGhost(devKey, cluster)
+        if (!targetArea?.bounds || !currentCluster?.bounds || !currentCluster?.points) {
+            return false
+        }
+
+        if (!isBoundsWithinBounds(currentCluster.bounds, targetArea.bounds)) {
+            return false
+        }
+
+        currentCluster.points.every { point ->
+            isPointWithinBounds(point.x as Double, point.y as Double, point.z as Double, targetArea.bounds) &&
+                    !pointContributesToOccupancyInsideInterferenceArea(devKey, point)
+        }
+    } finally {
+        endGhostEval("busted", devKey, cluster)
+    }
+}
+
+private boolean checkGhostEscaping(String devKey, Map cluster) {
     if (!devKey || !cluster) {
-        return null
+        return false
     }
-    def rememberedAreas = getRememberedInterferenceAreas(devKey)
-    def explicitIndex = cluster.targetAreaIndex != null ? (cluster.targetAreaIndex as Integer) : null
-    if (explicitIndex != null) {
-        def indexedArea = rememberedAreas.find { (it.areaIndex as Integer) == explicitIndex }
-        if (indexedArea) {
-            return indexedArea
+    if (!beginGhostEval("escaping", devKey, cluster)) {
+        return false
+    }
+    try {
+
+        def targetArea = findPrimaryAreaForGhost(devKey, cluster)
+        def activeCluster = getCurrentClusterForGhost(devKey, cluster)
+        def clusterBounds = activeCluster?.bounds
+        if (!targetArea?.bounds || !isValidBounds(clusterBounds)) {
+            return false
         }
+
+        boundsOverlap(clusterBounds, targetArea.bounds) && !isBoundsWithinBounds(clusterBounds, targetArea.bounds)
+    } finally {
+        endGhostEval("escaping", devKey, cluster)
     }
-
-    if (cluster?.appliedBounds && isValidBounds(cluster.appliedBounds as Map)) {
-        def appliedMatch = rememberedAreas.find { area ->
-            sameBounds(cluster.appliedBounds as Map, area.bounds)
-        }
-        if (appliedMatch) {
-            return appliedMatch
-        }
-    }
-
-    if (!cluster?.bounds) {
-        return null
-    }
-
-    rememberedAreas.find { area ->
-        boundsOverlap(cluster.bounds, area.bounds)
-    }
-}
-
-private boolean isGhostTargeted(String devKey, Map cluster) {
-    isClusterTargeted(cluster) || getRememberedAreaForGhost(devKey, cluster) != null
-}
-
-private boolean isGhostHistoricallyBusted(String devKey, Map cluster) {
-    if (!isGhostTargeted(devKey, cluster)) {
-        return false
-    }
-
-    def activeIssue = isGhostLeaking(devKey, cluster) || isGhostEscaping(devKey, cluster)
-    def requiredAbsentDays = activeIssue ? Integer.MAX_VALUE : safeLeakRecoveryDays()
-    ((cluster?.absentStreak ?: 0) >= requiredAbsentDays)
-}
-
-private boolean isGhostBusted(String devKey, Map cluster) {
-    if (!isGhostTargeted(devKey, cluster)) {
-        return false
-    }
-
-    if (isGhostHistoricallyBusted(devKey, cluster)) {
-        return true
-    }
-
-    def targetArea = getRememberedAreaForGhost(devKey, cluster)
-    def currentCluster = getCurrentClusterForGhost(devKey, cluster)
-    if (!targetArea?.bounds || !currentCluster?.bounds || !currentCluster?.points) {
-        return false
-    }
-
-    if (!isBoundsWithinBounds(currentCluster.bounds, targetArea.bounds)) {
-        return false
-    }
-
-    currentCluster.points.every { point ->
-        isPointWithinBounds(point.x as Double, point.y as Double, point.z as Double, targetArea.bounds) &&
-                !pointContributesToOccupancyInsideInterferenceArea(devKey, point)
-    }
-}
-
-private boolean isGhostEscaping(String devKey, Map cluster) {
-    getEscapingGhostMode(devKey, cluster) != null
 }
 
 private String getEscapingGhostMode(String devKey, Map cluster) {
@@ -4708,42 +5408,26 @@ private String getEscapingGhostMode(String devKey, Map cluster) {
     }
 
     def dev = mmwaveDevices?.find { deviceKey(it?.id) == devKey }
-    def targetArea = getRememberedAreaForGhost(devKey, cluster)
+    def targetArea = findLiveAreaForGhost(devKey, cluster)
     if (!dev || !targetArea?.bounds) {
         return null
     }
 
-    def displayData = getDisplayData(dev.id)
-    def pointBuckets = classifyPlotPoints(displayData.points, displayData.outOfBoundsPoints, dev)
-    def escapingInside = ((pointBuckets.occupancyAssociatedInterferencePoints ?: []) as List).any { point ->
-        isPointWithinBounds(point.x as Double, point.y as Double, point.z as Double, targetArea.bounds)
-    }
-    def leakingAdjacent = isGhostLeaking(devKey, cluster)
-    if (escapingInside && leakingAdjacent) {
-        return "both"
-    }
-    if (escapingInside) {
-        return "inside-area"
-    }
-    if (leakingAdjacent) {
-        return "adjacent"
+    if (checkGhostEscaping(devKey, cluster)) {
+        return "beyond"
     }
     null
 }
 
-private boolean isGhostLeaking(String devKey, Map cluster) {
-    if (!devKey || !cluster || !isGhostTargeted(devKey, cluster)) {
+private boolean checkGhostLeaking(String devKey, Map cluster) {
+    if (!beginGhostEval("leaking", devKey, cluster)) {
         return false
     }
-
-    def targetArea = getRememberedAreaForGhost(devKey, cluster)
-    def activeCluster = getCurrentClusterForGhost(devKey, cluster)
-    def clusterBounds = activeCluster?.bounds
-    if (!targetArea?.bounds || !isValidBounds(clusterBounds)) {
-        return false
+    try {
+        hasCoverageFailureInsideArea(devKey, cluster)
+    } finally {
+        endGhostEval("leaking", devKey, cluster)
     }
-
-    boundsOverlap(clusterBounds, targetArea.bounds) && !isBoundsWithinBounds(clusterBounds, targetArea.bounds)
 }
 
 private boolean hasLiveGhostEvidence(String devKey) {
@@ -4751,7 +5435,8 @@ private boolean hasLiveGhostEvidence(String devKey) {
     if (!dev) {
         return false
     }
-    ((getPointsForDevice(dev.id) ?: []) as List) || ((getTodayClusters(dev.id) ?: []) as List)
+    def displayData = getDisplayData(dev.id)
+    ((displayData?.points ?: []) as List) || ((displayData?.currentClusters ?: []) as List)
 }
 
 private boolean pointContributesToOccupancyInsideInterferenceArea(String devKey, Map point) {
@@ -4765,13 +5450,30 @@ private boolean pointContributesToOccupancyInsideInterferenceArea(String devKey,
     }
 
     def displayData = getDisplayData(dev.id)
-    def rememberedAreas = getRememberedInterferenceAreas(devKey)
+    def rememberedAreas = loadLiveInterferenceAreas(devKey)
     def deviceBounds = getDeviceBounds(dev)
     def validDeviceBounds = isValidBounds(deviceBounds)
     def allDisplayPoints = []
     allDisplayPoints.addAll(displayData.points ?: [])
     allDisplayPoints.addAll(displayData.outOfBoundsPoints ?: [])
     shouldPlotInterferenceAreaPointAsRed(point, allDisplayPoints, rememberedAreas, deviceBounds, validDeviceBounds, getOccupancyAssociationWindowMs(dev))
+}
+
+private boolean hasCoverageFailureInsideArea(String devKey, Map cluster) {
+    if (!devKey || !cluster) {
+        return false
+    }
+
+    def dev = mmwaveDevices?.find { deviceKey(it?.id) == devKey }
+    def targetArea = findPrimaryAreaForGhost(devKey, cluster)
+    if (!dev || !targetArea?.bounds) {
+        return false
+    }
+
+    def pointBuckets = getPointBucketsForDevice(dev.id)
+    ((pointBuckets.occupancyAssociatedInterferencePoints ?: []) as List).any { point ->
+        isPointWithinBounds(point.x as Double, point.y as Double, point.z as Double, targetArea.bounds)
+    }
 }
 
 private Map getCurrentClusterForGhost(String devKey, Map cluster) {
@@ -4782,11 +5484,13 @@ private Map getCurrentClusterForGhost(String devKey, Map cluster) {
 
     def displayData = getDisplayData(dev.id)
     def currentClusters = ((displayData.currentClusters ?: []) as List)
-    def targetArea = getRememberedAreaForGhost(devKey, cluster)
+    def targetArea = findLiveAreaForGhost(devKey, cluster)
 
     if (targetArea?.bounds && currentClusters) {
         def targetedCandidates = currentClusters.findAll { currentCluster ->
-            currentCluster?.bounds && boundsOverlap(currentCluster.bounds, targetArea.bounds)
+            currentCluster?.bounds &&
+                    boundsOverlap(currentCluster.bounds, targetArea.bounds) &&
+                    shouldMergeClusters(currentCluster as Map, cluster as Map)
         }
         def targetedMatch = targetedCandidates ? targetedCandidates.min { candidate ->
             distance3D((candidate.center ?: [:]) as Map, (cluster.center ?: [:]) as Map)
@@ -4814,11 +5518,11 @@ private Map getCurrentClusterForGhost(String devKey, Map cluster) {
 }
 
 private boolean hasProblemInterferencePointsForGhost(String devKey, Map cluster) {
-    isGhostEscaping(devKey, cluster) || isGhostLeaking(devKey, cluster)
+    checkGhostEscaping(devKey, cluster) || checkGhostLeaking(devKey, cluster)
 }
 
 private Map getGhostAreaExpansion(String devKey, Map cluster) {
-    def targetArea = getRememberedAreaForGhost(devKey, cluster)
+    def targetArea = findLiveAreaForGhost(devKey, cluster)
     def clusterBounds = getCurrentClusterForGhost(devKey, cluster)?.bounds ?: cluster?.bounds
     if (!targetArea?.bounds || !isValidBounds(clusterBounds)) {
         return [:]
@@ -4875,6 +5579,7 @@ private Map plotStateStyle(Map cluster, String devKey, List historicalClusters, 
             case "Escaping":
                 return [stroke: "#c62828", fill: "rgba(198,40,40,0.08)", dash: "5,3"]
             case "Targeted":
+            case "Covered":
                 return [stroke: "#ef6c00", fill: "rgba(239,108,0,0.08)", dash: "5,3"]
             case "Persistent":
                 return [stroke: "#f9a825", fill: "rgba(249,168,37,0.08)", dash: "5,3"]
@@ -4885,11 +5590,12 @@ private Map plotStateStyle(Map cluster, String devKey, List historicalClusters, 
 
     switch (stateName) {
         case "Busted":
-            return [stroke: "#2e7d32", fill: "rgba(46,125,50,0.14)", dash: null]
+            return [stroke: "#2e7d32", fill: "rgba(46,125,50,0.10)", dash: null]
         case "Escaping":
-            return [stroke: "#c62828", fill: "rgba(198,40,40,0.14)", dash: null]
+            return [stroke: "#c62828", fill: "rgba(198,40,40,0.10)", dash: null]
         case "Targeted":
-            return [stroke: "#ef6c00", fill: "rgba(239,108,0,0.14)", dash: null]
+        case "Covered":
+            return [stroke: "#ef6c00", fill: "rgba(239,108,0,0.10)", dash: null]
         case "Persistent":
             return [stroke: "#f9a825", fill: historicalOnly ? "rgba(249,168,37,0.14)" : "none", dash: "3,2"]
         default:
@@ -5063,8 +5769,8 @@ private Long getOccupancyAssociationWindowMs(dev) {
     }
 }
 
-private Map calculatePlotScale(List points, List outOfBoundsPoints, List currentClusters, List historicalClusters, dev = null, String horizontalAxis = "x", String verticalAxis = "y", Map preferredScale = null) {
-    def pointBuckets = classifyPlotPoints(points, outOfBoundsPoints, dev, horizontalAxis, verticalAxis)
+private Map calculatePlotScale(List points, List outOfBoundsPoints, List currentClusters, List historicalClusters, dev = null, String horizontalAxis = "x", String verticalAxis = "y", Map preferredScale = null, Map pointBuckets = null) {
+    pointBuckets = pointBuckets ?: classifyPlotPoints(points, outOfBoundsPoints, dev, horizontalAxis, verticalAxis)
     def deviceBounds = pointBuckets.deviceBounds
     def validDeviceBounds = pointBuckets.validDeviceBounds
     def hMinField = "${horizontalAxis}min"
@@ -5172,17 +5878,17 @@ private Map calculatePlotScale(List points, List outOfBoundsPoints, List current
     ]
 }
 
-private String renderClusterPlot(List points, List outOfBoundsPoints, List currentClusters, List historicalClusters, dev = null, String horizontalAxis = "x", String verticalAxis = "y", Map preferredScale = null, boolean pointsPendingProcessing = false) {
+private String renderClusterPlot(List points, List outOfBoundsPoints, List currentClusters, List historicalClusters, dev = null, String horizontalAxis = "x", String verticalAxis = "y", Map preferredScale = null, boolean pointsPendingProcessing = false, Map pointBuckets = null) {
     def limitedPointSet = limitPointsForGraph(points, outOfBoundsPoints)
     def plotPoints = limitedPointSet.points
     def plotOutOfBoundsPoints = limitedPointSet.outOfBoundsPoints
 
-    def scale = calculatePlotScale(plotPoints, plotOutOfBoundsPoints, currentClusters, historicalClusters, dev, horizontalAxis, verticalAxis, preferredScale)
+    pointBuckets = pointBuckets ?: classifyPlotPoints(plotPoints, plotOutOfBoundsPoints, dev, horizontalAxis, verticalAxis)
+    def scale = calculatePlotScale(plotPoints, plotOutOfBoundsPoints, currentClusters, historicalClusters, dev, horizontalAxis, verticalAxis, preferredScale, pointBuckets)
     if (!scale) {
         return "No points or cluster history available."
     }
 
-    def pointBuckets = classifyPlotPoints(plotPoints, plotOutOfBoundsPoints, dev, horizontalAxis, verticalAxis)
     def deviceBounds = pointBuckets.deviceBounds
     def validDeviceBounds = pointBuckets.validDeviceBounds
     def displayInBoundsPoints = pointBuckets.inBoundsPoints
@@ -5248,13 +5954,16 @@ private String renderClusterPlot(List points, List outOfBoundsPoints, List curre
     }
 
     // Draw remembered interference area boxes separately from ghost boxes.
-    (rememberedAreas ?: []).each { area ->
+    def sortedRememberedAreas = (rememberedAreas ?: []).sort { a, b ->
+        boundsVolume((b?.bounds ?: [:]) as Map) <=> boundsVolume((a?.bounds ?: [:]) as Map)
+    }
+    sortedRememberedAreas.each { area ->
         if (area?.bounds) {
             def x1 = normalizeX(area.bounds[hMinField])
             def x2 = normalizeX(area.bounds[hMaxField])
             def y1 = normalizeY(area.bounds[vMaxField])
             def y2 = normalizeY(area.bounds[vMinField])
-            svg << "<rect x='${x1}' y='${y1}' width='${x2 - x1}' height='${y2 - y1}' fill='rgba(197,204,211,0.18)' stroke='#c5ccd3' stroke-width='1.2' />"
+            svg << "<rect x='${x1}' y='${y1}' width='${x2 - x1}' height='${y2 - y1}' fill='rgba(33,150,243,0.08)' stroke='#1e88e5' stroke-width='1.2' stroke-dasharray='5,3' />"
         }
     }
 
@@ -5270,6 +5979,10 @@ private String renderClusterPlot(List points, List outOfBoundsPoints, List curre
         if (historicalCluster?.archivedGhost == true || !hasCurrentMatch) {
             drawClusters << [cluster: historicalCluster, historicalOnly: true]
         }
+    }
+
+    drawClusters = drawClusters.sort { a, b ->
+        boundsVolume((((b?.cluster ?: [:]).bounds ?: [:]) as Map)) <=> boundsVolume((((a?.cluster ?: [:]).bounds ?: [:]) as Map))
     }
 
     drawClusters.each { entry ->
@@ -5291,6 +6004,17 @@ private String renderClusterPlot(List points, List outOfBoundsPoints, List curre
                 def ey2 = normalizeY(escapingBounds[vMinField])
                 svg << "<rect x='${ex1}' y='${ey1}' width='${ex2 - ex1}' height='${ey2 - ey1}' fill='rgba(198,40,40,0.08)' stroke='#c62828' stroke-width='1.1' stroke-dasharray='2,2' />"
             }
+        }
+    }
+
+    // Redraw area outlines on top so they remain visible even when ghost boxes overlap them.
+    sortedRememberedAreas.each { area ->
+        if (area?.bounds) {
+            def x1 = normalizeX(area.bounds[hMinField])
+            def x2 = normalizeX(area.bounds[hMaxField])
+            def y1 = normalizeY(area.bounds[vMaxField])
+            def y2 = normalizeY(area.bounds[vMinField])
+            svg << "<rect x='${x1}' y='${y1}' width='${x2 - x1}' height='${y2 - y1}' fill='none' stroke='#1565c0' stroke-width='1.8' stroke-dasharray='5,3' />"
         }
     }
 
@@ -5519,7 +6243,7 @@ private Map getPreferredRenderCluster(Map currentCluster, List historicalCluster
     }
 
     def currentState = matchedHistorical?.archivedGhost == true ? null : (devKey ? determineGhostState(devKey, matchedHistorical) : matchedHistorical?.ghostStateSnapshot)
-    if (!(currentState in ["Targeted", "Escaping", "Busted"])) {
+    if (!(currentState in ["Covered", "Escaping", "Busted"])) {
         return currentCluster
     }
 
@@ -5554,7 +6278,7 @@ private Map findPreferredHistoricalRenderMatch(Map currentCluster, List historic
         }
     }
 
-    def targetArea = devKey ? getRememberedAreaForGhost(devKey, currentCluster) : null
+    def targetArea = devKey ? findRememberedAreaForGhost(devKey, currentCluster) : null
     if (targetArea?.bounds) {
         def areaCandidates = (historicalClusters ?: []).findAll { historicalCluster ->
             historicalCluster?.archivedGhost != true &&
@@ -5573,14 +6297,14 @@ private Map findPreferredHistoricalRenderMatch(Map currentCluster, List historic
 }
 
 private String renderCorrelationSummary(deviceId) {
-    def cardsData = buildCorrelationTrackerCards(deviceId)
+    def displayEpisodeCount = getDisplayGhostEpisodeCount(deviceId)
+    def cardsData = buildCorrelationTrackerCards(deviceId, displayEpisodeCount)
     if (!cardsData) {
         return null
     }
 
     def coincidenceWindow = safeCorrelationChangeWindowSeconds()
     def episodeGapSeconds = safeCorrelationEpisodeGapSeconds()
-    def displayEpisodeCount = getDisplayGhostEpisodeCount(deviceId)
     def cards = new StringBuilder()
 
     cardsData.each { card ->
@@ -5597,6 +6321,7 @@ private String renderCorrelationSummary(deviceId) {
             body << "<div style='color:#424242; font-weight:bold; margin-bottom:4px;'>No clear correlation events detected yet</div>"
             body << "<div style='color:#555555;'>This device / attribute pair does not yet show a strong value-based or transition-based correlation signal.</div>"
             body << "</div>"
+            body << renderCorrelationEvidenceStats(card.aggregate as Map, card.transitionAssessment as Map)
             body << "</div>"
             cards << "<div style='border-left:4px solid #cfd8dc; background:#ffffff; padding:10px; margin:4px 0;'>${body}</div>"
             return
@@ -5642,6 +6367,32 @@ private String renderCorrelationEventBlock(Map event, String activationHint = nu
     html.toString()
 }
 
+private String renderCorrelationEvidenceStats(Map aggregate, Map transitionAssessment) {
+    def values = ((aggregate?.values ?: [:]) as Map)
+    def rankedValues = values.collect { value, stats ->
+        def total = (stats.ghostSamples ?: 0) + (stats.clearSamples ?: 0)
+        [
+                value: value,
+                total: total,
+                ghostSamples: stats.ghostSamples ?: 0,
+                clearSamples: stats.clearSamples ?: 0
+        ]
+    }.findAll { (it.total ?: 0) > 0 }.sort { a, b -> (b.total ?: 0) <=> (a.total ?: 0) }
+    def topValue = rankedValues ? rankedValues[0] : null
+
+    def rows = [
+            "Samples checked": aggregate?.samples ?: 0,
+            "Ghost-present samples": "${aggregate?.ghostSamples ?: 0} / ${aggregate?.samples ?: 0} (${percent(aggregate?.ghostSamples ?: 0, aggregate?.samples ?: 0)})",
+            "Ghost episode starts": transitionAssessment?.episodeCount ?: 0,
+            "Starts near recent changes": transitionAssessment?.supportLine?.replace("Ghost starts after a recent change: ", "") ?: "0 / 0 (0%)"
+    ]
+    if (topValue) {
+        rows["Most observed value"] = "${formatCorrelationEventValue(topValue.value as String)} (${topValue.total} samples, ghost-present ${topValue.ghostSamples}, clear ${topValue.clearSamples})"
+    }
+
+    renderStatBlock("Correlation Evidence", rows)
+}
+
 private String formatCorrelationEventValue(String value) {
     def text = value?.toString()?.trim()
     if (!text) {
@@ -5676,48 +6427,6 @@ private List getQualifiedValueCorrelationCandidates(Map aggregate) {
     }.sort { a, b ->
         (b.bias <=> a.bias) ?: ((b.stats?.ghostSamples ?: 0) <=> (a.stats?.ghostSamples ?: 0))
     }
-}
-
-private Map assessValueCorrelation(Map aggregate) {
-    def totalSamples = (aggregate.samples ?: 0) as Integer
-    def ghostSamples = (aggregate.ghostSamples ?: 0) as Integer
-    def clearSamples = (aggregate.clearSamples ?: 0) as Integer
-    def rankedValues = getQualifiedValueCorrelationCandidates(aggregate)
-    def strongest = rankedValues ? rankedValues[0] : null
-
-    def headline = "No clear correlation signal"
-    def color = "#424242"
-    def border = "#cfd8dc"
-    def background = "#f8fafc"
-    def summary = "So far, ghost activity does not line up clearly with this device or attribute."
-    def supportLine = totalSamples > 0 ?
-            "Across all observed values: ${ghostSamples} / ${totalSamples} samples were ghost-present (${percent(ghostSamples, totalSamples)})." :
-            "Not enough samples yet."
-
-    if (strongest && strongest.bias >= 0.55d && (strongest.stats.ghostSamples ?: 0) >= 5) {
-        headline = "Possible correlation with value '${strongest.value}'"
-        color = "#c62828"
-        border = "#ef9a9a"
-        background = "#ffebee"
-        summary = "Ghosts are concentrated when this attribute is '${strongest.value}', and much less common in the other observed values."
-        supportLine = "${strongest.stats.ghostSamples ?: 0} / ${strongest.total ?: 0} samples were ghost-present while the value was '${strongest.value}' (${percent(strongest.stats.ghostSamples, strongest.total)})."
-    } else if (ghostSamples >= 10 && clearSamples >= 10 && rankedValues.size() > 1) {
-        headline = "Weak correlation signal"
-        color = "#ef6c00"
-        border = "#ffcc80"
-        background = "#fff8e1"
-        summary = "There is some separation by value, but not enough yet to call it a strong correlation."
-    }
-
-    [
-            headline: headline,
-            color: color,
-            border: border,
-            background: background,
-            summary: summary,
-            supportLine: supportLine,
-            isDetected: strongest != null
-    ]
 }
 
 private Map assessTransitionCorrelation(Map aggregate) {
@@ -5758,16 +6467,24 @@ private Map assessTransitionCorrelation(Map aggregate, Integer displayEpisodeCou
 }
 
 private Integer getDisplayGhostEpisodeCount(deviceId) {
-    def dev = mmwaveDevices?.find { deviceKey(it.id) == deviceKey(deviceId) }
-    if (!dev) {
+    def devKey = deviceKey(deviceId)
+    def cache = getPageRenderCacheSection("episodeCounts")
+    if (cache.containsKey(devKey)) {
+        return (cache[devKey] ?: 0) as Integer
+    }
+
+    if (!(mmwaveDevices?.find { deviceKey(it.id) == devKey })) {
         return 0
     }
-    getGhostEpisodeStartsFromPoints(dev, getDisplayData(deviceId).points ?: []).size()
+    def trackedGhosts = getTrackedGhostsForDisplay(deviceId)
+    def count = (((trackedGhosts ?: []) as List).collect { Math.max(0, ((it?.episodes ?: 0) as Integer)) }.sum() ?: 0) as Integer
+    cache[devKey] = count
+    count
 }
 
 private String renderInterferenceAreasCard(deviceId) {
     def devKey = deviceKey(deviceId)
-    def rememberedAreas = getRememberedInterferenceAreas(devKey)
+    def rememberedAreas = loadLiveInterferenceAreas(devKey)
     if (!rememberedAreas) {
         return renderNoteCard("Device Interference Areas", "No interference area data is currently available for this device.")
     }
@@ -5789,7 +6506,7 @@ private String renderInterferenceAreasCard(deviceId) {
 private String renderInterferenceAreasControlCard(deviceId, List selectableClusters) {
     def devKey = deviceKey(deviceId)
     def activeGhosts = (getTrackedGhostsForDisplay(deviceId) ?: []) as List
-    def rememberedAreas = getRememberedInterferenceAreas(devKey)
+    def rememberedAreas = loadLiveInterferenceAreas(devKey)
     if (!rememberedAreas) {
         return renderActionHintCard("No Interference Area Data", "No interference area data is currently available for this device.")
     }
@@ -5804,49 +6521,27 @@ private String renderInterferenceAreasControlCard(deviceId, List selectableClust
                     "</div>"
         }
 
-        def statusText = "Configured, but no current ghost match"
-        def targetedCluster = activeGhosts.find { cluster ->
-            (cluster?.targetAreaIndex as Integer) == (area.areaIndex as Integer)
+        def containingGhosts = activeGhosts.findAll { cluster ->
+            cluster?.bounds && isBoundsWithinBounds(cluster.bounds as Map, area.bounds as Map)
         }
-        if (targetedCluster?.bounds && sameBounds(targetedCluster.bounds, area.bounds)) {
-            def idx = activeGhosts.indexOf(targetedCluster) + 1
-            statusText = "Currently targeting Ghost ${idx}"
-            accent = "#2563eb"
+        def overlappingGhosts = activeGhosts.findAll { cluster ->
+            cluster?.bounds && boundsOverlap(cluster.bounds as Map, area.bounds as Map)
         }
-        else if (targetedCluster?.bounds && isBoundsWithinBounds(targetedCluster.bounds, area.bounds)) {
-            def idx = activeGhosts.indexOf(targetedCluster) + 1
-            statusText = "Currently targeting Ghost ${idx}"
-            accent = "#2563eb"
+        def escapingGhosts = overlappingGhosts.findAll { cluster ->
+            cluster?.bounds && !isBoundsWithinBounds(cluster.bounds as Map, area.bounds as Map)
         }
-        else if (targetedCluster?.bounds && boundsOverlap(targetedCluster.bounds, area.bounds)) {
-            def idx = activeGhosts.indexOf(targetedCluster) + 1
-            statusText = "Currently targeting Ghost ${idx}, but the ghost now extends beyond this area"
+
+        def containingIndexes = containingGhosts.collect { activeGhosts.indexOf(it) + 1 }
+        def overlappingIndexes = overlappingGhosts.collect { activeGhosts.indexOf(it) + 1 }
+        def statusText = "Configured, but no current ghost overlap"
+        if (containingIndexes) {
+            statusText = "Fully contains Ghost${containingIndexes.size() == 1 ? '' : 's'} ${containingIndexes.join(', ')}"
+            accent = escapingGhosts ? "#b91c1c" : "#0f766e"
+        } else if (overlappingIndexes) {
+            statusText = "Overlaps Ghost${overlappingIndexes.size() == 1 ? '' : 's'} ${overlappingIndexes.join(', ')}"
             accent = "#b91c1c"
         } else {
-            def exactMatch = activeGhosts.find { cluster ->
-                cluster?.bounds && sameBounds(cluster.bounds, area.bounds)
-            }
-            if (exactMatch) {
-                def idx = activeGhosts.indexOf(exactMatch) + 1
-                statusText = "Matches Ghost ${idx}"
-                accent = "#2563eb"
-            } else {
-                def overlappingCluster = activeGhosts.find { cluster ->
-                    cluster?.bounds && boundsOverlap(cluster.bounds, area.bounds)
-                }
-                if (overlappingCluster) {
-                    def idx = activeGhosts.indexOf(overlappingCluster) + 1
-                    if (isBoundsWithinBounds(overlappingCluster.bounds, area.bounds)) {
-                        statusText = "Contains Ghost ${idx}"
-                        accent = "#0f766e"
-                    } else {
-                        statusText = "May be using older bounds than Ghost ${idx}"
-                        accent = "#b91c1c"
-                    }
-                } else {
-                    accent = "#d97706"
-                }
-            }
+            accent = "#d97706"
         }
 
         "<div style='border-left:4px solid ${accent}; background:#ffffff; padding:8px 10px; margin:6px 0;'>" +
@@ -5874,7 +6569,7 @@ private String renderCorrelationEventDefinitions(deviceId) {
 private String renderAreaAssignmentSummaryCard(deviceId) {
     def devKey = deviceKey(deviceId)
     def activeGhosts = (getTrackedGhostsForDisplay(deviceId) ?: []) as List
-    def areas = getRememberedInterferenceAreas(devKey)
+    def areas = loadLiveInterferenceAreas(devKey)
 
     if (!areas) {
         return getInterface("deviceSubHeader", "Interference Area Controls") +
@@ -5888,39 +6583,22 @@ private String renderAreaAssignmentSummaryCard(deviceId) {
             text = "Area ${area.areaIndex}: No area configured"
             accent = "#94a3b8"
         } else {
-            def targetedCluster = activeGhosts.find { cluster ->
-                (cluster?.targetAreaIndex as Integer) == (area.areaIndex as Integer)
-            }
-            if (targetedCluster) {
-                def idx = activeGhosts.indexOf(targetedCluster) + 1
-                def stale = targetedCluster?.bounds && boundsOverlap(targetedCluster.bounds, area.bounds) && !isBoundsWithinBounds(targetedCluster.bounds, area.bounds)
-                text = stale ?
-                        "Area ${area.areaIndex}: Ghost ${idx} targeted, but the ghost now extends beyond this area" :
-                        "Area ${area.areaIndex}: Ghost ${idx} targeted"
-                accent = stale ? "#b91c1c" : "#2563eb"
+            def containingIndexes = activeGhosts.findAll { cluster ->
+                cluster?.bounds && isBoundsWithinBounds(cluster.bounds as Map, area.bounds as Map)
+            }.collect { activeGhosts.indexOf(it) + 1 }
+            def overlappingIndexes = activeGhosts.findAll { cluster ->
+                cluster?.bounds && boundsOverlap(cluster.bounds as Map, area.bounds as Map)
+            }.collect { activeGhosts.indexOf(it) + 1 }
+
+            if (containingIndexes) {
+                text = "Area ${area.areaIndex}: Fully contains Ghost${containingIndexes.size() == 1 ? '' : 's'} ${containingIndexes.join(', ')}"
+                accent = "#0f766e"
+            } else if (overlappingIndexes) {
+                text = "Area ${area.areaIndex}: Overlaps Ghost${overlappingIndexes.size() == 1 ? '' : 's'} ${overlappingIndexes.join(', ')}"
+                accent = "#b91c1c"
             } else {
-                def exactMatch = activeGhosts.find { cluster ->
-                    cluster?.bounds && sameBounds(cluster.bounds, area.bounds)
-                }
-                if (exactMatch) {
-                    def idx = activeGhosts.indexOf(exactMatch) + 1
-                    text = "Area ${area.areaIndex}: Matches Ghost ${idx}"
-                    accent = "#2563eb"
-                } else {
-                    def overlappingCluster = activeGhosts.find { cluster ->
-                        cluster?.bounds && boundsOverlap(cluster.bounds, area.bounds)
-                    }
-                    if (overlappingCluster) {
-                        def idx = activeGhosts.indexOf(overlappingCluster) + 1
-                        text = isBoundsWithinBounds(overlappingCluster.bounds, area.bounds) ?
-                                "Area ${area.areaIndex}: Contains Ghost ${idx}" :
-                                "Area ${area.areaIndex}: Overlaps Ghost ${idx}, but the assignment may be stale"
-                        accent = isBoundsWithinBounds(overlappingCluster.bounds, area.bounds) ? "#0f766e" : "#b91c1c"
-                    } else {
-                        text = "Area ${area.areaIndex}: Configured, no current ghost match"
-                        accent = "#d97706"
-                    }
-                }
+                text = "Area ${area.areaIndex}: Configured, no current ghost overlap"
+                accent = "#d97706"
             }
         }
 
@@ -5933,7 +6611,7 @@ private String renderAreaAssignmentSummaryCard(deviceId) {
             "</div>"
 }
 
-private String renderDeviceStatsCard(dev, String devKey, Map displayCounts, Map displayData, Map lastSummary, List trackedGhosts, Integer archivedGhostCount, Integer escapingPointCount, Map xyScale) {
+private String renderDeviceStatsCard(dev, String devKey, Map displayCounts, Map displayData, Map lastSummary, List trackedGhosts, Integer archivedGhostCount, Integer escapingPointCount, Map xyScale, Map xyPointBuckets = null, Map xzPointBuckets = null) {
     def ghostDetailActions = [
             buttonLink("reclusterDevice_${devKey}", "<div style='float:right;vertical-align:middle; margin:4px;'><b><font size=3>Re-evaluate</font></b></div>", "#1A77C9", 14)
     ]
@@ -5959,9 +6637,9 @@ private String renderDeviceStatsCard(dev, String devKey, Map displayCounts, Map 
         html << getInterface("deviceSubHeaderWithRightLink", "Ghost Details", ghostDetailActions.join(""))
         html << renderSideBySidePlots(
                 "X / Y View",
-                renderClusterPlot(displayData.points, displayData.outOfBoundsPoints, displayData.currentClusters, displayData.historicalClusters, dev, "x", "y", xyScale, displayData.pointsPendingProcessing as boolean),
+                renderClusterPlot(displayData.points, displayData.outOfBoundsPoints, displayData.currentClusters, displayData.historicalClusters, dev, "x", "y", xyScale, displayData.pointsPendingProcessing as boolean, xyPointBuckets),
                 "X / Z View",
-                renderClusterPlot(displayData.points, displayData.outOfBoundsPoints, displayData.currentClusters, displayData.historicalClusters, dev, "x", "z", xyScale, displayData.pointsPendingProcessing as boolean)
+                renderClusterPlot(displayData.points, displayData.outOfBoundsPoints, displayData.currentClusters, displayData.historicalClusters, dev, "x", "z", xyScale, displayData.pointsPendingProcessing as boolean, xzPointBuckets)
         )
 
         if (totalGraphPoints > safeMaxGraphPointsPerDevice()) {
@@ -5972,7 +6650,7 @@ private String renderDeviceStatsCard(dev, String devKey, Map displayCounts, Map 
         }
 
         if ((displayCounts.leakingGhosts ?: 0) > 0 || (displayCounts.escapingGhosts ?: 0) > 0 || escapingPointCount > 0) {
-            html << buildGhostAlertsHtml(displayCounts.leakingGhosts as Integer, escapingPointCount as Integer)
+            html << buildGhostAlertsHtml(displayCounts.escapingGhosts as Integer, escapingPointCount as Integer)
         }
 
         if (trackedGhosts) {
@@ -6029,7 +6707,7 @@ private String renderDeviceStatsCard(dev, String devKey, Map displayCounts, Map 
     html.toString()
 }
 
-private String renderAllDevicesSummaryCard(Map networkSummary, def recommendation) {
+private String renderAllDevicesSummaryCard(Map networkSummary, List recommendations, def recommendation) {
     def html = new StringBuilder()
     html << "<div style='border:1px solid #bfccda; background:#eef4f8; padding:10px; margin:8px 0 14px 0; box-shadow:1px 2px #d8e2ea;'>"
     html << getInterface("deviceHeaderWithRightLink", "All Devices Summary", "")
@@ -6040,7 +6718,7 @@ private String renderAllDevicesSummaryCard(Map networkSummary, def recommendatio
         html << networkSummary._html as String
     }
     if (recommendation) {
-        html << renderRecommendationSummary(recommendation)
+        html << renderRecommendationsSummary(recommendations, recommendation)
     }
     html << "</div>"
     html.toString()
@@ -6122,14 +6800,15 @@ private String percent(Number numerator, Number denominator) {
 private String renderClusterDetails(Map cluster, Integer displayIndex, String devKey) {
     def bounds = cluster.bounds ?: [:]
     def status = determineGhostState(devKey, cluster)
-    def rememberedArea = getRememberedAreaForGhost(devKey, cluster)
-    def effectiveTargetIndex = cluster.targetAreaIndex != null ? cluster.targetAreaIndex : rememberedArea?.areaIndex
-    def effectiveTargetSource = cluster.targetSource ?: rememberedArea?.source
-    def leaking = isGhostLeaking(devKey, cluster)
-    def escaping = isGhostEscaping(devKey, cluster)
+    def primaryArea = findPrimaryAreaForGhost(devKey, cluster)
+    def overlappingAreas = findOverlappingAreasForGhost(devKey, cluster)
+    def containingAreas = findContainingAreasForGhost(devKey, cluster)
+    def escaping = checkGhostEscaping(devKey, cluster)
+    def insideCoverageFailure = hasCoverageFailureInsideArea(devKey, cluster)
     def statusStyle = ghostStatusNoteStyle(status)
     def episodeCount = countGhostEpisodesForCluster(devKey, cluster)
     def episodeAvg = averageGhostEpisodesPerDay(devKey, cluster)
+    def freeAreaIndexes = getFreeInterferenceAreaIndexes(devKey)
 
     def hasPoints = cluster.points && cluster.points.size() > 0
     def clusterKey = "${devKey}_cluster_${displayIndex}"
@@ -6149,29 +6828,31 @@ private String renderClusterDetails(Map cluster, Integer displayIndex, String de
 
     def detailNotes = []
 
-    if (rememberedArea?.bounds) {
-        detailNotes << "<div style='margin-bottom:6px;'><span style='color:${statusStyle.label}; font-size:11px; text-transform:uppercase; letter-spacing:0.04em;'>Targeting</span><div style='margin-top:2px; color:#111827; line-height:1.35;'>${describeGhostTargeting(devKey, cluster)}</div></div>"
-        detailNotes << "<div style='margin-bottom:6px;'><span style='color:#64748b; font-size:11px; text-transform:uppercase; letter-spacing:0.04em;'>Area ${effectiveTargetIndex}</span><div style='margin-top:2px; color:#111827; line-height:1.35;'>X ${round2(rememberedArea.bounds.xmin)}..${round2(rememberedArea.bounds.xmax)}, Y ${round2(rememberedArea.bounds.ymin)}..${round2(rememberedArea.bounds.ymax)}, Z ${round2(rememberedArea.bounds.zmin)}..${round2(rememberedArea.bounds.zmax)} cm</div></div>"
-        detailNotes << "<div style='margin-bottom:6px;'><span style='color:#64748b; font-size:11px; text-transform:uppercase; letter-spacing:0.04em;'>Area fit</span><div style='margin-top:2px; color:#111827; line-height:1.35;'>${leaking ? "Ghost exceeds area: ${describeGhostAreaExpansion(devKey, cluster)}" : "Ghost does not currently exceed the targeted area"}</div></div>"
+    if (overlappingAreas) {
+        detailNotes << "<div style='margin-bottom:6px;'><span style='color:${statusStyle.label}; font-size:11px; text-transform:uppercase; letter-spacing:0.04em;'>Coverage</span><div style='margin-top:2px; color:#111827; line-height:1.35;'>${describeGhostTargeting(devKey, cluster)}</div></div>"
+        if (primaryArea?.bounds) {
+            detailNotes << "<div style='margin-bottom:6px;'><span style='color:#64748b; font-size:11px; text-transform:uppercase; letter-spacing:0.04em;'>Primary Area ${primaryArea.areaIndex}</span><div style='margin-top:2px; color:#111827; line-height:1.35;'>X ${round2(primaryArea.bounds.xmin)}..${round2(primaryArea.bounds.xmax)}, Y ${round2(primaryArea.bounds.ymin)}..${round2(primaryArea.bounds.ymax)}, Z ${round2(primaryArea.bounds.zmin)}..${round2(primaryArea.bounds.zmax)} cm</div></div>"
+        }
+        detailNotes << "<div style='margin-bottom:6px;'><span style='color:#64748b; font-size:11px; text-transform:uppercase; letter-spacing:0.04em;'>Area fit</span><div style='margin-top:2px; color:#111827; line-height:1.35;'>${escaping ? "Ghost exceeds the overlapping area: ${describeGhostAreaExpansion(devKey, cluster)}" : containingAreas ? "Ghost is fully contained by at least one interference area" : "Ghost overlaps an interference area but does not fully fit within it"}</div></div>"
     }
     if (escaping) {
-        def escapingMode = getEscapingGhostMode(devKey, cluster)
-        def escapingMessage = escapingMode == "inside-area" ?
-                "Occupancy-contributing points are still appearing inside Area ${effectiveTargetIndex}" :
-                escapingMode == "adjacent" ?
-                        "Occupancy-contributing points adjacent to Area ${effectiveTargetIndex} suggest the area should be expanded" :
-                        "Occupancy-contributing points are appearing both inside and just outside Area ${effectiveTargetIndex}"
+        def escapingMessage = "Ghost extends beyond Area ${primaryArea?.areaIndex}; expansion is recommended"
         detailNotes << "<div style='margin-bottom:0;'><span style='color:#b91c1c; font-size:11px; text-transform:uppercase; letter-spacing:0.04em;'>Escaping alert</span><div style='margin-top:2px; color:#111827; line-height:1.35;'>${escapingMessage}</div></div>"
+    }
+    if (insideCoverageFailure) {
+        detailNotes << "<div style='margin-bottom:0;'><span style='color:#b91c1c; font-size:11px; text-transform:uppercase; letter-spacing:0.04em;'>Leaking Inside</span><div style='margin-top:2px; color:#111827; line-height:1.35;'>Points are still leaking inside Area ${primaryArea?.areaIndex}; the interference area may not be working correctly.</div></div>"
     }
 
     def html = new StringBuilder()
     html << "<div style='border:1px solid #d7d7d7; background:#fbfbfb; padding:8px 10px; margin:4px 0;'>"
     def headerActions = []
-    if (leaking && rememberedArea?.bounds) {
+    if (escaping && primaryArea?.bounds) {
         headerActions << buttonLink("expandGhost_${devKey}_${displayIndex}", "<div style='float:right;vertical-align:middle; margin:2px 4px;'><b><font size=3>Expand</font></b></div>", "#1A77C9", 13)
+    } else if (!containingAreas && freeAreaIndexes) {
+        headerActions << buttonLink("targetGhost_${devKey}_${displayIndex}", "<div style='float:right;vertical-align:middle; margin:2px 4px;'><b><font size=3>Cover</font></b></div>", "#0f766e", 13)
     }
     headerActions << buttonLink("clearGhost_${devKey}_${displayIndex}", "<div style='float:right;vertical-align:middle; margin:2px 4px;'><b><font size=3>Clear</font></b></div>", "#b91c1c", 13)
-    html << "<div style='margin:-8px -10px 8px -10px; padding:8px 10px; background:${statusStyle.background}; border-bottom:1px solid ${statusStyle.border}; font-weight:bold; color:#111827; overflow:auto;'><div style='display:inline-block;'>Ghost ${displayIndex}: ${status}</div><div style='float:right; display:inline-block; text-align:center;'>${headerActions.join('')}</div></div>"
+    html << "<div style='margin:-8px -10px 8px -10px; padding:8px 10px; background:${statusStyle.background}; border-bottom:1px solid ${statusStyle.border}; font-weight:bold; color:${statusStyle.label}; overflow:auto;'><div style='display:inline-block;'>Ghost ${displayIndex}: ${status}</div><div style='float:right; display:inline-block; text-align:center;'>${headerActions.join('')}</div></div>"
     html << "<table style='width:100%; border-collapse:collapse;'>"
     stats.each { label, value ->
         html << "<tr>"
@@ -6187,8 +6868,9 @@ private String renderClusterDetails(Map cluster, Integer displayIndex, String de
     // Add cluster splitting controls if the cluster has points
     if (hasPoints && cluster.density >= safeMinClusterEvents() * 2) {
         html << "<div style='margin-top:8px;'>"
-        html << "<input name='splitClusterRadius_${clusterKey}' type='decimal' title='Split radius (cm)' value='${round2(cluster.radius * 0.5)}' style='width:80px;'/> "
-        html << "<input name='splitCluster_${clusterKey}' type='button' value='Split Cluster ${displayIndex}' style='margin-left:4px;'/>"
+        html << "<div style='color:#475569; font-size:11px; margin-bottom:6px;'>Split this ghost into smaller ghosts when one large cluster looks like multiple separate hotspots. Use a smaller re-clustering radius to test that.</div>"
+        html << "<input name='splitClusterRadius_${clusterKey}' type='decimal' title='Smaller re-clustering radius (cm)' value='${round2(cluster.radius * 0.5)}' style='width:110px;'/> "
+        html << "<input name='splitCluster_${clusterKey}' type='button' value='Split Ghost ${displayIndex}' style='margin-left:4px;'/>"
         html << "</div>"
     }
 
@@ -6266,6 +6948,7 @@ private Map ghostStatusNoteStyle(String status) {
         case "Escaping":
             return [border: "#ef9a9a", background: "#fff1f2", label: "#b91c1c"]
         case "Targeted":
+        case "Covered":
             return [border: "#f4a261", background: "#fff4eb", label: "#c2410c"]
         case "Persistent":
             return [border: "#e9c46a", background: "#fffbea", label: "#a16207"]
@@ -6276,43 +6959,56 @@ private Map ghostStatusNoteStyle(String status) {
     }
 }
 
-private String describeClusterOption(Map cluster, Integer idx) {
+private String describeClusterOption(Integer idx) {
     "Ghost ${idx + 1}"
-}
-
-private String describeInterferenceAreaAssignment(deviceId, Integer areaIndex) {
-    def devKey = deviceKey(deviceId)
-    def rememberedArea = getRememberedInterferenceAreas(devKey).find { (it.areaIndex as Integer) == areaIndex }
-    if (!rememberedArea) {
-        return "No remembered bounds"
-    }
-
-    def matchedGhosts = []
-    getStableClusters(deviceId).findAll { ghost ->
-        boundsOverlap(ghost.bounds, rememberedArea.bounds)
-    }.eachWithIndex { ghost, idx ->
-        matchedGhosts << "Ghost ${idx + 1} (${determineGhostState(devKey, ghost)})"
-    }
-
-    def ghostSummary = matchedGhosts ? matchedGhosts.join(", ") : "no tracked ghost overlap"
-    "Area ${areaIndex}: ${ghostSummary}"
 }
 
 private String renderRecommendationSummary(def recommendation) {
     if (recommendation?.message) {
-        return renderNoteCard("Recommendation", recommendation.message as String)
+        return renderNoteCard("Recommendation Status", recommendation.message as String)
     }
 
     def bounds = recommendation.bounds ?: [:]
     renderStatBlock("Recommended Interference Area", [
             "Device": recommendation.deviceName,
             "Action": describeRecommendationAction(recommendation),
-            "Reason": recommendation.reason == "leaking" ? "Targeted ghost is leaking beyond its current area" : "Persistent ghost should be targeted",
+            "Reason": recommendation.reason == "leaking" ?
+                    "Ghost overlaps an interference area but extends beyond it" :
+                    recommendation.reason == "overlap" ?
+                            "Persistent ghost overlaps an existing area that can be expanded" :
+                            "Persistent ghost should be covered by an interference area",
             "X bounds": "${round2(bounds.xmin)} to ${round2(bounds.xmax)} cm",
             "Y bounds": "${round2(bounds.ymin)} to ${round2(bounds.ymax)} cm",
             "Z bounds": "${round2(bounds.zmin)} to ${round2(bounds.zmax)} cm",
             "Stability": "${round2(Math.min(100.0d, (recommendation.stabilityPct ?: 0.0d) as Double))}%"
     ])
+}
+
+private String renderRecommendationsSummary(List recommendations, def fallbackRecommendation = null) {
+    if (fallbackRecommendation?.message) {
+        return renderRecommendationSummary(fallbackRecommendation)
+    }
+
+    def plans = (recommendations ?: []).findAll { it && !it.message }
+    if (!plans) {
+        return fallbackRecommendation ? renderRecommendationSummary(fallbackRecommendation) : ""
+    }
+
+    if (plans.size() == 1) {
+        return renderRecommendationSummary(plans[0])
+    }
+
+    def rows = plans.collect { recommendation ->
+        def bounds = recommendation.bounds ?: [:]
+        "<div style='border-left:4px solid #bfdbfe; background:#ffffff; padding:8px 10px; margin:6px 0;'>" +
+                "<div style='font-weight:bold; color:#111827; margin-bottom:4px;'>${recommendation.deviceName}</div>" +
+                "<div style='color:#475569; margin-bottom:3px;'>${describeRecommendationAction(recommendation)}</div>" +
+                "<div style='color:#111827;'>X ${round2(bounds.xmin)}..${round2(bounds.xmax)}, Y ${round2(bounds.ymin)}..${round2(bounds.ymax)}, Z ${round2(bounds.zmin)}..${round2(bounds.zmax)} cm</div>" +
+                "<div style='color:#475569; margin-top:3px;'>Stability ${round2(Math.min(100.0d, (recommendation.stabilityPct ?: 0.0d) as Double))}%</div>" +
+                "</div>"
+    }
+
+    renderNoteCard("Recommended Interference Areas", "Showing the current qualifying recommendation for each device.<div style='margin-top:8px;'>${rows.join('')}</div>")
 }
 
 private String describeRecommendationAction(def recommendation) {
@@ -6321,7 +7017,7 @@ private String describeRecommendationAction(def recommendation) {
     }
     if (recommendation.action == "expand" && recommendation.areaIndex != null) {
         if (recommendation.reason == "leaking") {
-            return "Expand interference area ${recommendation.areaIndex} to cover a leaking ghost"
+            return "Expand interference area ${recommendation.areaIndex} to cover more of the ghost"
         }
         return "Expand interference area ${recommendation.areaIndex}"
     }
@@ -6360,23 +7056,6 @@ Z ${round2(bounds.zmin)}..${round2(bounds.zmax)} cm
 Stability ${round2(recommendation.stabilityPct ?: 0)}%"""
 }
 
-private Map getMainPageOverviewStats() {
-    def deviceCount = (mmwaveDevices ?: []).size()
-    def activeCount = 0
-    mmwaveDevices?.each { dev ->
-        if (isDeviceActive(dev)) {
-            activeCount += 1
-        }
-    }
-
-    [
-            "Configured devices": deviceCount,
-            "Active devices now": activeCount,
-            "Detection modes": ghostModes ? ghostModes.size() : 0,
-            "Processed days": state.totalDays ?: 0
-    ]
-}
-
 private String describeAutoBustConfiguration() {
     def boundary = getAutoGhostBustBoundary()
     def mode = (autoBustMode == "Apply the overlapping part of the cluster, clamped to the boundary") ?
@@ -6393,35 +7072,6 @@ private boolean shouldProcessPointsOnDetectionInactive() {
     processPointsOnDetectionInactive == true
 }
 
-private String describeBustMode(Map cluster) {
-    if (isClusterBusted(cluster)) {
-        return "Area ${cluster.targetAreaIndex} (${describeTargetSource(cluster.targetSource)}) eliminated this ghost for ${cluster.absentStreak ?: 0} active day(s)"
-    }
-
-    if (isClusterTargeted(cluster)) {
-        return "Area ${cluster.targetAreaIndex} (${describeTargetSource(cluster.targetSource)}) is targeting this ghost"
-    }
-
-    if (isClusterPersistent(cluster)) {
-        return "Persistent but not targeted"
-    }
-
-    "Detected but not persistent"
-}
-
-private String determineClusterState(Map cluster) {
-    if (isClusterBusted(cluster)) {
-        return "Busted"
-    }
-    if (isClusterTargeted(cluster)) {
-        return "Targeted"
-    }
-    if (isClusterPersistent(cluster)) {
-        return "Persistent"
-    }
-    "Detected"
-}
-
 private void sendGhostLifecycleNotifications(dev, List previousStableClusters) {
     if (!sendPush || !dev) {
         return
@@ -6430,21 +7080,21 @@ private void sendGhostLifecycleNotifications(dev, List previousStableClusters) {
     def devKey = deviceKey(dev.id)
     def currentStableClusters = ((state.stabilityData[devKey] ?: []) as List).collect { cloneCluster(it) }
     def newDetectedGhosts = countNewGhostState(previousStableClusters, currentStableClusters) { ghost ->
-        !isGhostBusted(devKey, ghost) && ((ghost.daysSeen ?: 0) > 0)
+        !checkGhostBusted(devKey, ghost) && ((ghost.daysSeen ?: 0) > 0)
     }
     def newPersistentGhosts = countNewGhostState(previousStableClusters, currentStableClusters) { ghost ->
-        isClusterPersistent(ghost) && !isGhostBusted(devKey, ghost)
+        isClusterPersistent(ghost) && !checkGhostBusted(devKey, ghost)
     }
     def newBustedGhosts = countNewGhostState(previousStableClusters, currentStableClusters, { ghost ->
-        isGhostBusted(devKey, ghost)
+        checkGhostBusted(devKey, ghost)
     }, { ghost ->
-        isGhostBusted(devKey, ghost)
+        checkGhostBusted(devKey, ghost)
     })
     def newTargetedPersistentGhosts = countNewGhostState(previousStableClusters, currentStableClusters) { ghost ->
-        isClusterPersistent(ghost) && isGhostTargeted(devKey, ghost) && !isGhostBusted(devKey, ghost)
+        isClusterPersistent(ghost) && checkGhostTargeted(devKey, ghost) && !checkGhostBusted(devKey, ghost)
     }
     def newEscapingGhosts = countNewGhostState(previousStableClusters, currentStableClusters) { ghost ->
-        isGhostEscaping(devKey, ghost) && !isGhostBusted(devKey, ghost)
+        checkGhostEscaping(devKey, ghost) && !checkGhostBusted(devKey, ghost)
     }
 
     if (notifyOnAnyGhostDetected && newDetectedGhosts > 0) {
@@ -6457,10 +7107,10 @@ private void sendGhostLifecycleNotifications(dev, List previousStableClusters) {
         sendNotification("${dev.displayName}: ${newBustedGhosts} ghost${newBustedGhosts == 1 ? '' : 's'} ${newBustedGhosts == 1 ? 'was' : 'were'} busted.")
     }
     if (notifyOnTargetedPersistentGhost && newTargetedPersistentGhosts > 0) {
-        sendNotification("${dev.displayName}: ${newTargetedPersistentGhosts} targeted persistent ghost${newTargetedPersistentGhosts == 1 ? ' is' : 's are'} still active, so the interference area may not be working.")
+        sendNotification("${dev.displayName}: ${newTargetedPersistentGhosts} covered persistent ghost${newTargetedPersistentGhosts == 1 ? ' is' : 's are'} still active, so the interference area may not be working.")
     }
     if (notifyOnEscapingGhost && newEscapingGhosts > 0) {
-        sendNotification("${dev.displayName}: ${newEscapingGhosts} targeted ghost${newEscapingGhosts == 1 ? '' : 's'} ${newEscapingGhosts == 1 ? 'is' : 'are'} escaping from inside the configured interference area.")
+        sendNotification("${dev.displayName}: ${newEscapingGhosts} covered ghost${newEscapingGhosts == 1 ? '' : 's'} ${newEscapingGhosts == 1 ? 'extends' : 'extend'} beyond the configured interference area.")
     }
 }
 
@@ -6480,37 +7130,37 @@ private Integer countNewGhostState(List previousStableClusters, List currentStab
 }
 
 private String describeGhostTargeting(String devKey, Map cluster) {
-    def rememberedArea = getRememberedAreaForGhost(devKey, cluster)
-    def effectiveTargetIndex = cluster.targetAreaIndex != null ? cluster.targetAreaIndex : rememberedArea?.areaIndex
+    def overlappingAreas = findOverlappingAreasForGhost(devKey, cluster)
+    def containingAreas = findContainingAreasForGhost(devKey, cluster)
+    def primaryArea = findPrimaryAreaForGhost(devKey, cluster)
     def escapingMode = getEscapingGhostMode(devKey, cluster)
+    def areaIndexes = overlappingAreas.collect { it.areaIndex as Integer }.unique().sort()
 
-    if (isGhostBusted(devKey, cluster)) {
-        return "Area ${effectiveTargetIndex} is containing this ghost; current points are fully ignored inside the target area"
-    }
-
-    if (escapingMode == "both") {
-        return "Area ${effectiveTargetIndex} is being escaped from both inside the area and just beyond its boundary; review the area settings and consider expansion"
-    }
-    if (escapingMode == "inside-area") {
-        return "Area ${effectiveTargetIndex} is being escaped from inside the area; review the interference area settings"
-    }
-    if (escapingMode == "adjacent") {
-        return "Area ${effectiveTargetIndex} is targeting this ghost, but the ghost extends beyond the area; expansion is recommended"
+    if (checkGhostBusted(devKey, cluster)) {
+        return "Interference area${areaIndexes.size() == 1 ? '' : 's'} ${areaIndexes.join(', ')} contain this ghost; current points are fully ignored inside the covered area"
     }
 
-    if (isGhostTargeted(devKey, cluster)) {
-        return "Area ${effectiveTargetIndex} is targeting this ghost"
+    if (escapingMode == "beyond") {
+        return "Ghost overlaps area${areaIndexes.size() == 1 ? '' : 's'} ${areaIndexes.join(', ')}, but extends beyond the current coverage; expansion is recommended"
+    }
+
+    if (containingAreas) {
+        return "Fully covered by interference area${containingAreas.size() == 1 ? '' : 's'} ${containingAreas.collect { it.areaIndex as Integer }.unique().sort().join(', ')}"
+    }
+
+    if (overlappingAreas) {
+        return "Overlaps interference area${overlappingAreas.size() == 1 ? '' : 's'} ${areaIndexes.join(', ')}"
     }
 
     if (isClusterPersistent(cluster)) {
-        return "Persistent but not targeted"
+        return "Persistent but not covered"
     }
 
     "Detected but not persistent"
 }
 
 private String determineGhostState(String devKey, Map cluster) {
-    if (isGhostBusted(devKey, cluster)) {
+    if (checkGhostBusted(devKey, cluster)) {
         return "Busted"
     }
     if (!hasLiveGhostEvidence(devKey)) {
@@ -6518,25 +7168,22 @@ private String determineGhostState(String devKey, Map cluster) {
             return "Escaping"
         }
         if (cluster?.ghostStateSnapshot) {
-            return cluster.ghostStateSnapshot as String
+            return (cluster.ghostStateSnapshot == "Targeted") ? "Covered" : (cluster.ghostStateSnapshot as String)
         }
     }
-    if (isGhostEscaping(devKey, cluster)) {
+    if (checkGhostEscaping(devKey, cluster)) {
         return "Escaping"
     }
-    if (isGhostTargeted(devKey, cluster)) {
-        return "Targeted"
+    if (checkGhostLeaking(devKey, cluster)) {
+        return "Escaping"
+    }
+    if (checkGhostTargeted(devKey, cluster)) {
+        return "Covered"
     }
     if (isClusterPersistent(cluster)) {
         return "Persistent"
     }
     "Detected"
-}
-
-private boolean isGhostLeakProblem(String devKey, Map cluster) {
-    isGhostTargeted(devKey, cluster) &&
-            !isGhostBusted(devKey, cluster) &&
-            hasProblemInterferencePointsForGhost(devKey, cluster)
 }
 
 private String describeTargetSource(String source) {
@@ -6576,38 +7223,9 @@ private Map getConfigurationSummaryStats() {
             "Processing": shouldProcessPointsOnDetectionInactive() ? "On detection inactive + daily boundary fallback" : "Daily boundary only",
             "Positional clustering": "${clusteringAlgorithm ?: 'DBSCAN'} / r=${clusterRadius ?: 50}cm / min=${minClusterEvents ?: 5} / bin=${round2(safePointBinSizeCm())}cm",
             "Persistence": "history ${historyDays ?: 14}d / persistent ${persistentGhostDays ?: 2}d / busted ${bustedGhostDays ?: 2}d",
-            "Display": "detected grace ${safeDisplayGraceDays()}d / historical overlays ${showHistoricalGhostOverlaysEnabled() ? 'on' : 'off'}",
+            "Display": "detected grace ${safeDisplayGraceDays()}d / historical overlays ${showHistoricalGhostOverlaysEnabled() ? 'on' : 'off'} / pending points ${showPendingPointsOnGraphsEnabled() ? 'graphed' : 'hidden'}",
             "Auto busting": enableAutoGhostBusting ? describeAutoBustConfiguration() : "Disabled",
             "Notifications": sendPush ? "Enabled" : "Disabled"
-    ]
-}
-
-private Map getMainPageStatsSummary() {
-    def ghosts = 0
-    def detected = 0
-    def persistent = 0
-    def targeted = 0
-    def busted = 0
-    def pointsProcessed = 0
-
-    mmwaveDevices?.each { dev ->
-        def displayCounts = getDisplayCounts(dev.id)
-        def summary = getSummaryForDevice(dev.id)
-        ghosts += displayCounts.ghostsToday ?: 0
-        detected += displayCounts.detectedGhosts ?: 0
-        persistent += displayCounts.persistentGhosts ?: 0
-        targeted += displayCounts.targetedGhosts ?: 0
-        busted += displayCounts.bustedGhosts ?: 0
-        pointsProcessed += summary.pointCount ?: 0
-    }
-
-    [
-            "Detected ghosts": detected,
-            "Persistent ghosts": persistent,
-            "Targeted ghosts": targeted,
-            "Busted ghosts": busted,
-            "Last processed ghosts": ghosts,
-            "Points in last run": pointsProcessed
     ]
 }
 
@@ -6618,27 +7236,25 @@ private Map getMainPageHeadlineSummary() {
     def escaping = 0
     def busted = 0
     def leaking = 0
-    def escapingPoints = 0
 
     mmwaveDevices?.each { dev ->
-        def displayCounts = getDisplayCounts(dev.id)
-        detected += displayCounts.detectedGhosts ?: 0
-        persistent += displayCounts.persistentGhosts ?: 0
-        targeted += displayCounts.targetedGhosts ?: 0
-        escaping += displayCounts.escapingGhosts ?: 0
-        busted += displayCounts.bustedGhosts ?: 0
-        leaking += displayCounts.leakingGhosts ?: 0
-        escapingPoints += getEscapingPointCount(dev.id) ?: 0
+        def summary = getSummaryForDevice(dev.id)
+        detected += summary.detectedGhosts ?: 0
+        persistent += summary.persistentGhosts ?: 0
+        targeted += summary.targetedGhosts ?: 0
+        escaping += summary.escapingGhosts ?: 0
+        busted += summary.bustedGhosts ?: 0
+        leaking += summary.leakingGhosts ?: 0
     }
 
     def stats = [
             "Detected": detected,
             "Persistent": persistent,
-            "Targeted": targeted,
+            "Covered": targeted,
             "Escaping": escaping,
             "Busted": busted
     ]
-    def alertHtml = buildGhostAlertsHtml(leaking as Integer, escapingPoints as Integer)
+    def alertHtml = buildGhostAlertsHtml(leaking as Integer, escaping as Integer)
     if (alertHtml) {
         stats._html = alertHtml
     }
@@ -6854,17 +7470,7 @@ private Map enrichClusterWithGhostSnapshotData(String devKey, Map cluster, dev, 
 
 private Map buildGhostSnapshotData(String devKey, Map cluster, dev, Map liveCluster = null, List rawPoints = null, List rawOutOfBoundsPoints = null) {
     def effectiveCluster = liveCluster ?: cluster
-    def targetArea = getRememberedAreaForGhost(devKey, cluster)
-    def allPoints = []
-    allPoints.addAll(rawPoints ?: [])
-    allPoints.addAll(rawOutOfBoundsPoints ?: [])
-    def pointBuckets = classifyPlotPoints(rawPoints ?: [], rawOutOfBoundsPoints ?: [], dev)
-    def escapingInsidePoints = ((pointBuckets.occupancyAssociatedInterferencePoints ?: []) as List).findAll { point ->
-        targetArea?.bounds &&
-                isPointWithinBounds(point.x as Double, point.y as Double, point.z as Double, targetArea.bounds) &&
-                effectiveCluster?.bounds &&
-                isPointWithinBounds(point.x as Double, point.y as Double, point.z as Double, effectiveCluster.bounds)
-    }
+    def targetArea = findLiveAreaForGhost(devKey, cluster)
     def escapingAdjacentPoints = ((effectiveCluster?.points ?: []) as List).findAll { point ->
         point?.ghostEligible != false &&
                 targetArea?.bounds &&
@@ -6875,25 +7481,18 @@ private Map buildGhostSnapshotData(String devKey, Map cluster, dev, Map liveClus
             boundsOverlap(effectiveCluster.bounds, targetArea.bounds) &&
             !isBoundsWithinBounds(effectiveCluster.bounds, targetArea.bounds)
 
-    def escapingPoints = []
-    escapingPoints.addAll(escapingInsidePoints.collect { clonePoint(it) })
-    escapingPoints.addAll(escapingAdjacentPoints)
-
-    def escapingMode = escapingInsidePoints && (escapingAdjacentPoints || escapingAdjacentByBounds) ? "both" :
-            escapingInsidePoints ? "inside-area" :
-                    (escapingAdjacentPoints || escapingAdjacentByBounds) ? "adjacent" :
-                            null
+    def escapingMode = (escapingAdjacentPoints || escapingAdjacentByBounds) ? "beyond" : null
 
     def computedState = targetArea?.bounds ?
-            (escapingMode ? "Escaping" : (isGhostTargeted(devKey, cluster) ? "Targeted" : (isClusterPersistent(cluster) ? "Persistent" : "Detected"))) :
+            (escapingMode ? "Escaping" : (checkGhostTargeted(devKey, cluster) ? "Covered" : (isClusterPersistent(cluster) ? "Persistent" : "Detected"))) :
             (isClusterPersistent(cluster) ? "Persistent" : "Detected")
 
     [
             ghostStateSnapshot: computedState,
             escapingModeSnapshot: escapingMode,
-            escapingBounds: escapingPoints ? boundsForPoints(escapingPoints) :
+            escapingBounds: escapingAdjacentPoints ? boundsForPoints(escapingAdjacentPoints) :
                     (escapingAdjacentByBounds ? cloneBounds(effectiveCluster?.bounds) : null),
-            escapingPointCount: escapingPoints ? escapingPoints.size() : (escapingAdjacentByBounds ? Math.max(1, cluster?.escapingPointCount ?: 0) : 0),
+            escapingPointCount: escapingAdjacentPoints ? escapingAdjacentPoints.size() : (escapingAdjacentByBounds ? Math.max(1, cluster?.escapingPointCount ?: 0) : 0),
             targetedAreaBounds: cloneBounds(targetArea?.bounds ?: cluster?.targetedAreaBounds)
     ]
 }
@@ -7059,6 +7658,7 @@ private void applyDynamicInterferenceAreaState(dev, Integer areaIndex, Map bound
             appliedBounds.zmin,
             appliedBounds.zmax
     )
+    recordPendingInterferenceAreaWrite(deviceKey(dev.id), areaIndex, appliedBounds)
 }
 
 private Map inactiveInterferenceAreaBounds() {
@@ -7127,6 +7727,10 @@ private boolean showHistoricalGhostOverlaysEnabled() {
     showHistoricalGhostOverlays == true
 }
 
+private boolean showPendingPointsOnGraphsEnabled() {
+    showPendingPointsOnGraphs != false
+}
+
 private Double safeMaxLeakExpandX() {
     Math.max(0.0d, (maxLeakExpandX ?: 0.0d) as Double)
 }
@@ -7145,15 +7749,6 @@ private BigDecimal safeStableThreshold() {
 
 private BigDecimal round2(value) {
     ((value ?: 0.0d) as BigDecimal).setScale(2, BigDecimal.ROUND_HALF_UP)
-}
-
-private String renderDualStatBlocks(String leftTitle, Map leftStats, String rightTitle, Map rightStats) {
-    """<table style='width:100%; border-collapse:separate; border-spacing:8px 0;'>
-<tr>
-<td style='width:50%; vertical-align:top;'>${renderStatBlock(leftTitle, leftStats)}</td>
-<td style='width:50%; vertical-align:top;'>${renderStatBlock(rightTitle, rightStats)}</td>
-</tr>
-</table>"""
 }
 
 private String renderMetricDashboard(List panels, Integer columnCount = 3) {
@@ -7274,8 +7869,11 @@ private String renderTrackingPanel(Map stats, String devKey = null) {
     def pendingValue = devKey && pendingCount > 0 ?
             "<span style='display:block; overflow:auto;'><span style='float:left;'>${pendingProcessing}</span><span style='float:right;'>${buttonLink("processPendingPoints_${devKey}", "<span style='font-size:11px; font-weight:bold;'>Process</span>", "#1A77C9", 11)}</span></span>" :
             pendingProcessing
+    def ignoredLabel = devKey && ignoredCount > 0 ?
+            "<span style='display:block; overflow:auto;'><span style='float:left;'>Ignored outside window</span><span style='float:right;'>${buttonLink("clearIgnoredOutsideWindow_${devKey}", "<span style='font-size:11px; font-weight:bold;'>Clear</span>", "#b91c1c", 11)}</span></span>" :
+            "Ignored outside window"
     def outsideWindowHtml = ignoredCount > 0 ? """
-<div class='gt-metric-half'>${renderMetricTile("Ignored outside window", ignoredOutsideWindow)}</div>
+<div class='gt-metric-half'>${renderMetricTile(ignoredLabel, ignoredOutsideWindow)}</div>
 <div class='gt-metric-half'>${renderMetricTile("Last outside-window point", lastOutsideWindowPoint)}</div>""" : ""
     """<div class='gt-metric-grid'>
 <div class='gt-metric-full'>${renderMetricTile("Detection", detectionValue)}</div>
@@ -7298,17 +7896,20 @@ private String renderSideBySidePlots(String leftTitle, String leftPlot, String r
 }
 
 private String renderCommonPlotLegend() {
+    def pendingPointLegend = showPendingPointsOnGraphsEnabled() ?
+            "<div class='gt-legend-item'><span class='gt-legend-swatch gt-legend-dot' style='background:#d1d5db;border:0.55px dashed #334155;'></span><span>Pending-processing point</span></div>" :
+            ""
     """<div class='gt-panel'>
 <div class='gt-legend-grid'>
 <div class='gt-legend-item'><span class='gt-legend-swatch gt-legend-dot' style='background:#ff9800;'></span><span>In-bounds point</span></div>
-<div class='gt-legend-item'><span class='gt-legend-swatch gt-legend-dot' style='background:#d1d5db;border:0.55px dashed #334155;'></span><span>Pending-processing point</span></div>
+${pendingPointLegend}
 <div class='gt-legend-item'><span class='gt-legend-swatch gt-legend-dot' style='background:#888888;'></span><span>Ignored point</span></div>
 <div class='gt-legend-item'><span class='gt-legend-swatch gt-legend-dot' style='background:#d32f2f;'></span><span>Escaping point</span></div>
 <div class='gt-legend-item'><span class='gt-legend-swatch gt-legend-box' style='background:rgba(197,204,211,0.18);border:1.2px solid #c5ccd3;'></span><span>Interference area</span></div>
 <div class='gt-legend-item'><span class='gt-legend-swatch gt-legend-box' style='background:transparent;border:1px dashed #888888;'></span><span>Device bounds</span></div>
 <div class='gt-legend-item'><span class='gt-legend-swatch gt-legend-box' style='background:none;border:1.6px solid #1565c0;'></span><span>Detected ghost</span></div>
 <div class='gt-legend-item'><span class='gt-legend-swatch gt-legend-box' style='background:none;border:1.6px dashed #f9a825;'></span><span>Persistent ghost</span></div>
-<div class='gt-legend-item'><span class='gt-legend-swatch gt-legend-box' style='background:rgba(239,108,0,0.14);border:1.6px solid #ef6c00;'></span><span>Targeted ghost</span></div>
+<div class='gt-legend-item'><span class='gt-legend-swatch gt-legend-box' style='background:rgba(239,108,0,0.14);border:1.6px solid #ef6c00;'></span><span>Covered ghost</span></div>
 <div class='gt-legend-item'><span class='gt-legend-swatch gt-legend-box' style='background:rgba(198,40,40,0.14);border:1.6px solid #c62828;'></span><span>Escaping ghost</span></div>
 <div class='gt-legend-item'><span class='gt-legend-swatch gt-legend-box' style='background:rgba(46,125,50,0.14);border:1.6px solid #2e7d32;'></span><span>Busted ghost</span></div>
 <div class='gt-legend-item'><span class='gt-legend-swatch gt-legend-box' style='background:rgba(21,101,192,0.08);border:1.6px dashed #1565c0;'></span><span>Archived ghost</span></div>
@@ -7371,12 +7972,12 @@ private String renderArchivedGhostDetails(Map archivedGhost, Integer displayInde
             "Last seen day": archivedGhost?.lastSeenDay ?: 0,
             "Days seen": archivedGhost?.daysSeen ?: 0,
             "Episodes": archivedGhost?.episodes ?: 0,
-            "Last targeted area": targetedText
+            "Last area used": targetedText
     ]
 
     def notes = ""
     if (isValidBounds(archivedGhost?.lastTargetedAreaBounds)) {
-        notes = "<div style='margin-top:8px; color:#111827; line-height:1.35;'><span style='color:#64748b; font-size:11px; text-transform:uppercase; letter-spacing:0.04em;'>Last targeted bounds</span><div style='margin-top:2px;'>X ${round2(archivedGhost.lastTargetedAreaBounds.xmin)}..${round2(archivedGhost.lastTargetedAreaBounds.xmax)}, Y ${round2(archivedGhost.lastTargetedAreaBounds.ymin)}..${round2(archivedGhost.lastTargetedAreaBounds.ymax)}, Z ${round2(archivedGhost.lastTargetedAreaBounds.zmin)}..${round2(archivedGhost.lastTargetedAreaBounds.zmax)} cm</div></div>"
+        notes = "<div style='margin-top:8px; color:#111827; line-height:1.35;'><span style='color:#64748b; font-size:11px; text-transform:uppercase; letter-spacing:0.04em;'>Last area bounds</span><div style='margin-top:2px;'>X ${round2(archivedGhost.lastTargetedAreaBounds.xmin)}..${round2(archivedGhost.lastTargetedAreaBounds.xmax)}, Y ${round2(archivedGhost.lastTargetedAreaBounds.ymin)}..${round2(archivedGhost.lastTargetedAreaBounds.ymax)}, Z ${round2(archivedGhost.lastTargetedAreaBounds.zmin)}..${round2(archivedGhost.lastTargetedAreaBounds.zmax)} cm</div></div>"
     }
 
     def html = new StringBuilder()
@@ -7450,14 +8051,6 @@ private void logThrowable(String context, Throwable t) {
         }
     } catch (ignored) {
         log.error("  (stack trace unavailable)")
-    }
-}
-
-private String stackTraceString(Throwable t) {
-    try {
-        return t?.stackTrace?.collect { it.toString() }?.join("\n")
-    } catch (Throwable ignored) {
-        return null
     }
 }
 
