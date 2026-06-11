@@ -853,6 +853,13 @@ def appButtonHandler(btn) {
         return
     }
 
+    if (btn.startsWith("clearArchivedGhosts_")) {
+        def devKey = btn.substring("clearArchivedGhosts_".length())
+        clearArchivedGhosts(devKey)
+        scheduleStatsPageRefresh(0L, 3000L, 1)
+        return
+    }
+
     if (btn.startsWith("applyZones_")) {
         def devKey = btn.substring("applyZones_".length())
         applySelectedZones(devKey)
@@ -4367,6 +4374,14 @@ private void clearCorrelationEvents(String devKey) {
     state.correlationEpisodeState?.remove(devKey)
 }
 
+private void clearArchivedGhosts(String devKey) {
+    if (!devKey) {
+        return
+    }
+    state.archivedGhosts?.remove(devKey)
+    state.archivedGhostVisibility?.remove(devKey)
+}
+
 private void setArchivedGhostVisibility(String devKey, boolean visible) {
     state.archivedGhostVisibility = ((state.archivedGhostVisibility ?: [:]) as Map) + [(devKey): visible]
 }
@@ -6682,12 +6697,19 @@ private String renderDeviceStatsCard(dev, String devKey, Map displayCounts, Map 
             "deviceSubHeaderWithRightLink",
             "Archived Ghosts",
             archivedGhostCount > 0 ?
+                    (
                     buttonLink(
                             "${displayData.showArchivedGhosts ? 'hideArchivedGhosts' : 'showArchivedGhosts'}_${devKey}",
                             "<div style='float:right;vertical-align:middle; margin:4px;'><b><font size=3>${displayData.showArchivedGhosts ? 'Hide Archived Ghosts' : 'Show Archived Ghosts'}</font></b></div>",
                             "#1A77C9",
                             14
-                    ) :
+                    ) +
+                    buttonLink(
+                            "clearArchivedGhosts_${devKey}",
+                            "<div style='float:right;vertical-align:middle; margin:4px;'><b><font size=3>Clear</font></b></div>",
+                            "#b91c1c",
+                            14
+                    )) :
                     ""
     )
     if ((archivedGhostCount ?: 0) <= 0) {
